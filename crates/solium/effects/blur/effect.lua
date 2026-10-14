@@ -2,8 +2,8 @@
 -- many doublings back, each sampling at `offset` texels. Copy this folder to
 -- ~/.config/solium/effects/blur/ to change it; your copy is used instead.
 --
--- Its input is the backdrop. Until xray arrives (X2.1) a rule reads the
--- window's own pixels with `source = "self"`:
+-- Its input is the backdrop, what is behind the part, from xray. A rule
+-- reads the window's own pixels instead with `source = "self"`:
 --   { match = { app_id = "mpv" }, part = "client", slot = "replace",
 --     effect = { "blur", source = "self", passes = 3 } }
 return {

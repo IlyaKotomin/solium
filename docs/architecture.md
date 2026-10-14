@@ -398,11 +398,32 @@ texture (`pool::Pool::blank`), its input never counts as redrawn
 its params or its padded box's size change, and it runs in the first phase
 whatever its part. `dev/effects-check.sh t0` shows one behind a window.
 
-So two tiers run: T0 and T1 (`Tier::Own`, a capture of the part), the tier
-read from the bound chain's flattened plan when the rules are applied
-(`effect::rules::tier`); the backdrop from xray (T2) and the live backdrop
-(T3) are refused at bind by `rules::runnable`, naming X2.1 and X4.1, so a
-rule that cannot run yet is a problem and not a slot drawn empty.
+So three tiers run: T0, T1 (`Tier::Own`, a capture of the part) and T2 (the
+backdrop from xray), the tier read from the bound chain's flattened plan when
+the rules are applied (`effect::rules::tier`); the live backdrop (T3) is
+refused at bind by `rules::runnable`, naming X4.1, so a rule that cannot run
+yet is a problem and not a slot drawn empty.
+
+T2 adds two phases to `prepare`, after `resolve` and before any capture or
+chain (Ruling F31): `scenes` renders each hosted scene a wanted xray cut
+holds at the size and scale `elements` will ask for, and `xray` draws each
+wanted cut (`offscreen::xray_job`, a keyed capture of the layers below a
+part's band, kept until what it holds differs) and runs each wanted memo
+over a cut redrawn since it last ran (`render::run_xray`). `resolve` records
+one `T2Place` per monitor a T2 part's padded box overlaps (its box in that
+monitor's xray pixels and its own, a `BoxMap` into the monitor-sized
+textures, the size the suffix runs at), and `want_t2` wants each place's cut
+and asks `effect::memo::Memos::admit_pass` once for every place's memos under
+`effects.memo.budget_mib`; a cut or a memo nobody reads this pass is not
+built. In the inner nest each place then runs its chain's suffix at the
+part's own size (or its whole plan, when its memos were not held), only when
+its `memo::T2Key` moved, or, with an empty suffix, places a crop of the memo
+and runs nothing; the walk places each monitor's result there
+(`Slots::at_on`). The split (`stage::split_memo`) is derived from the bound
+plan by `BoundChain::split`, by `effects.memo.split` or a rule's
+`memo = false`. While the session is locked `build_slots` wants no slot of
+the session at all, so nothing of it is captured, run or read behind the
+lock.
 `dev/effects-check.sh blur` blurs a video player's own pixels through a rule
 and shows a still window's chain run only on the passes that captured it.
 

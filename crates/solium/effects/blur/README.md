@@ -19,10 +19,16 @@ from nothing. Its `fallback` lists two cheaper versions, `{ passes = 2 }`
 and then `{ passes = 1 }`, for when a frame runs late; falling back to them
 on a late frame arrives with X2.7.
 
-Its input is the `backdrop`, what lies behind the part. Reading that needs
-xray, which arrives with X2.1, and until then a rule blurring the backdrop
-is refused, by name. Give `source = "self"` to blur the part's own pixels
-instead:
+Its input is the `backdrop`, what lies behind the part, from xray: behind a
+translucent terminal it blurs the wallpaper, and the whole blur is shared,
+run once per monitor, each window drawing its own crop of it:
+
+```lua
+{ match = { app_id = "kitty" }, part = "client", slot = "behind",
+  effect = "blur" }
+```
+
+Give `source = "self"` to blur the part's own pixels instead:
 
 ```lua
 { match = { app_id = "mpv" }, part = "client", slot = "replace",

@@ -486,8 +486,10 @@ function sol.problems() end
 ---@field part string `pane`, `client`, `popup`, `layer:<name>`, `region:titlebar`, `surface:<name>` or `layer_shell:<namespace>`. Other regions, and the titlebar's own pixels as a chain's input, wait for `Solium.region`, and `output` for X4.2.
 ---@field slot "behind"|"front"|"replace" Below the part, above it, or in its place. The part itself is always drawn: a `replace` whose effect fails draws the part.
 ---@field effect string|table|false An effect's name; a link, `{ "blur", passes = 3 }`, its params beside the name, with `reach` and `bleed` overriding the effect's own; a chain of links in order, `{ { "blur" }, { "tint" } }`; or `false`, which empties the slot.
----@field source? "self"|"xray"|"live"|"auto" What the chain's first input reads in place of its own: `"self"`, the part's own pixels. On the rule or in its first link. Reading the backdrop from xray waits for X2.1 and the live backdrop for X4.1, both refused when the rules are applied.
+---@field source? "self"|"xray"|"live"|"auto" What the chain's first input reads in place of its own: `"self"`, the part's own pixels, or `"xray"`, the backdrop from xray, which is what a chain reading the backdrop reads anyway. On the rule or in its first link. The live backdrop (`"live"`, `"auto"`) waits for X4.1 and is refused when the rules are applied.
 ---@field mask? "shape"|"alpha" How the result is cut: the part's shape (the default), or the alpha of the part's own pixels, which needs `source = "self"`.
+---@field memo? boolean `false`: never share this rule's backdrop-only part per monitor, whatever `effects.memo.split` says; each part runs its whole chain. Default `true`.
+---@field cut? "below"|"background" Which layers a T2 chain reads: every configured layer below the part's own (`"below"`, the default) or the wallpaper alone (`"background"`), even when `effects.xray.layers` has `"bottom"`.
 
 ---What T2 effects read as the backdrop, `sol.effects`' `xray`: a sharp
 ---picture of the layers below a part, per monitor, rebuilt only when what is

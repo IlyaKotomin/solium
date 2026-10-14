@@ -54,6 +54,8 @@ return {
 | `effect` | an effect's name; a link, `{ "blur", passes = 3 }`, with the effect's params beside its name; a chain of links, run in order, each reading the last one's result, `{ { "blur", source = "self" }, { "tint", amount = 0.1 } }`; or `false`, which empties the slot |
 | `source` | what the chain's first input reads in place of its own: `"self"`, the part's own pixels. On the rule or in its first link, never a later one |
 | `mask` | how the result is cut: `"shape"`, the part's own shape (the default: the client's own rectangle and rounded corners for `client`; the whole window rounded at its largest corner for `pane`; the band, as above, for `region:titlebar`; the rectangle for the rest), or `"alpha"`, the alpha of the part's own pixels, which needs `source = "self"` |
+| `memo` | `false` shares nothing of this rule's chain per monitor: each part runs its whole chain over xray, whatever `effects.memo.split` says (see *The memo*). `true` unless you say so |
+| `cut` | which xray a chain reading the `backdrop` reads: `"below"` (the default), every layer `effects.xray.layers` names below the part's own; or `"background"`, the wallpaper alone, even where `layers` has `"bottom"` |
 
 A link may also give `reach` and `bleed`, in pixels, in place of the
 effect's own. A chain reads as far around its part as its first link
@@ -76,10 +78,8 @@ the overlay, by the rule's number and key, or at the effect's own file and
 line when the effect is what failed. `solium --check` fails on it too.
 
 Some of what a rule can say waits for a later part of Solium, and is refused
-until then, by name: an effect that reads the `backdrop` from what is behind
-the window (blur's own input) needs xray, which arrives with X2.1, so give
-`source = "self"` to blur the part's own pixels; the live backdrop
-(`source = "live"` or `"auto"`) arrives with X4.1; regions other than the
+until then, by name: the live backdrop (`source = "live"` or `"auto"`)
+arrives with X4.1; regions other than the
 titlebar, a `region:titlebar` rule whose chain reads the band's own pixels
 (`self`), `part = "output"`, `keep`, a `surface` match naming a plane, and an
 alpha mask without `source = "self"` likewise. This build reads, checks and
@@ -95,16 +95,48 @@ tier is fixed when the rules are applied: a reload is what changes it.
 |---|---|---|---|
 | T0 | nothing of the frame: only `shape` and its own states (a border, a glow, a gradient) | no capture. It runs once, and again only when its params or the part's size change, whatever the window draws under it; its `sol_tex` reads a transparent texel | runs |
 | T1 | the part's own pixels: `self`, or its first input given `source = "self"` | a capture of the part, padded by the chain's `reach`, drawn again only when the part commits. The chain runs again only then, or when its params or the part's size change; otherwise its last result is placed as it was | runs |
-| T2 | the `backdrop`, what is behind the part, from xray | | refused, naming X2.1 |
+| T2 | the `backdrop`, what is behind the part, from xray: a sharp picture of the layers below the part's own, per monitor (`effects.xray`) | xray is drawn only on a monitor a T2 part is on, and again only when what is in it changes. The chain's start that reads only the backdrop (a blur) runs once per monitor and is shared (*The memo*); the rest runs per part, at the part's own size, again only when the part moves, its params change or xray is redrawn. A plain blur runs nothing per part: each part is a crop of the shared result | runs |
 | T3 | the live backdrop, with `source = "live"` or `"auto"` | | refused, naming X4.1 |
 
 A rule in a tier this build cannot run is an error, not an effect that draws
 nothing: the rules that ran stay, the overlay names it, and `solium --check`
 fails on it, so a rule that cannot work yet says so. The shipped `blur` reads
-the backdrop, so here it draws only as `{ "blur", source = "self" }`, a T1
-effect. An effect that reads its part's own pixels always captures the part
-for now, a tint or a dim included; drawing one inline, with no capture, comes
-later.
+the backdrop, so `{ "blur" }` behind a translucent window blurs what is behind
+it (T2), and `{ "blur", source = "self" }` blurs the part's own pixels (T1).
+An effect that reads its part's own pixels always captures the part for now,
+a tint or a dim included; drawing one inline, with no capture, comes later.
+
+A part on `background` has nothing below it to read, so a T2 rule there
+wants no slot and is no problem either. A window across two monitors has a
+T2 result on each, each from that monitor's xray, with a seam at the edge
+(`effects.xray.straddle = "own"` keeps only its own monitor's). While the
+session is locked no rule's slot is wanted at all: nothing of the session is
+captured, run or read behind the lock.
+
+### The memo
+
+A T2 chain is split when the rules are applied: its start, as far as it reads
+only the `backdrop` and earlier such steps, is run once per monitor and xray
+cut and shared by every part whose chain starts the same way (five frosted
+titlebars are one blur); the rest runs per part and reads each shared result
+as the input `memo:<step>`. A step that reads anything only a part has
+(`sol_content`, `sol_shape`, `self` and the rest), or a stage marked
+`per_part = true`, ends the shared start. In a shared step `uv` spans the
+monitor and `sol_size` is the monitor's, so positional work belongs in a
+part's step. With nothing left per part (a plain blur) a part runs no pass at
+all: it is drawn as a crop of the shared result.
+
+`effects.memo` says how: `split = "resize"` (the default) shares up to the
+last step that changes size, so a trailing tint stays per part;
+`"longest"` shares the tint too, and `"off"` shares nothing. A rule's
+`memo = false` is `"off"` for that rule alone. A shared result nobody reads
+is given back after `keep_passes` passes (0 by default), and `budget_mib`
+caps what they hold together (0, no cap, by default): past it a part that
+cannot be given its shared results runs its whole chain itself, a part that
+read them the pass before keeps them, and the first refusal at a cap is said
+in Solium's log. `SOLIUM_XRAY_REBUILD=always` draws xray and runs every shared
+result on every pass, for measuring; the PACING line and the trace count both
+(`xray_builds`, `memo_runs`).
 
 Whatever the tier, an effect that fails, in its Lua, its checks, its compile
 or on the GPU, leaves its part drawn as if no rule named it: a `replace` draws
@@ -457,5 +489,5 @@ the window.
 
 | Folder | What it is |
 |---|---|
-| [`blur`](blur/README.md) | a dual Kawase blur, `passes` halvings and as many doublings back at `offset` texels; its input is the backdrop, so until xray a rule gives it `source = "self"` |
+| [`blur`](blur/README.md) | a dual Kawase blur, `passes` halvings and as many doublings back at `offset` texels; its input is the backdrop, what is behind the part from xray, or the part's own pixels with `source = "self"` |
 | [`genie`](genie/README.md) | the window pulled into its target like a sheet through a letterbox, the edge nearest the target first, `spread` drawing the tail out behind it; a geometry effect, held to Solium's Rust genie within 10⁻⁹ |

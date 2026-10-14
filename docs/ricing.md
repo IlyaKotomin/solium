@@ -283,8 +283,14 @@ with params (`{ "blur", passes = 3 }`), a chain of them, or `false` to empty
 the slot. A later rule for the same part and slot wins, and yours win over a
 pane style's: a style may give its own windows rules in an `effects.lua`
 beside its `Pane.qml` ([pane styles](../crates/solium/qml/panes/README.md#effectslua)). `source = "self"` is what makes this blur read mpv's own
-pixels: blurring what is behind a window needs xray, which has not arrived,
-and a rule asking for it is refused, by name.
+pixels. Without it, a blur reads what is behind the window: put it `behind`
+a translucent terminal and the wallpaper shows through blurred, the blur run
+once per monitor and shared by every window it is behind
+([effect folders](../crates/solium/effects/README.md#the-memo)):
+
+```lua
+{ match = { app_id = "kitty" }, part = "client", slot = "behind", effect = "blur" }
+```
 
 The rules are applied whole: one that cannot be, a typo in a key or an
 effect with a broken shader, keeps the whole set out, leaves the rules that
