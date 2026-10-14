@@ -223,7 +223,7 @@ sol.on("surface", function(surface, action, data) end) -- a hosted scene sent an
 sol.on("closing", function(id) end)                -- a close was asked for
 sol.on("refused", function(id) end)                -- ...and declined: it is back
 sol.on("close",  function(id) end)                 -- it is gone
-sol.on("focus",  function(id) end)                 -- the keyboard moved
+sol.on("focus",  function(id, source, changed) end) -- the keyboard moved, what moved it, and from another window?
 sol.on("activate", function(id, why) end)          -- a window asked to come forward: "launch" or "request"
 sol.on("drop",   function(id, x, y) end)           -- a drag finished
 sol.on("resize", function(id, edge_x, edge_y, horizontal_side, vertical_side) end)
@@ -367,6 +367,50 @@ hear `focus` for it. If your `open` handler calls `sol.focus` itself, yours is
 the last word and the compositor does not give it again. A window launched with
 `sol.spawn` gets it the same way when its application arrives; a `sol.focus`
 for it during `open` finds no application yet to give it to.
+
+**`focus` says what moved the keyboard** (#220), as its second argument, and
+`sol.focus_source()` says the same inside any handler: what a `sol.focus` made
+there is told with. Its third, `changed`, is whether the keyboard came from
+another window or from none: a layout focusing again the window that already
+has it -- scrolling does after every key it binds -- is told `false`
+(`state::tests::real_client::follow::the_focus_event_says_whether_the_keyboard_moved`).
+
+| `source` | the keyboard moved because of |
+|---|---|
+| `"binding"` | a key binding's handler: a workspace key, the overview's keys |
+| `"direction"` | a `sol.focus` in `sol.focus_direction`'s listeners, `super+arrows`, whatever called it |
+| `"move"` | the same in `sol.move_direction`'s, `super+shift+arrows` |
+| `"click"` | a press on a window, or a `click` listener while a script holds input |
+| `"scroll"`, `"drop"` | a `scroll` or `drop` listener |
+| `"touch"` | a touch on a window |
+| `"hover"` | the pointer onto a window, with focus following the mouse |
+| `"surface"` | a hosted scene's action: a bar's window chip, the dock, a search |
+| `"open"` | a window opening, or an `open` listener |
+| `"activate"` | an application bringing its window forward, or an `activate` listener |
+| `"settle"` | the window with the keyboard went, and the compositor found another |
+| `"script"` | `sol.focus` from anything else |
+
+`lua/follow.lua` is the listener that ships: it takes the pointer to the window
+that took the keyboard for a key and not for a click, and only when the
+keyboard moved, by `focus.cursor` in `config.lua` -- which sources follow,
+where on the window, the motion, where the mouse carries on from mid-flight,
+whether a window focused again takes it too, and what a switch to an empty
+workspace does
+(`script::directions::the_pointer_follows_a_key_and_not_a_click`,
+`script::directions::which_focus_changes_take_the_pointer_along_where_to_and_how_is_configured`,
+`script::directions::the_focus_event_says_what_moved_the_keyboard`,
+`state::tests::real_client::follow::the_compositors_own_focus_changes_say_what_they_are`).
+Two kinds of change tell no `focus` that moved the keyboard, so the shipped
+files ask for those by name: a move keeps the keyboard on the window that
+moved, and `direction.lua` takes the pointer after it, to where it went, as
+`scrolling.lua` does for its keys that move a column or push a window out of
+one; a workspace switch that leaves no window to take the keyboard has
+`workspaces.lua` take it to the middle of the monitor, or leave it, as
+`focus.cursor.empty_workspace` says, and one back to the window the keyboard
+stayed on while it was hidden takes it to that window
+(`script::directions::a_move_takes_the_pointer_to_where_the_window_went`,
+`script::directions::in_scrolling_a_key_takes_the_pointer_along_only_if_it_moves_the_keyboard_or_its_window`,
+`script::directions::a_switch_to_an_empty_workspace_takes_the_pointer_to_the_middle_or_leaves_it`).
 
 **`activate` says a window asked to be brought forward**, with an activation
 token such as a notification you clicked hands it, and it comes after the
@@ -565,6 +609,60 @@ already on screen.
 `skip` on `window_at` exists because of one specific bug: a new window is
 already mapped and under the pointer, so asking "what am I pointing at" without
 skipping it names the window as its own split target.
+
+## Taking the pointer somewhere
+
+```lua
+sol.warp(id)                                   -- to a window's centre, at once
+sol.warp(id, { to = { x = 0.5, y = 0.25 }, motion = { duration = 260, easing = "outCubic" }, interrupt = "picture" })
+sol.warp({ x = 960, y = 540 }, { motion = { easing = "spring" } })
+sol.focus(id, { warp = true })                 -- the keyboard, then the pointer
+```
+
+The pointer is there at once: what it is over, what is hovered, which client
+has it and the shape that client gives it are the destination's from the first
+instant, so a key or a click the moment after goes where the pointer went, and
+no focus follows it however focus follows the mouse. Only its picture flies,
+from wherever it was drawn, along `motion`; with none it is there at once. It
+is the split a window's own move makes: input where the window is, the drawing
+presented on its way. `Solium.cursor` says so while it flies -- `moving`,
+`from`, `to`, and its `velocity` is the flight's -- so a pointer scene can
+stretch or trail by it ([ricing.md](ricing.md#your-own-pointer))
+(`state::tests::real_client::follow::a_key_takes_the_pointer_to_the_window_it_focuses_at_once_and_flies_its_picture`,
+`state::tests::real_client::follow::a_warp_takes_no_focus_with_it`,
+`models::pointer::tests::a_flight_is_published_while_it_flies_and_said_to_have_landed_after`).
+
+A window is measured where it is headed once your handler's commands are
+applied and its transforms have landed: a desk sliding in, a window your
+handler has just placed, a tile its client has not filled yet. The last warp
+a handler asks for wins, and a point off every screen is kept on one
+(`state::tests::real_client::follow::a_warp_goes_where_the_window_was_moved_in_the_same_handler`,
+`state::tests::real_client::follow::a_tiled_window_is_warped_to_its_tile_before_its_client_has_filled_it`,
+`state::tests::real_client::follow::a_warp_to_nothing_goes_nowhere_and_one_off_every_screen_is_kept_on_one`).
+
+The hand on the mouse wins. Moving the mouse mid-flight ends the flight and
+carries on from where the pointer is, so with focus following the mouse the
+window the warp went to keeps the keyboard; `interrupt = "picture"` carries on
+from where the picture is drawn instead. The jump is no motion of the mouse's,
+so the velocity `Solium.cursor` says after it is the mouse's own. A press lands
+the flight where the pointer is, and a second warp starts from wherever the
+first had got to. A warp asked for while a press is being handled -- a click
+whose `focus` takes the pointer along -- waits for the buttons to come up, so
+the click goes where it was aimed, and is refused then if a menu the click
+opened holds the pointer. Nothing is warped while a button holds the
+pointer, while a client holds it (a game's locked pointer), or behind the lock.
+When the picture lands, what the pointer is over is asked again, so a window
+that slid in under it since has it and says its cursor (#229)
+(`state::tests::real_client::follow::real_motion_mid_flight_wins_at_once`,
+`state::tests::real_client::follow::with_focus_following_the_mouse_a_nudge_mid_flight_keeps_the_keyboard_where_the_key_put_it`,
+`state::tests::real_client::follow::real_motion_after_a_warp_reports_only_its_own_speed`,
+`state::tests::real_client::follow::a_press_mid_flight_lands_it`,
+`state::tests::real_client::follow::a_click_that_takes_the_pointer_along_lands_where_it_was_aimed`,
+`state::tests::real_client::follow::a_click_that_opened_a_menu_takes_the_pointer_nowhere_later`,
+`state::tests::real_client::follow::a_second_warp_mid_flight_starts_from_where_the_picture_is`,
+`state::tests::real_client::follow::a_held_pointer_is_not_warped`,
+`state::tests::real_client::lock_focus::no_warp_moves_the_pointer_behind_the_lock`,
+`state::tests::real_client::follow::where_the_picture_lands_the_pointer_is_given_to_what_is_there`).
 
 ## A layout runs per monitor
 

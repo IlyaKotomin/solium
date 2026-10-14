@@ -21,6 +21,7 @@ local modes = require("modes")
 local monitors = require("monitors")
 local workspaces = require("workspaces")
 local dialogs = require("dialogs")
+local follow = require("follow")
 
 local direction = {}
 
@@ -280,10 +281,19 @@ end
 sol.on("direction", function(verb, dir)
     local layout = modes.registered[modes.current()]
     local answer = layout and layout.active and layout[verb .. "_direction"]
-    if answer and answer(dir) then
-        return
+    if not (answer and answer(dir)) then
+        floating[verb](dir)
     end
-    floating[verb](dir)
+    -- A move keeps the keyboard on the window that moved, so no `focus` is
+    -- told for it: the pointer goes after it here, to where the layout has
+    -- just put it (#220). `sol.focus_source()` is "move" in here.
+    -- `a_move_takes_the_pointer_to_where_the_window_went`.
+    if verb == "move" then
+        local moved = focused(sol.windows())
+        if moved then
+            follow.window(moved.id, sol.focus_source())
+        end
+    end
 end)
 
 -- The plain arrows: super to focus, as `direction.beside` below. A separate

@@ -1171,7 +1171,11 @@ impl XdgActivationHandler for Solium {
                 );
             } else {
                 tracing::debug!("a window asked to be brought forward");
-                self.focus_window(&window, SERIAL_COUNTER.next_serial());
+                self.focus_window(
+                    &window,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Activate,
+                );
                 if !pane.is_some_and(|pane| self.pane_on_stage(pane)) {
                     tracing::debug!(
                         "a window asked to be brought forward where nobody can see it, and the \

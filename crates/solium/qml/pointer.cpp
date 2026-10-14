@@ -17,17 +17,30 @@ void SoliumPointerState::publish(const QJsonObject &next)
                            moving.value(QStringLiteral("y")).toDouble(m_velocity.y()));
     const double scale = next.value(QStringLiteral("scale")).toDouble(m_scale);
     const int size = next.value(QStringLiteral("size")).toInt(m_size);
+    const bool flying = next.value(QStringLiteral("moving")).toBool(m_moving);
+    const QJsonObject set_off = next.value(QStringLiteral("from")).toObject();
+    const QPointF from(set_off.value(QStringLiteral("x")).toDouble(m_from.x()),
+                       set_off.value(QStringLiteral("y")).toDouble(m_from.y()));
+    const QJsonObject went = next.value(QStringLiteral("to")).toObject();
+    const QPointF to(went.value(QStringLiteral("x")).toDouble(m_to.x()),
+                     went.value(QStringLiteral("y")).toDouble(m_to.y()));
 
     const bool shape_moved = shape != m_shape;
     const bool pressed_moved = pressed != m_pressed;
     const bool velocity_moved = velocity != m_velocity;
     const bool scale_moved = scale != m_scale;
     const bool size_moved = size != m_size;
+    const bool moving_moved = flying != m_moving;
+    const bool from_moved = from != m_from;
+    const bool to_moved = to != m_to;
     m_shape = shape;
     m_pressed = pressed;
     m_velocity = velocity;
     m_scale = scale;
     m_size = size;
+    m_moving = flying;
+    m_from = from;
+    m_to = to;
 
     if (shape_moved) {
         emit shapeChanged();
@@ -43,6 +56,15 @@ void SoliumPointerState::publish(const QJsonObject &next)
     }
     if (size_moved) {
         emit sizeChanged();
+    }
+    if (moving_moved) {
+        emit movingChanged();
+    }
+    if (from_moved) {
+        emit fromChanged();
+    }
+    if (to_moved) {
+        emit toChanged();
     }
 }
 
@@ -66,6 +88,10 @@ SoliumCursor::SoliumCursor(QObject *parent) : QObject(parent)
                      &SoliumCursor::velocityChanged);
     QObject::connect(state, &SoliumPointerState::scaleChanged, this, &SoliumCursor::scaleChanged);
     QObject::connect(state, &SoliumPointerState::sizeChanged, this, &SoliumCursor::sizeChanged);
+    QObject::connect(state, &SoliumPointerState::movingChanged, this,
+                     &SoliumCursor::movingChanged);
+    QObject::connect(state, &SoliumPointerState::fromChanged, this, &SoliumCursor::fromChanged);
+    QObject::connect(state, &SoliumPointerState::toChanged, this, &SoliumCursor::toChanged);
 }
 
 void SoliumCursor::setHotspot(const QPointF &hotspot)

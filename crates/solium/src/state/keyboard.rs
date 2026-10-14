@@ -163,7 +163,11 @@ impl Solium {
             });
         if let Some(window) = next {
             tracing::debug!("a window went and the keyboard had nowhere to be");
-            self.focus_window(&window, SERIAL_COUNTER.next_serial());
+            self.focus_window(
+                &window,
+                SERIAL_COUNTER.next_serial(),
+                crate::script::FocusSource::Settle,
+            );
         }
     }
 
@@ -232,7 +236,15 @@ impl Solium {
         self.settle_focus();
     }
 
-    pub(crate) fn focus_window(&mut self, window: &Window, serial: Serial) {
+    /// Give `window` the keyboard, and tell scripts `focus` with `source`,
+    /// what moved it (#220).
+    /// `tests::real_client::follow::the_compositors_own_focus_changes_say_what_they_are`.
+    pub(crate) fn focus_window(
+        &mut self,
+        window: &Window,
+        serial: Serial,
+        source: crate::script::FocusSource,
+    ) {
         let Some(location) = self.space.element_location(window) else {
             return;
         };
@@ -246,6 +258,12 @@ impl Solium {
             tracing::debug!("refused to focus a window: the session is locked");
             return;
         }
+        // Whether the keyboard comes from another window, or from none, asked
+        // before anything moves: a layout focusing again the window that has
+        // it, after a key that only resized it, is told `changed = false`, so
+        // a policy can tell that from the keyboard moving (#220).
+        // `tests::real_client::follow::the_focus_event_says_whether_the_keyboard_moved`.
+        let changed = !self.is_focused(window);
         // Any explicit focus ends a scene's hold on the keyboard, a click on a
         // window and `sol.focus` among them (Ruling 14).
         // `tests::real_client::reflow_on_close::hosted::clicking_a_window_ends_the_shells_hold`,
@@ -291,19 +309,24 @@ impl Solium {
         // half off the edge and being able to use it.
         if !self.focusing {
             self.focusing = true;
-            self.trigger_focus(window);
+            self.trigger_focus(window, source, changed);
             self.focusing = false;
         }
     }
 
-    /// Tell scripts focus moved.
-    fn trigger_focus(&mut self, window: &Window) {
+    /// Tell scripts focus moved, what moved it, and whether it `changed`.
+    fn trigger_focus(
+        &mut self,
+        window: &Window,
+        source: crate::script::FocusSource,
+        changed: bool,
+    ) {
         let id = self.window_id(window);
         let snapshot = self.snapshot();
         let Some(mut scripts) = self.scripts.take() else {
             return;
         };
-        let outcome = scripts.focused(id, snapshot);
+        let outcome = scripts.focused(id, source, changed, snapshot);
         self.scripts = Some(scripts);
         self.apply(outcome);
     }

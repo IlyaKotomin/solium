@@ -1097,6 +1097,13 @@ moved over the last frame in logical pixels a second along `x` and `y`,
 zero once it stops, `scale` the scale of the monitor it is on and `size` the
 configured `cursor.size`
 (`models::pointer::tests::the_published_pointer_is_its_buttons_its_motion_its_monitor_and_its_size`).
+When the pointer is taken somewhere -- following the keyboard, or by
+`sol.warp` -- the pointer is there at once and its picture flies: `moving` is
+true while it does, `from` and `to` are where it set off and where it is going
+in the desktop's logical pixels, kept once it lands, and `velocity` is the
+flight's own, so a scene can stretch or trail the picture by it
+(`models::pointer::tests::a_flight_is_published_while_it_flies_and_said_to_have_landed_after`,
+`qml::pointer::tests::a_published_flight_reaches_solium_cursor`).
 It says one thing back, `Solium.cursor.hotspot` on its root: the point of
 its picture that sits on the pointer, its top-left corner unless it says.
 Its size is its root's own `width` and `height`, up to 256 logical pixels
@@ -1364,6 +1371,37 @@ In tiling a move trades tiles with the neighbour level with it that way, and
 in a grid the opposite key puts both back; `move = "split"` makes it split the
 neighbour's tile instead, as Hyprland's `movewindow` does. [modes.md](modes.md#focus-and-move-by-direction)
 has what each layout does with a direction.
+
+### The pointer follows the keyboard
+
+Moving focus with a key -- `super+arrows`, a workspace key, a move -- takes the
+pointer to the window that took the keyboard, and its picture glides there.
+The pointer itself is there at once, so whatever it is over is the new
+window's from the first instant; moving the mouse while it glides carries on
+from there, or from where you see the picture with `interrupt = "picture"`. A
+key that leaves the keyboard where it was, such as scrolling's `super+r`,
+takes it nowhere. A click, a bar's window chip, a window opening or focus
+following the mouse leaves it where your hand put it. All of it is
+`focus.cursor`, by what moved the keyboard
+([modes.md](modes.md#what-a-mode-is-told) lists every source):
+
+```lua
+return {
+    focus = {
+        cursor = {
+            follows = { binding = false, surface = true }, -- not for workspace keys, but for a bar's chip
+            to = { x = 0.5, y = 0.25 },                    -- a quarter of the way down the window
+            motion = { easing = "spring" },                -- or false, to be there at once
+            interrupt = "picture",                         -- the mouse mid-flight goes on from the picture
+            refocus = true,                                -- super+r in scrolling recentres it too
+            empty_workspace = "stay",                      -- a key onto an empty workspace leaves it
+        },
+    },
+}
+```
+
+`lua/follow.lua` is the whole of the policy, and `sol.warp` the compositor's
+part of it ([modes.md](modes.md#taking-the-pointer-somewhere)). #220.
 
 ### Click, hover and an empty desktop
 

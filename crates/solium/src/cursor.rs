@@ -86,6 +86,7 @@
 //! *shape* the theme has never heard of must end up at the theme's own arrow
 //! before it ever gets that far, which is [`shape::resolve`].
 
+pub(crate) mod flight;
 pub(crate) mod scene;
 pub(crate) mod shape;
 pub(crate) mod theme;
@@ -869,6 +870,13 @@ impl Pointer {
     /// device's clock. `scene::tests::velocity_is_the_motion_since_it_was_last_read`.
     pub(crate) fn moved(&mut self, at: u64, location: Point<f64, Logical>) {
         self.motion.moved(at, location);
+    }
+
+    /// The pointer was put somewhere by a warp, not moved there by the mouse:
+    /// see `scene::Motion::restart`.
+    /// `state::tests::real_client::follow::real_motion_after_a_warp_reports_only_its_own_speed`.
+    pub(crate) fn warped(&mut self) {
+        self.motion.restart();
     }
 
     /// How fast the pointer has moved since this was last asked, in logical
