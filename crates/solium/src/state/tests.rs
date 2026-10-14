@@ -20657,6 +20657,45 @@ end)
                 }
             }
 
+            /// **A hand-off the session puts off goes by the compositor's own
+            /// rule, not by a close it no longer answers** (#128 review). A
+            /// lock, a key still down from an unlock, or a scene holding the
+            /// keyboard each keeps `settle_focus` from handing the keyboard
+            /// on as a close lands; the settle that comes later -- here the
+            /// key coming up -- is the one after an unlock, which goes to the
+            /// window under the pointer and then the topmost. Tiling's
+            /// `after_close = {}` would leave the keyboard on nothing, so a
+            /// window with the keyboard shows the close was not carried over.
+            /// With the closed window taken only after those early returns, as
+            /// it was, it fails: the stale close's `{}` left the keyboard on
+            /// nothing.
+            #[test]
+            fn a_settle_put_off_by_a_held_key_goes_by_the_compositors_own_rule() {
+                let mut desk = Desk::new();
+                let (_, closed, _) = three_tiles(&mut desk, &set_after_close("{}"));
+                russian(&mut desk.state);
+                point_at(&mut desk.state, (1.0, 1.0).into());
+                give_keyboard(&mut desk, closed);
+                super_q(&mut desk);
+                // The session has just unlocked with a key still down, and
+                // the keyboard waits for it to come up.
+                desk.state.refocus_on_release = true;
+                desk.ask();
+                assert!(
+                    desk.state.focused_window().is_none(),
+                    "the premise: the keyboard waits for the key to come up"
+                );
+
+                // The key comes up, as `input::key` sees it.
+                desk.state.refocus_on_release = false;
+                desk.state.settle_focus();
+                assert!(
+                    desk.state.focused_window().is_some(),
+                    "the settle after the key came up went by the close it put off \
+                     (`after_close = {{}}`), not by the compositor's own rule"
+                );
+            }
+
             /// **Hovering a window focuses it in tiling and scrolling, and
             /// not in floating; a click on empty desktop still clears it**
             /// (#219). The shipped `focus.modes`, as a session starts them:

@@ -368,7 +368,10 @@ way. A layout that wants a say focuses a window in its own handler; the
 compositor then leaves the keyboard where that put it. `focus` hears the
 hand-off with the source `"settle"`, which `focus.cursor.follows.settle`,
 `false` as shipped, keeps from taking the pointer along: a close never moves
-the pointer out from under your hand.
+the pointer out from under your hand. While the session is locked, a key from
+the unlock is still down or a scene holds the keyboard, the hand-off waits,
+and when it comes it goes by the compositor's own rule -- the window under the
+pointer, then the topmost -- not by `after_close`.
 
 A layout that listens for neither event hears exactly what it always heard --
 `close`, once the window is gone -- so a mode written before these two existed

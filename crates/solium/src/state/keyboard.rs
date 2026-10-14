@@ -70,11 +70,14 @@ impl Solium {
     /// `config.focus.after_close`** for the mode in charge (#128): word by
     /// word, the window under the pointer, the one that takes its place, the
     /// one used before it on its monitor, or the topmost -- see
-    /// [`crate::successor`]. Anywhere else, and with no configuration, the
-    /// window under the pointer first, because with focus-follows-mouse that
-    /// is where focus would land the moment you moved; the topmost otherwise.
-    /// Called where a window went, and only when nothing has focus, so it
-    /// cannot argue with a script that has just chosen one.
+    /// [`crate::successor`]. Only as the close hands the keyboard on: a
+    /// lock, a key still down from an unlock or a scene holding the keyboard
+    /// puts that off, and the settle that comes later is one of the others.
+    /// Anywhere else, and with no configuration, the window under the
+    /// pointer first, because with focus-follows-mouse that is where focus
+    /// would land the moment you moved; the topmost otherwise. Called where
+    /// a window went, and only when nothing has focus, so it cannot argue
+    /// with a script that has just chosen one.
     ///
     /// **While locked, the only place the keyboard can go is a lock surface**,
     /// so that is where this sends it: to the lock screen on the monitor the
@@ -131,6 +134,16 @@ impl Solium {
     /// question the pointer path already asks, put to the screens rather than
     /// to a point.
     pub(crate) fn settle_focus(&mut self) {
+        // The window that had the keyboard when its close landed, if one did,
+        // taken before anything returns: a close is answered here or not at
+        // all. A lock, a key still down from an unlock and a scene holding
+        // the keyboard each put the hand-off off, and the settle that comes
+        // later -- the unlock's, the key's, the scene's letting go -- goes by
+        // the rule there always was; left in place, the closed window and
+        // where it stood would steer that settle, or any later one, by a
+        // close it no longer answers.
+        // `a_settle_put_off_by_a_held_key_goes_by_the_compositors_own_rule`.
+        let left = self.keyboard_left.take();
         if self.lock.is_some() {
             self.settle_lock_focus();
             return;
@@ -143,10 +156,9 @@ impl Solium {
         if self.hosted_keyboard.is_some() {
             return;
         }
+        // Something already has it, so a window that closed has been
+        // answered for: nothing is left for `after_close` to decide.
         if self.focused_window().is_some() {
-            // Something already has it, so a window that closed has been
-            // answered for: nothing is left for `after_close` to decide.
-            self.keyboard_left = None;
             return;
         }
         let at = self
@@ -164,7 +176,6 @@ impl Solium {
         // unlock, a shell letting go, a window moved off screen. Word by word
         // until one finds a window, and with none the keyboard is left on
         // nothing, as the configuration asked. See `crate::successor`.
-        let left = self.keyboard_left.take();
         let words = match left {
             Some(_) => self.after_close.clone(),
             None => crate::successor::Successor::UNCONFIGURED.to_vec(),
