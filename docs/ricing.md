@@ -1255,13 +1255,30 @@ return {
 ```
 
 The application is told its new size the moment you press the key, and its
-last picture is stretched until it has drawn one at that size — through the
-glide and after it, for a quarter of a second past the landing at most, and
-then the window is shown at whatever size the application has. Once it has
-answered the window is drawn as it is, with nothing in between, so a
-fullscreen game or video can be shown directly. An instant change is just that:
-nothing is stretched or moved, and the window is drawn as it is on the next
-frame. An app id is what `sol.windows()` calls `app_id`.
+last picture is drawn into the new rectangle until it has drawn one at that
+size — through the glide and after it, for a quarter of a second past the
+landing at most, and then the window is shown at whatever size the application
+has. How that picture goes in is `resize.fill`, the same setting as for a drag
+or a layout's glide (below). Once it has answered the window is drawn as it is,
+with nothing in between, so a fullscreen game or video can be shown directly.
+An instant change is just that: nothing is moved, and the window is drawn as it
+is on the next frame. An app id is what `sol.windows()` calls `app_id`.
+
+While any window changes size — an edge or a seam you drag, a layout gliding
+it to a new tile, a fullscreen or maximise glide — its application is a frame
+or more behind the rectangle on screen. `resize.fill` decides what its picture
+does meanwhile: `"anchor"`, the default, keeps it at its own size against the
+edges that are not moving, so text never changes size; `"crop"` keeps it at
+the window's top-left instead; `"stretch"` scales it to fill, which is smooth
+but draws text up to twice as wide while the application catches up.
+`resize.background` is what shows where the picture does not reach, `"none"`
+to see through:
+
+```lua
+return {
+    resize = { fill = "crop", background = "#000000" },
+}
+```
 
 Desktop mode's snap — the focused window sliding to a half, a quarter or the
 whole of its monitor while no layout is in charge (#222) — has its own
