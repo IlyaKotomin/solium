@@ -1387,7 +1387,7 @@ focus following the mouse leaves it where your hand put it. All of it is
 return {
     focus = {
         cursor = {
-            follows = { binding = false, surface = true }, -- not for keys, but for a bar's chip
+            follows = { binding = false, surface = true }, -- not for workspace keys, but for a bar's chip
             to = { x = 0.5, y = 0.25 },                    -- a quarter of the way down the window
             motion = { easing = "spring" },                -- or false, to be there at once
             empty_workspace = "stay",                      -- a key onto an empty workspace leaves it

@@ -5587,6 +5587,10 @@ fn motion_from(options: Option<&Table>) -> mlua::Result<(Option<Duration>, Optio
 /// Where on a window the pointer goes when no `to` says: its centre.
 const CENTRE: (f64, f64) = (0.5, 0.5);
 
+/// A warp's options as [`warp_options`] reads them: where on a window, as a
+/// share of its width and height, and the motion its picture flies along.
+type WarpOptions = (Option<(f64, f64)>, Option<AnimationSpec>);
+
 /// A warp's options (#220): `to`, where on a window, `"center"` or a share
 /// of its width and height `{ x, y }`, and `motion`, how the drawn pointer
 /// flies there, `{ duration, easing }`. `to` left out is `None` for the
@@ -5594,10 +5598,7 @@ const CENTRE: (f64, f64) = (0.5, 0.5);
 /// once. A duration left out of a motion is the default 220 ms, and an
 /// easing the default `"outCubic"`, as `sol.animate`'s are.
 /// `tests::sol_warp_names_a_window_or_a_point_and_a_bad_one_is_an_error`.
-fn warp_options(
-    options: Option<&Table>,
-    caller: &str,
-) -> mlua::Result<(Option<(f64, f64)>, Option<AnimationSpec>)> {
+fn warp_options(options: Option<&Table>, caller: &str) -> mlua::Result<WarpOptions> {
     let Some(options) = options else {
         return Ok((None, None));
     };
