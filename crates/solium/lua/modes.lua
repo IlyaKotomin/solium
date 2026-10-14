@@ -89,11 +89,18 @@ end
 -- it, so `super+shift+r` while tiling would silently answer floating's
 -- click-only default until the next `super+t`.
 -- `a_reload_keeps_the_focus_model_tiling_was_switched_to`.
+--
+-- `after_close` is the mode's own entry in `config.focus.after_close` (#128),
+-- or nil -- the compositor's own rule, the window under the pointer and then
+-- the topmost -- for a mode that has none, as for a mode registered outside
+-- `config.lua`. `the_shipped_modes_each_hand_over_their_own_focus_model`.
 local function apply_focus_mode(name)
+    local after_close = config.focus.after_close
     sol.focus_mode({
         click = config.focus.click,
         follow = follow_for(name),
         clear_on_empty_click = config.focus.clear_on_empty_click,
+        after_close = type(after_close) == "table" and after_close[name] or nil,
     })
 end
 

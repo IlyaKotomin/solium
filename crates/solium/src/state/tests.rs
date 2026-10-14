@@ -19939,10 +19939,96 @@ end)
                 press(desk, &[SUPER, Q]);
             }
 
+            fn window_of(desk: &Desk, pane: crate::pane::PaneId) -> Window {
+                desk.state
+                    .panes
+                    .get(pane)
+                    .and_then(Pane::client)
+                    .cloned()
+                    .expect("the pane has its client")
+            }
+
+            fn give_keyboard(desk: &mut Desk, pane: crate::pane::PaneId) {
+                let window = window_of(desk, pane);
+                desk.state
+                    .focus_window(&window, SERIAL_COUNTER.next_serial());
+                assert_eq!(
+                    desk.focused(),
+                    pane,
+                    "the premise: the window has the keyboard"
+                );
+            }
+
             fn centre(rect: Rectangle<i32, Logical>) -> (f64, f64) {
                 (
                     f64::from(rect.loc.x) + f64::from(rect.size.w) / 2.0,
                     f64::from(rect.loc.y) + f64::from(rect.size.h) / 2.0,
+                )
+            }
+
+            /// Three tiles, and which is which: `(whole, closed, grows)` --
+            /// the window with the right of the screen to itself, and the two
+            /// that share the left, one of which is closed and the other of
+            /// which grows into its space when it is.
+            ///
+            /// Opened one at a time with tiling on and the pointer at the
+            /// left, so each new window splits the tile there, as it does
+            /// in use. That puts the whole tile last in the layout's sweep,
+            /// so it is the topmost of the three once the layout has placed
+            /// them again -- which is where the keyboard went before #128.
+            fn three_tiles(
+                desk: &mut Desk,
+                before: &str,
+            ) -> (
+                crate::pane::PaneId,
+                crate::pane::PaneId,
+                crate::pane::PaneId,
+            ) {
+                let first = desk.open().2;
+                start(desk, "tiling", before);
+                point_at(&mut desk.state, (200.0, 540.0).into());
+                let mut panes = vec![first];
+                for _ in 0..2 {
+                    panes.push(desk.open().2);
+                    desk.state.clock.advance(Duration::from_secs(1));
+                    let now = desk.state.clock.now();
+                    desk.state.settle(now);
+                    desk.pump();
+                }
+                let whole = panes
+                    .iter()
+                    .copied()
+                    .max_by_key(|pane| desk.placed(*pane).loc.x)
+                    .expect("three windows");
+                let pair: Vec<crate::pane::PaneId> = panes
+                    .iter()
+                    .copied()
+                    .filter(|pane| *pane != whole)
+                    .collect();
+                let (one, other, right) = (
+                    desk.placed(pair[0]),
+                    desk.placed(pair[1]),
+                    desk.placed(whole),
+                );
+                assert!(
+                    one.loc.x == other.loc.x
+                        && one.size.w == other.size.w
+                        && one.loc.x + one.size.w < right.loc.x
+                        && right.size.h > one.size.h,
+                    "the premise: two tiles share the left of the screen, {one:?} and \
+                     {other:?}, and one has the right, {right:?}"
+                );
+                (whole, pair[0], pair[1])
+            }
+
+            /// `config.focus.after_close.tiling = list`, written so that a
+            /// configuration that has no `after_close` -- the compositor
+            /// before #128 -- still loads, and ignores it.
+            fn set_after_close(list: &str) -> String {
+                format!(
+                    "local focus = require(\"config\").focus\n\
+                     focus.after_close = focus.after_close or {{}}\n\
+                     focus.after_close.tiling = {list}"
                 )
             }
 
@@ -20092,6 +20178,297 @@ end)
                         }
                     }
                 }
+            }
+
+            /// **In tiling, the window that takes the closed one's space
+            /// takes the keyboard** as the close lands, and between two that
+            /// take it equally, the one used last -- not whichever the
+            /// layout's sweep happened to stack on top, which is where the
+            /// compositor gave it before #128.
+            ///
+            /// Four tiles, opened with the pointer at the top left so each
+            /// new window splits the tile there: one of them has two side by
+            /// side over it, and when it is closed with `super+q`, Russian
+            /// active, both grow into its space. Run twice, each of the two
+            /// used last once; the keyboard follows that.
+            /// Against `0ce2ab8` it fails in one of the two runs: the
+            /// keyboard went to the same window both times.
+            #[test]
+            fn in_tiling_the_window_that_takes_the_space_takes_the_keyboard() {
+                for used_last in [0, 1] {
+                    let mut desk = Desk::new();
+                    let mut panes = vec![desk.open().2];
+                    start(&mut desk, "tiling", "");
+                    for at in [(200.0, 540.0), (200.0, 300.0), (200.0, 300.0)] {
+                        point_at(&mut desk.state, at.into());
+                        panes.push(desk.open().2);
+                        desk.state.clock.advance(Duration::from_secs(1));
+                        let now = desk.state.clock.now();
+                        desk.state.settle(now);
+                        desk.pump();
+                    }
+                    panes.truncate(4);
+                    // The window with two side by side across the whole of
+                    // one of its sides: its space is theirs when it goes.
+                    let pair_over = |closed: crate::pane::PaneId| {
+                        let stood = desk.placed(closed);
+                        let others: Vec<crate::pane::PaneId> = panes
+                            .iter()
+                            .copied()
+                            .filter(|pane| *pane != closed)
+                            .collect();
+                        others.iter().copied().find_map(|one| {
+                            others
+                                .iter()
+                                .copied()
+                                .find(|other| {
+                                    let (a, b) = (desk.placed(one), desk.placed(*other));
+                                    a.loc.y == b.loc.y
+                                        && a.size.h == b.size.h
+                                        && a.loc.x == stood.loc.x
+                                        && b.loc.x + b.size.w == stood.loc.x + stood.size.w
+                                        && a.loc.x < b.loc.x
+                                })
+                                .map(|other| (one, other))
+                        })
+                    };
+                    let (closed, takers) = panes
+                        .iter()
+                        .copied()
+                        .find_map(|closed| pair_over(closed).map(|pair| (closed, pair)))
+                        .unwrap_or_else(|| {
+                            let tiles: Vec<_> =
+                                panes.iter().map(|pane| desk.placed(*pane)).collect();
+                            panic!("the premise: a tile with two side by side over it: {tiles:?}")
+                        });
+                    let takers = [takers.0, takers.1];
+                    russian(&mut desk.state);
+                    point_at(&mut desk.state, (1.0, 1.0).into());
+                    give_keyboard(&mut desk, takers[used_last]);
+                    give_keyboard(&mut desk, closed);
+                    let stood = desk.placed(closed);
+
+                    super_q(&mut desk);
+                    assert!(
+                        desk.events()
+                            .ends_with(&format!("closing {}*", closed.get())),
+                        "the premise: super+q closed the focused window: {}",
+                        desk.events()
+                    );
+                    assert!(
+                        takers.iter().all(|pane| desk.placed(*pane).overlaps(stood)),
+                        "the premise: both grew into where the closed window stood, {stood:?}"
+                    );
+                    assert_eq!(
+                        desk.focused(),
+                        closed,
+                        "the keyboard left the closing window before its close landed"
+                    );
+                    let history = desk.state.focus_history.clone();
+                    desk.ask();
+                    assert_eq!(
+                        desk.focused(),
+                        takers[used_last],
+                        "the keyboard did not go to the window that took the space and was \
+                         used last: {takers:?}, the one used last {used_last}, closed \
+                         {closed:?}, focused before {history:?}, placed {:?}",
+                        takers.map(|pane| desk.placed(pane))
+                    );
+                }
+            }
+
+            /// **In scrolling, the column that takes the closed one's place
+            /// takes the keyboard**: three columns, the middle one closed,
+            /// and the one to its right slides into its place. Not the
+            /// column on the left, used before it and the topmost.
+            /// Against `0ce2ab8` it fails at the last assertion.
+            #[test]
+            fn in_scrolling_the_column_that_takes_the_place_takes_the_keyboard() {
+                let mut desk = Desk::new();
+                let mut panes = [desk.open().2, desk.open().2, desk.open().2];
+                start(&mut desk, "scrolling", "");
+                russian(&mut desk.state);
+                point_at(&mut desk.state, (1.0, 1.0).into());
+                panes.sort_by_key(|pane| desk.placed(*pane).loc.x);
+                let [left, middle, right] = panes;
+                give_keyboard(&mut desk, left);
+                give_keyboard(&mut desk, middle);
+                let stood = desk.placed(middle);
+
+                super_q(&mut desk);
+                assert!(
+                    desk.placed(right).overlaps(stood) && !desk.placed(left).overlaps(stood),
+                    "the premise: the right-hand column slid into the closed one's place, \
+                     {stood:?}: it is at {:?} and the left one at {:?}",
+                    desk.placed(right),
+                    desk.placed(left)
+                );
+                desk.ask();
+                assert_eq!(
+                    desk.focused(),
+                    right,
+                    "the keyboard did not go to the column that took the place"
+                );
+            }
+
+            /// **In floating, the window used before the closed one on its
+            /// monitor takes the keyboard** -- not one on the other monitor,
+            /// though that was used more recently and is the topmost.
+            /// Against `0ce2ab8` it fails at the last assertion: the
+            /// keyboard went across to the other monitor.
+            #[test]
+            fn in_floating_the_window_focused_before_it_on_that_monitor_takes_the_keyboard() {
+                let mut desk = Desk::side_by_side();
+                let before = desk.open().2;
+                let across = desk.open().2;
+                let closed = desk.open().2;
+                start(&mut desk, "floating", "");
+                russian(&mut desk.state);
+                for (pane, at) in [
+                    (before, (100, 100)),
+                    (across, (2020, 100)),
+                    (closed, (400, 300)),
+                ] {
+                    let window = window_of(&desk, pane);
+                    desk.state.map_stacked(window, at, false);
+                }
+                desk.state.space.refresh();
+                desk.state.sync_panes();
+                point_at(&mut desk.state, (1500.0, 900.0).into());
+                give_keyboard(&mut desk, before);
+                give_keyboard(&mut desk, across);
+                give_keyboard(&mut desk, closed);
+
+                super_q(&mut desk);
+                desk.ask();
+                assert_eq!(
+                    desk.focused(),
+                    before,
+                    "the keyboard did not go to the window used before on the closed one's \
+                     monitor"
+                );
+            }
+
+            /// **`"pointer"` gives the keyboard to the window under the
+            /// pointer, and the list decides whether it comes first**: with
+            /// the shipped tiling list the window under the pointer takes it;
+            /// with `{ "neighbour", "topmost" }` the window that took the
+            /// space does, wherever the pointer is.
+            /// Against `0ce2ab8` it fails at the second list: the
+            /// configuration was not read and the pointer always won.
+            #[test]
+            fn with_after_close_pointer_the_window_under_the_pointer_takes_the_keyboard() {
+                for (list, takes) in [
+                    ("nil", "under the pointer"),
+                    ("{ \"neighbour\", \"topmost\" }", "grew"),
+                ] {
+                    let mut desk = Desk::new();
+                    let before = if list == "nil" {
+                        String::new()
+                    } else {
+                        set_after_close(list)
+                    };
+                    let (whole, closed, grows) = three_tiles(&mut desk, &before);
+                    russian(&mut desk.state);
+                    give_keyboard(&mut desk, closed);
+                    let (x, y) = centre(
+                        desk.state
+                            .pane_outer_of(whole)
+                            .expect("a mapped pane has a rectangle"),
+                    );
+                    point_at(&mut desk.state, (x, y).into());
+
+                    super_q(&mut desk);
+                    desk.ask();
+                    let expected = if takes == "grew" { grows } else { whole };
+                    assert_eq!(
+                        desk.focused(),
+                        expected,
+                        "after_close.tiling = {list}: the keyboard did not go to the window \
+                         {takes}"
+                    );
+                }
+            }
+
+            /// **`"recent"` hands the keyboard back to the window used before
+            /// the closed one, and an empty list leaves it on nothing** --
+            /// changing the key changes where it goes. The window used
+            /// before is not the topmost here: the one that grows is raised
+            /// over it without being focused.
+            /// Against `0ce2ab8` it fails at `"recent"`: the topmost took it.
+            #[test]
+            fn with_after_close_recent_tiling_hands_the_keyboard_to_the_window_used_before() {
+                for list in ["{ \"recent\" }", "{}"] {
+                    let mut desk = Desk::new();
+                    let (whole, closed, grows) = three_tiles(&mut desk, &set_after_close(list));
+                    russian(&mut desk.state);
+                    point_at(&mut desk.state, (1.0, 1.0).into());
+                    give_keyboard(&mut desk, whole);
+                    give_keyboard(&mut desk, closed);
+                    let raised = window_of(&desk, grows);
+                    desk.state.space.raise_element(&raised, false);
+                    desk.state.sync_panes();
+
+                    super_q(&mut desk);
+                    desk.ask();
+                    let now = desk
+                        .state
+                        .focused_window()
+                        .and_then(|window| desk.state.panes.id_of(&window));
+                    let expected = if list == "{}" { None } else { Some(whole) };
+                    assert_eq!(
+                        now, expected,
+                        "after_close.tiling = {list}: the keyboard is on {now:?}"
+                    );
+                }
+            }
+
+            /// **A window that closes itself while it has the keyboard hands
+            /// it to the window that takes its place**, as one the
+            /// compositor closes does -- `exit` in a terminal is the
+            /// ordinary way to close one.
+            /// Against `0ce2ab8` it fails at the last assertion: the topmost
+            /// took it.
+            #[test]
+            fn a_window_that_closes_itself_hands_the_keyboard_to_the_window_that_takes_its_place() {
+                let mut desk = Desk::new();
+                let opened: Vec<(Window, xdg_toplevel::XdgToplevel, crate::pane::PaneId)> =
+                    (0..3).map(|_| desk.open()).collect();
+                start(&mut desk, "tiling", "");
+                let area = |pane| {
+                    let placed = desk.placed(pane);
+                    i64::from(placed.size.w) * i64::from(placed.size.h)
+                };
+                let whole = opened
+                    .iter()
+                    .map(|each| each.2)
+                    .max_by_key(|pane| area(*pane))
+                    .expect("three windows");
+                let mut pair = opened.iter().filter(|each| each.2 != whole);
+                let (closing, grows) = match (pair.next(), pair.next()) {
+                    (Some(closing), Some(grows)) => (closing, grows.2),
+                    _ => panic!("the premise: three windows"),
+                };
+                point_at(&mut desk.state, (1.0, 1.0).into());
+                give_keyboard(&mut desk, whole);
+                give_keyboard(&mut desk, closing.2);
+
+                closing.1.destroy();
+                desk.pump();
+                desk.state.space.refresh();
+                desk.state.sync_panes();
+
+                assert!(
+                    desk.events()
+                        .ends_with(&format!("close {}*", closing.2.get())),
+                    "the premise: the window went on its own: {}",
+                    desk.events()
+                );
+                assert_eq!(
+                    desk.focused(),
+                    grows,
+                    "the keyboard did not go to the window that took the space"
+                );
             }
 
             /// **Hovering a window focuses it in tiling and scrolling, and

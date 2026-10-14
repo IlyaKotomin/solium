@@ -561,13 +561,18 @@ pub(crate) enum Command {
     /// before it said. It used to mean "leave the current answer alone",
     /// which made a mode that names nothing inherit the mode before it: the
     /// shipped floating's click-only, so tiling never followed the pointer
-    /// (#128).
+    /// (#128). `after_close`'s `None` is
+    /// [`crate::successor::Successor::UNCONFIGURED`].
     /// `a_mode_that_names_nothing_gets_the_machines_own_focus_not_the_last_modes`
     /// in `state/tests.rs`.
     FocusMode {
         click: Option<bool>,
         follow: Option<bool>,
         clear_on_empty_click: Option<bool>,
+        /// Where the keyboard goes when the window that has it closes, word
+        /// by word (#128): `config.focus.after_close` for the mode. See
+        /// `crate::successor`.
+        after_close: Option<Vec<crate::successor::Successor>>,
     },
     /// Turn one monitor, by name, or every one, on or off. See `power.rs`.
     Power {
@@ -848,6 +853,52 @@ impl Kept {
 }
 
 /// A Lua value as a log line should name it.
+/// `sol.focus_mode`'s `after_close`: one word of
+/// [`crate::successor::Successor`], or a list of them in order (#128).
+///
+/// A word it does not know is named in the log and left out, and the rest
+/// still count; what is left can be nothing at all, which leaves the keyboard
+/// on nothing when the window that has it closes, as asked. `nil` is `None`,
+/// the compositor's own rule, and anything else is named and read as `nil`.
+/// `sol_focus_mode_reads_after_close_word_by_word`.
+fn after_close_words(value: &Value) -> Option<Vec<crate::successor::Successor>> {
+    let word = |each: &Value| -> Option<crate::successor::Successor> {
+        let parsed = match each {
+            Value::String(text) => text
+                .to_str()
+                .ok()
+                .and_then(|text| crate::successor::Successor::parse(&text)),
+            _ => None,
+        };
+        if parsed.is_none() {
+            tracing::warn!(
+                word = describe(each),
+                known = ?crate::successor::Successor::WORDS,
+                "focus_mode: after_close names something that is not one of its words; \
+                 leaving it out"
+            );
+        }
+        parsed
+    };
+    match value {
+        Value::Nil => None,
+        Value::String(_) => Some(word(value).into_iter().collect()),
+        Value::Table(list) => Some(
+            list.sequence_values::<Value>()
+                .filter_map(Result::ok)
+                .filter_map(|each| word(&each))
+                .collect(),
+        ),
+        other => {
+            tracing::warn!(
+                value = describe(other),
+                "focus_mode: after_close is a word or a list of words; reading it as nil, the compositor's own rule"
+            );
+            None
+        }
+    }
+}
+
 fn describe(value: &Value) -> String {
     match value {
         Value::Integer(number) => number.to_string(),
@@ -3442,11 +3493,16 @@ fn build_api(lua: &Lua) -> mlua::Result<Table> {
                 ),
                 None => (None, None, None),
             };
+            let after_close = options
+                .as_ref()
+                .and_then(|options| options.get::<Value>("after_close").ok())
+                .and_then(|value| after_close_words(&value));
             with_pending(lua, |pending| {
                 pending.commands.push(Command::FocusMode {
                     click,
                     follow,
                     clear_on_empty_click,
+                    after_close,
                 });
             })
         })?,
@@ -6948,17 +7004,71 @@ mod tests {
                     click,
                     follow,
                     clear_on_empty_click,
+                    ..
                 } => Some((click, follow, clear_on_empty_click)),
                 _ => None,
             })
             .collect()
     }
 
+    /// Every `Command::FocusMode`'s `after_close` a run of commands carries,
+    /// in order.
+    fn after_closes(commands: Vec<Command>) -> Vec<Option<Vec<crate::successor::Successor>>> {
+        commands
+            .into_iter()
+            .filter_map(|command| match command {
+                Command::FocusMode { after_close, .. } => Some(after_close),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// **`after_close` is read word by word** (#128): a word, a list in
+    /// order, a word it does not know left out with the rest kept, an empty
+    /// list kept empty -- the keyboard left on nothing -- and `nil` or
+    /// anything else read as `None`, the compositor's own rule.
+    #[test]
+    fn sol_focus_mode_reads_after_close_word_by_word() {
+        use crate::successor::Successor::{Neighbour, Pointer, Recent, Topmost};
+        let directory = std::env::temp_dir().join("solium-script-test-after-close-words");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("a temporary directory");
+        let config = directory.join("init.lua");
+        std::fs::write(
+            &config,
+            r#"
+            sol.focus_mode({ after_close = { "recent", "neighbor", "pointer", 7 } })
+            sol.focus_mode({ after_close = "topmost" })
+            sol.focus_mode({ after_close = { "neighbour" } })
+            sol.focus_mode({ after_close = {} })
+            sol.focus_mode({})
+            sol.focus_mode({ after_close = 42 })
+            "#,
+        )
+        .expect("writing the test script");
+        let mut scripts = Scripts::load(&config).expect("loading the test script");
+        let words = after_closes(scripts.startup().commands);
+        let _ = std::fs::remove_dir_all(&directory);
+        assert_eq!(
+            words,
+            [
+                Some(vec![Recent, Pointer]),
+                Some(vec![Topmost]),
+                Some(vec![Neighbour]),
+                Some(vec![]),
+                None,
+                None,
+            ]
+        );
+    }
+
     /// **Each shipped mode hands over its own focus model** (#128): floating
-    /// click-only at load, tiling and scrolling following the pointer as
-    /// each is switched to.
+    /// click-only, tiling and scrolling following the pointer, each with its
+    /// own `focus.after_close` -- floating's at load, tiling's and
+    /// scrolling's as each is switched to.
     #[test]
     fn the_shipped_modes_each_hand_over_their_own_focus_model() {
+        use crate::successor::Successor::{Neighbour, Pointer, Recent, Topmost};
         let Some((directory, mut scripts)) =
             shipped_init_with_user("solium-script-test-after-close-shipped", "return {}")
         else {
@@ -6970,14 +7080,22 @@ mod tests {
             scripts.key("super+s", empty_snapshot()).commands,
         ];
         let _ = std::fs::remove_dir_all(&directory);
-        let [loaded, tiling, scrolling] = commands.map(focus_modes);
+        let [loaded, tiling, scrolling] =
+            commands.map(|commands| (focus_modes(commands.clone()), after_closes(commands)));
         assert_eq!(
             loaded,
-            [(None, Some(false), Some(true))],
+            (
+                vec![(None, Some(false), Some(true))],
+                vec![Some(vec![Recent, Topmost])]
+            ),
             "floating, at load"
         );
-        assert_eq!(tiling, [(None, Some(true), Some(true))], "tiling");
-        assert_eq!(scrolling, [(None, Some(true), Some(true))], "scrolling");
+        let layout = (
+            vec![(None, Some(true), Some(true))],
+            vec![Some(vec![Pointer, Neighbour, Topmost])],
+        );
+        assert_eq!(tiling, layout, "tiling");
+        assert_eq!(scrolling, layout, "scrolling");
     }
 
     /// **A key `sol.focus_mode` is not given is left to the machine** (#219):

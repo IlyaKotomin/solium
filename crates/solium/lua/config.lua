@@ -778,6 +778,45 @@ local defaults = {
             scrolling = "follow",
         },
 
+        -- Where the keyboard goes when the window that has it closes (#128):
+        -- per mode, a list of these, tried in order until one finds a window
+        -- on screen. The keyboard moves when the close lands -- as the window
+        -- finishes fading, not while you can still see it -- and when a
+        -- window goes on its own.
+        --
+        --   "pointer"    the window under the pointer, where the windows are
+        --                going: what hovering would pick the moment the
+        --                pointer moved, so it comes first where hover focus
+        --                is on.
+        --   "neighbour"  the window that takes its place on its monitor --
+        --                the tile that grows into the space, the column that
+        --                slides into it -- or, where nothing does, the one
+        --                nearest to where it stood. Of several, the one you
+        --                used last.
+        --   "recent"     the window you used before it, still open on its
+        --                monitor.
+        --   "topmost"    the topmost window on screen, on any monitor: what
+        --                the compositor does with no configuration, after
+        --                the window under the pointer.
+        --
+        -- A word that is not one of these is named in the log and skipped.
+        -- An empty list, `{}`, leaves the keyboard on nothing until you
+        -- click or point at a window. A mode with no entry here gets the
+        -- compositor's own rule, `{ "pointer", "topmost" }`.
+        --
+        --     focus = { after_close = { tiling = { "recent", "topmost" } } },
+        --
+        -- `in_tiling_the_window_that_takes_the_space_takes_the_keyboard`,
+        -- `in_scrolling_the_column_that_takes_the_place_takes_the_keyboard`,
+        -- `in_floating_the_window_focused_before_it_on_that_monitor_takes_the_keyboard`,
+        -- `with_after_close_pointer_the_window_under_the_pointer_takes_the_keyboard`
+        -- and `with_after_close_recent_tiling_hands_the_keyboard_to_the_window_used_before`.
+        after_close = {
+            floating = { "recent", "topmost" },
+            tiling = { "pointer", "neighbour", "topmost" },
+            scrolling = { "pointer", "neighbour", "topmost" },
+        },
+
         -- `click` and `follow` above, for every mode at once rather than one
         -- at a time -- not here by default, so that `nil` can mean "whatever
         -- this machine's form factor already answered" rather than a fixed
@@ -1452,8 +1491,9 @@ local open_sections = {
     focus = { click = true, follow = true },
     -- Mode names are open-ended, the same as a key combination: a mode
     -- outside this file can register any name with `modes.register` and
-    -- give `focus.modes` an entry of its own.
+    -- give `focus.modes` and `focus.after_close` entries of its own.
     ["focus.modes"] = true,
+    ["focus.after_close"] = true,
     -- `true` rather than a set of names: everything is accepted.
     bindings = true,
 }
@@ -1610,9 +1650,10 @@ end
 --   * `keyboard`, `cursor` and `bindings` are the sections above; the first
 --     two are checked against a list this file restates, the other two
 --     against nothing: `bindings` because any key combination is one, and
---     `focus.modes` because mode names are open-ended the same way (a mode
---     outside this file can register any name). `focus.modes.folating`
---     merges in silently, exactly like a misspelled binding.
+--     `focus.modes` and `focus.after_close` because mode names are
+--     open-ended the same way (a mode outside this file can register any
+--     name). `focus.modes.folating` merges in silently, exactly like a
+--     misspelled binding.
 --   * A value of the wrong *type* is not this check's business. `gap = "12"`
 --     is a recognised key and passes.
 for _, entry in ipairs(unrecognised) do

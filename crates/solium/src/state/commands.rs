@@ -429,6 +429,7 @@ impl Solium {
                     click,
                     follow,
                     clear_on_empty_click,
+                    after_close,
                 } => {
                     // `None` is the machine's own answer, the form factor's,
                     // and never the answer the last call left: see
@@ -441,6 +442,8 @@ impl Solium {
                         follow.unwrap_or(machine.focus_follows_mouse);
                     self.profile.clear_focus_on_empty_click =
                         clear_on_empty_click.unwrap_or(machine.clear_focus_on_empty_click);
+                    self.after_close = after_close
+                        .unwrap_or_else(|| crate::successor::Successor::UNCONFIGURED.to_vec());
                 }
                 Command::Power { monitor, on } => match monitor {
                     None => self.power_all(on),

@@ -1398,7 +1398,23 @@ return {
 }
 ```
 
-`lua/modes.lua` is what turns this into `sol.focus_mode`, on every mode
+When the window you are typing into closes, the keyboard moves on by itself
+as the close lands, and `focus.after_close` says where, per mode, as a list
+tried in order (#128): `"pointer"`, the window under the pointer;
+`"neighbour"`, the window that takes its place -- the tile that grows into
+the space, the column that slides into it -- or the nearest to where it
+stood; `"recent"`, the one you used before it on that monitor; `"topmost"`,
+the topmost window on any screen. Tiling and scrolling are
+`{ "pointer", "neighbour", "topmost" }` and floating is
+`{ "recent", "topmost" }`. An empty list leaves the keyboard on nothing:
+
+```lua
+return {
+    focus = { after_close = { tiling = { "recent", "topmost" } } },
+}
+```
+
+`lua/modes.lua` is what turns all of this into `sol.focus_mode`, on every mode
 change as well as at load, so a mode switch applies at once and a reload
 keeps whichever model the session was already in.
 

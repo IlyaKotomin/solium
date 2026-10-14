@@ -357,6 +357,16 @@ before it takes the silence for a refusal, so one slower than that to quit is
 refused and then closes, and the layout moves three times -- as it closes up,
 at `refused`, and at `close`.
 
+**Where the keyboard goes is the compositor's, not the layout's.** It stays on
+the window being closed until the close lands, so what you type during the
+fade goes where you are looking, and then moves by `config.focus.after_close`
+for the mode in charge: the window under the pointer, the window that took the
+closed one's place (or the one nearest to where it stood), the one used before
+it on that monitor, or the topmost -- in the order the mode lists them. A
+window that goes on its own while it has the keyboard hands it on the same
+way. A layout that wants a say focuses a window in its own handler; the
+compositor then leaves the keyboard where that put it.
+
 A layout that listens for neither event hears exactly what it always heard --
 `close`, once the window is gone -- so a mode written before these two existed
 keeps working unchanged, and keeps its slot for a closing window until the

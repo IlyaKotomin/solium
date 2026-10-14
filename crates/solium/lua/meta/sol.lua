@@ -298,7 +298,15 @@
 ---@class sol.FocusModeOptions
 ---@field click? boolean Whether a press focuses the window it lands on.
 ---@field follow? boolean Whether moving the pointer over a window focuses it.
+---@field after_close? sol.AfterClose|sol.AfterClose[] Where the keyboard goes when the window that has it closes, tried in order until one finds a window on screen; `{}` leaves it on nothing. Left out: `{ "pointer", "topmost" }`. An unknown word is logged and skipped.
 ---@field clear_on_empty_click? boolean Whether a press on empty desktop or the wallpaper clears keyboard focus. A press on a client's own shell surface (a bar, say) is not covered yet, even one that declines the keyboard: see #219.
+
+---One word of `sol.FocusModeOptions.after_close` (#128).
+---@alias sol.AfterClose
+---| "pointer" # The window under the pointer, where the windows are going.
+---| "neighbour" # The window that takes the closed one's place on its monitor -- one going into where it stood -- or the one nearest to it; of several, the one focused last.
+---| "recent" # The window focused most recently that is still open on its monitor.
+---| "topmost" # The topmost window on screen, on any monitor.
 
 ---The pointer's theme. A key left out, or no table, means the configuration
 ---did not say, and `XCURSOR_THEME` and `XCURSOR_SIZE` have their turn.

@@ -298,9 +298,9 @@ end)
 -- has played, and "when_gone" leaves it all to `close`.
 --
 -- `apply` and not `settle`, as `close` has always been: the keyboard leaves a
--- closing window when its animation lands, which is the compositor's to decide,
--- and a layout handing it to a neighbour now would take it off the window the
--- user is still looking at.
+-- closing window when its animation lands, which is the compositor's to decide
+-- (`config.focus.after_close`), and a layout handing it to a neighbour now
+-- would take it off the window the user is still looking at.
 --
 -- Only while this layout is in charge, for the reason `tiling.lua` gives: a
 -- strip nobody is using is not on screen, and one rearranged anyway comes back
