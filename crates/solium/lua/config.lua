@@ -1369,7 +1369,15 @@ local defaults = {
     -- for rules. With no rules nothing changes, and costs nothing.
     effects = {
         -- { match = { app_id = "mpv" }, part = "client", slot = "replace",
-        --   effect = { "blur", source = "self" } }
+        --   effect = { "blur", source = "self" } },
+        -- { match = { app_id = "kitty" }, part = "client", slot = "behind",
+        --   effect = "blur", memo = true, cut = "below" },
+        --
+        -- The first blurs a window's own pixels. The second, with no
+        -- `source`, blurs what lies behind a translucent window: the layers
+        -- below it (`cut = "background"`: the wallpaper alone, even where
+        -- `xray.layers` holds "bottom"), blurred once per monitor and shared
+        -- between windows (`memo = false`: each window blurs it alone).
         --
         -- A list, so yours replaces this one whole. A set with a broken rule
         -- is refused whole, named on the overlay, and the rules that ran stay.
