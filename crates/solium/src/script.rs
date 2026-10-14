@@ -3725,7 +3725,9 @@ fn build_api(lua: &Lua) -> mlua::Result<Table> {
         })?,
     )?;
 
-    // What fills a window while a resize drag is ahead of its client.
+    // How a window's picture is fitted while its rectangle and its client
+    // disagree about its size -- a drag ahead of its client, a glide between
+    // two tiles (#233) -- and what fills the part it does not cover.
     //
     // `Option<Table>` and not `Table`, for the reason `sol.cursor_theme` below
     // spells out at length: the documented way to override the configuration is
@@ -3747,7 +3749,7 @@ fn build_api(lua: &Lua) -> mlua::Result<Table> {
             // whole handler down with it. Same reasoning as `scene` above, and
             // it is how bezier easings once silently stopped working.
             //
-            // A name that is not one of the three is named in the log and the
+            // A name that is not one of the four is named in the log and the
             // default kept, rather than guessed at. Someone who wrote `fill =
             // "stretched"` wants to be told, and a compositor that silently
             // picks for them is one they cannot debug.
@@ -3769,14 +3771,29 @@ fn build_api(lua: &Lua) -> mlua::Result<Table> {
                             tracing::warn!(
                                 "resize.fill = \"scene\" only draws a scene a window already \
                                  has, which today means one resized before its application \
-                                 painted; anywhere else it behaves as \"hold\""
+                                 painted; anywhere else it behaves as \"anchor\""
                             );
                         }
                         resize.fill = fill;
                     }
                     None => tracing::warn!(
                         fill = %name,
-                        "resize.fill is one of stretch, hold or scene; keeping the default"
+                        "resize.fill is one of anchor, crop, stretch or scene; keeping the \
+                         default"
+                    ),
+                }
+            }
+            // The same for the colour of what a picture does not cover, for
+            // the same reasons. `the_shipped_resize_setting_reaches_the_compositor`.
+            if let Ok(Value::String(name)) = options.get::<Value>("background")
+                && let Ok(name) = name.to_str()
+            {
+                match crate::resizing::background_named(&name) {
+                    Some(background) => resize.background = background,
+                    None => tracing::warn!(
+                        background = %name,
+                        "resize.background is \"#rrggbb\", \"#rrggbbaa\" or \"none\"; \
+                         keeping the default"
                     ),
                 }
             }
@@ -8684,6 +8701,69 @@ mod tests {
                 .into_iter()
                 .filter_map(|command| match command {
                     Command::Fullscreen(covers) => Some(covers),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(handed, vec![wanted], "{user}");
+            let _ = std::fs::remove_dir_all(&directory);
+        }
+    }
+
+    /// **The shipped `resize` setting reaches the compositor (#233)**: the
+    /// default is `anchor` on `#1c1c1c`, and each key a user changes changes
+    /// what the compositor is told -- a name that is not one keeps the
+    /// default, as `fill`'s always did.
+    #[test]
+    fn the_shipped_resize_setting_reaches_the_compositor() {
+        use crate::resizing::{BACKGROUND, Fill, Settings};
+        for (user, wanted) in [
+            (
+                "return {}",
+                Settings {
+                    fill: Fill::Anchor,
+                    background: BACKGROUND,
+                },
+            ),
+            (
+                "return { resize = { fill = \"stretch\" } }",
+                Settings {
+                    fill: Fill::Stretch,
+                    background: BACKGROUND,
+                },
+            ),
+            (
+                "return { resize = { fill = \"crop\", background = \"#10203080\" } }",
+                Settings {
+                    fill: Fill::Crop,
+                    background: Some([0x10, 0x20, 0x30, 0x80]),
+                },
+            ),
+            (
+                "return { resize = { background = \"none\" } }",
+                Settings {
+                    fill: Fill::Anchor,
+                    background: None,
+                },
+            ),
+            (
+                "return { resize = { fill = \"hold\", background = \"dark\" } }",
+                Settings {
+                    fill: Fill::Anchor,
+                    background: BACKGROUND,
+                },
+            ),
+        ] {
+            let Some((directory, mut scripts)) =
+                shipped_init_with_user("solium-script-test-resize", user)
+            else {
+                return;
+            };
+            let handed: Vec<Settings> = scripts
+                .startup()
+                .commands
+                .into_iter()
+                .filter_map(|command| match command {
+                    Command::Resize(settings) => Some(settings),
                     _ => None,
                 })
                 .collect();

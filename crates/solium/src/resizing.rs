@@ -90,7 +90,8 @@
 //! for by a few pixels every single time; that is an answer, so it ends the
 //! bridge, and it is emphatically not the client that has walked away from the
 //! ask — treating it as one means kitty loses the configured fill on the first
-//! answer of every seam drag and gets [`Fill::Hold`]'s uncovered strip instead.
+//! answer of every seam drag configured to `stretch` and gets [`Fill::Anchor`]'s
+//! uncovered strip instead.
 //! [`ROUNDING`] is where the line is drawn and why it is drawn there.
 //!
 //! **And it is a line drawn afresh every frame, not once.** A client answers at
@@ -106,7 +107,7 @@ use std::time::Duration;
 
 use smithay::{
     reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge,
-    utils::{Logical, Rectangle, Size},
+    utils::{Logical, Point, Rectangle, Size},
 };
 
 use crate::{
@@ -157,54 +158,66 @@ const TELL_EVERY: Duration = Duration::from_millis(100);
 /// rather than a window stuck at the wrong size.
 pub(crate) const PATIENCE: Duration = Duration::from_millis(250);
 
-/// What fills a pane between the drag asking for a rectangle and the client
-/// filling it.
+/// How a client's picture is fitted to a rectangle it has not drawn at (#233).
 ///
-/// A matter of taste rather than of correctness, which is why it is
-/// configurable: all three end in the same place, and they differ only in what
-/// the gap looks like on the way.
+/// The picture and its rectangle disagree whenever the compositor moves first
+/// and the client follows: a drag ahead of its client, a layout's glide
+/// between two tiles, a fullscreen or maximise glide, and a client that
+/// answers with a size of its own (a terminal rounds to its cell grid). Each
+/// ends in the same place once the client has drawn at the rectangle's size;
+/// they differ only in what the window looks like on the way, which is taste,
+/// so it is `resize.fill` in `config.lua`.
+///
+/// Per axis, and only ever about the client's own picture: a frame's zoom (an
+/// open, a close, an overview thumbnail) scales the whole window on top of
+/// whatever this decides, and is not a disagreement between a client and its
+/// rectangle. `render::fit` is where it is applied, and
+/// `render::tests::each_fill_fits_a_picture_its_rectangle_has_outgrown`
+/// shows the four side by side.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Fill {
-    /// Scale the client's last buffer into the pane's rectangle.
+    /// Scale the client's picture into the rectangle, each axis on its own.
     ///
-    /// The default, and what niri does. Costs nothing — `render.rs` already
-    /// scales every window's surface tree into the rectangle its presentation
-    /// gives it, and this is that same number computed from a rectangle the
-    /// client has not agreed to yet rather than from one it has.
-    #[default]
+    /// What every glide and drag did before #233, kept exactly: a tiled
+    /// client that committed more than its rectangle is cut to it (#133), and
+    /// on every other axis the picture is scaled to fill, so nothing is ever
+    /// uncovered and text is drawn wider or taller than its client drew it
+    /// for as long as the two disagree -- up to 1.8x on a glide that halves a
+    /// terminal, and without bound on a degenerate buffer (#125). Smooth,
+    /// momentarily soft, and what niri does.
     Stretch,
-    /// Keep the last buffer at its own size inside the new rectangle.
+    /// The picture at its own size, against the edges the change does not
+    /// move, and cut to the rectangle. The default since #233.
     ///
-    /// Crisp instead of smooth: nothing is resampled, so what is uncovered
-    /// while the pane grows is the pane beneath rather than a stretched
-    /// picture. The frame still tracks the pointer exactly; only the picture
-    /// inside it lags.
+    /// **Never scaled.** A buffer is drawn at the size its client drew it, so
+    /// a glyph is the same width and height on every frame of a glide or a
+    /// drag. Where the picture is larger than the rectangle the part past it
+    /// is cut away; where it is smaller the pane's background fills the rest
+    /// (`resize.background`, `render::uncovered`).
     ///
-    /// **Anchored against the edges the drag is not moving**, which is what
-    /// makes that claim true for all eight of them rather than for the two easy
-    /// ones. Drawing the held buffer at the rectangle's top-left is right for a
-    /// bottom or right drag, where the top-left is exactly the corner standing
-    /// still, and wrong for every drag that pulls a left or top edge: the
-    /// picture would travel with the edge under the pointer and the uncovered
-    /// strip would open along the *stationary* edge, so the whole of the
-    /// window's contents would slide while the user dragged. [`Hold::pins`] is
-    /// the question, `render.rs` offsets by the slack it answers, and the offset
-    /// is zero for [`Fill::Stretch`] because a stretched buffer leaves no slack.
+    /// **Against the edges standing still**, which is what keeps the window's
+    /// contents still while one side of it moves. Drawing the picture at the
+    /// rectangle's top-left is right for a change that moves the right or
+    /// bottom edge, and wrong for one that moves a left or top edge alone: the
+    /// picture would travel with the moving edge and the gap would open, or the
+    /// cut fall, along the edge that is not moving. So the far edge is pinned
+    /// when the near one moves alone -- [`Hold::pins`] for a drag, [`pins`]
+    /// between the two ends of a glide -- and the top-left otherwise, which
+    /// includes a rectangle that moves both of an axis' edges or neither.
+    #[default]
+    Anchor,
+    /// The picture at its own size, at the rectangle's top-left, whichever
+    /// edge moves, and cut to the rectangle.
     ///
-    /// **Asymmetric on purpose.** Growing the pane holds the buffer at 1.0 and
-    /// leaves a strip uncovered, which is the whole idea. Shrinking it cannot
-    /// do the same without clipping the buffer to the pane, and there is no
-    /// clip in the element path while a hold is live — an unclipped oversized
-    /// buffer would spill over the frame and over the neighbouring window. So
-    /// shrinking falls back to scaling down, which is the direction where
-    /// resampling is close to free of artefacts anyway. See [`factor`].
-    ///
-    /// **Since #133 there is a clip, and this does not use it yet.**
-    /// `render::fit` cuts a tiled client to the rectangle its frame pictures,
-    /// and `Solium::tile_of` answers `None` under a hold, so a held pane is drawn
-    /// exactly as this describes. Holding a shrinking buffer at 1.0 inside that
-    /// cut is #125's change and not #133's.
-    Hold,
+    /// [`Fill::Anchor`] without the anchoring: never scaled, cut and filled
+    /// the same way, and the picture stays at the corner its client draws
+    /// from. The difference is a change that moves a left or top edge alone.
+    /// There the picture's left edge goes with the moving one, so what is cut
+    /// away, or uncovered, is along the right or the bottom, and the left of a
+    /// left-aligned page -- a terminal's prompt, an editor's gutter -- stays
+    /// at the window's own left edge, where the client's next picture will put
+    /// it too.
+    Crop,
     /// Draw the pane's QML scene over the client until it arrives.
     ///
     /// The one only Solium can offer, since a pane already hosts QML — this is
@@ -221,7 +234,7 @@ pub(crate) enum Fill {
     /// second exception in the one function documented as the place the
     /// compositor's view and the space's are reconciled. That is #84's
     /// reconciliation work, not this issue's. Until then this behaves as
-    /// [`Fill::Hold`] under the scene, which is what it would do anyway once
+    /// [`Fill::Anchor`] under the scene, which is what it would do anyway once
     /// the scene faded.
     Scene,
 }
@@ -231,20 +244,98 @@ impl Fill {
     ///
     /// Returns `None` for a name that is not one, so the caller can say which
     /// word it did not understand rather than silently choosing for the user.
+    /// `hold` is not one since #233: it was [`Fill::Anchor`] without the cut,
+    /// and is that fill now. `tests::a_fill_is_named_in_the_configuration_or_it_is_not_one`.
     pub(crate) fn named(name: &str) -> Option<Self> {
         match name {
             "stretch" => Some(Self::Stretch),
-            "hold" => Some(Self::Hold),
+            "anchor" => Some(Self::Anchor),
+            "crop" => Some(Self::Crop),
             "scene" => Some(Self::Scene),
             _ => None,
         }
     }
+
+    /// Whether this fill scales a client's picture into its rectangle.
+    pub(crate) const fn stretches(self) -> bool {
+        matches!(self, Self::Stretch)
+    }
+
+    /// Whether this fill keeps a picture against the edges standing still.
+    /// [`Fill::Crop`] keeps it at the top-left instead.
+    pub(crate) const fn anchors(self) -> bool {
+        matches!(self, Self::Anchor | Self::Scene)
+    }
+}
+
+/// The colour a pane shows where its client's picture does not reach, as
+/// straight (not premultiplied) RGBA bytes; `None` draws nothing there, so what
+/// is beneath the window shows.
+///
+/// `resize.background`, read by [`background_named`]. Only a fill that does
+/// not stretch leaves anything uncovered, and only while a picture is smaller
+/// than its rectangle: a glide that shrinks a window whose client has answered,
+/// a drag that grows one whose client has not, a degenerate buffer (#125).
+/// `script::tests::the_shipped_resize_setting_reaches_the_compositor`.
+pub(crate) type Background = Option<[u8; 4]>;
+
+/// The shipped `resize.background`: `#1c1c1c`, opaque.
+///
+/// **A colour, and not the frame, fills the gap.** A style's frame is QML with
+/// a hole where the client goes, and a style may draw nothing in it at all --
+/// `top`, the default, draws only its titlebar band, and a bare window has no
+/// frame -- so a frame cannot be relied on to cover the client's rectangle. A
+/// solid under the client's rectangle works under every style, costs one
+/// element per uncovered strip, and only while there is a strip.
+///
+/// **This shade** is the shipped theme's darkest surface (`Theme.qml`'s
+/// `surfaceInactive`), so on the default desktop the gap reads as part of the
+/// window rather than as a hole through it to the wallpaper. Not read from the
+/// theme, for `remains::FILL`'s reason: there is no channel from a style's QML
+/// to the compositor for its colours. A style that wants its own `behind`
+/// layer to show there sets `background = "none"`.
+pub(crate) const BACKGROUND: Background = Some([0x1c, 0x1c, 0x1c, 0xff]);
+
+/// Read `resize.background`: `"#rrggbb"`, `"#rrggbbaa"`, or `"none"`.
+///
+/// The outer `None` is a word that is none of those, so the caller can name it
+/// and keep the default rather than guess; `Some(None)` is `"none"`.
+/// `tests::a_background_is_a_colour_or_none_or_not_one`.
+pub(crate) fn background_named(name: &str) -> Option<Background> {
+    if name == "none" {
+        return Some(None);
+    }
+    let digits = name.strip_prefix('#')?;
+    if !matches!(digits.len(), 6 | 8) || !digits.is_ascii() {
+        return None;
+    }
+    let byte = |at: usize| {
+        digits
+            .get(at..at + 2)
+            .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+    };
+    Some(Some([
+        byte(0)?,
+        byte(2)?,
+        byte(4)?,
+        byte(6).unwrap_or(0xff),
+    ]))
 }
 
 /// What `config.lua` said about resizing.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Settings {
     pub(crate) fill: Fill,
+    pub(crate) background: Background,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            fill: Fill::default(),
+            background: BACKGROUND,
+        }
+    }
 }
 
 /// A live edge drag, and the window whose pane's slot it has taken charge of.
@@ -378,9 +469,9 @@ pub(crate) struct Hold {
 /// A terminal answers a configure with the nearest whole number of character
 /// cells, so it is a few pixels off *every single time*; with no distinction
 /// drawn, kitty — the ordinary tiled client — is declined from its first answer
-/// onward and [`Fill::Hold`] is forced for the whole of every seam drag. The
+/// onward and [`Fill::Anchor`] is forced for the whole of every seam drag. The
 /// user's configured `stretch` would then never once apply to a terminal, and
-/// what they would see instead is `Fill::Hold`'s deliberately uncovered strip:
+/// what they would see instead is `Fill::Anchor`'s deliberately uncovered strip:
 /// a *different* wrong-looking frame rather than no wrong-looking frame, which
 /// is the symptom this whole issue is about.
 ///
@@ -432,7 +523,7 @@ const CELL: i32 = 24;
 /// in one step and the answer comes a frame or two later, so a client that is
 /// keeping up is an interval behind for those frames — every interval, on every
 /// drag. That would read as a refusal once per interval and put one frame of
-/// [`Fill::Hold`]'s deliberately uncovered strip on screen each time: the band
+/// [`Fill::Anchor`]'s deliberately uncovered strip on screen each time: the band
 /// of background [`ROUNDING`] exists to keep off a terminal's drags, back at
 /// ten hertz instead of for the whole gesture.
 ///
@@ -506,7 +597,7 @@ impl Hold {
     ///
     /// The edges whose *opposite* number is standing still, which is what a
     /// picture held at its own size has to be anchored against — see
-    /// [`Fill::Hold`] — and the same question [`Self::anchored`] asks when a
+    /// [`Fill::Anchor`] — and the same question [`Self::anchored`] asks when a
     /// client's own size wins.
     pub(crate) const fn pins(&self) -> (bool, bool) {
         (pulls_left(self.edges), pulls_top(self.edges))
@@ -559,7 +650,7 @@ impl Hold {
     /// when we spoke to it, so it has answered; whether it answered with what
     /// it was asked for decides only whether the bridge is measuring a delay or
     /// a refusal. A refusal stops the stretch immediately — [`Self::fill`]
-    /// forces [`Fill::Hold`] — because a client that is not going to reach the
+    /// forces [`Fill::Anchor`] — because a client that is not going to reach the
     /// size it was offered will never bring the factor back to 1, and a
     /// stretched window that never un-stretches is worse than the shake this
     /// module was written to remove.
@@ -691,7 +782,7 @@ impl Hold {
     /// has stopped answering, and the ask stops running away here: from this
     /// point [`Self::settle`] bounds the stretch at [`PATIENCE`] whatever the
     /// client does. Counting it would only let a drag that ended in the few
-    /// milliseconds between a configure and its answer flash [`Fill::Hold`]'s
+    /// milliseconds between a configure and its answer flash [`Fill::Anchor`]'s
     /// uncovered strip at the one moment the user is looking at the result.
     pub(crate) fn release(
         &mut self,
@@ -834,55 +925,76 @@ impl Hold {
 
     /// What actually fills the pane, given what the configuration asked for.
     ///
-    /// A refusal overrides the setting. See [`Self::declined`]: the client is
-    /// not tracking what it is being offered, so a stretch would never return
-    /// to 1 and the window would stay soft until something else resized it.
+    /// A refusal overrides a configured stretch. See [`Self::declined`]: the
+    /// client is not tracking what it is being offered, so a stretch would
+    /// never return to 1 and the window would stay soft until something else
+    /// resized it. A fill that does not stretch has nothing to take away, so
+    /// it stands: `crop` stays `crop` (#233,
+    /// `tests::a_refused_size_stops_the_stretch_instead_of_stretching_for_ever`).
     ///
     /// **A rounding does not**, which is [`Self::refused`] and not
-    /// `declined.is_some()`. `Fill::Hold` deliberately leaves an uncovered
+    /// `declined.is_some()`. `Fill::Anchor` deliberately leaves an uncovered
     /// strip while a pane grows, so forcing it for a client that is four pixels
     /// off its ask trades a stretch nobody can see for a band of background
     /// nobody asked for.
     pub(crate) fn fill(&self, configured: Fill) -> Fill {
-        if self.refused() {
-            Fill::Hold
+        if self.refused() && configured.stretches() {
+            Fill::Anchor
         } else {
             configured
         }
     }
 }
 
-/// How much a client's last buffer is scaled by to fill the rectangle it is
-/// drawn in.
+/// How much a client's picture is scaled by, per axis, to go into the
+/// rectangle it is drawn in, before any zoom of the frame's.
 ///
-/// `fill` is `None` for a pane that is not mid-drag, and that case must stay
-/// exactly what it has always been: the ratio between a pane's drawn rectangle
-/// and its client's real one is also how a mode enlarges a window, so an
-/// overview thumbnail comes through here and it is free to grow. Only a pane
-/// under a live [`Hold`] is clamped, and only when the configuration asked for
-/// a fill that does not stretch.
+/// `drawn` is the rectangle the frame pictures and `real` the size the client
+/// committed. [`Fill::Stretch`] scales one into the other; every other fill
+/// draws the picture at its own size and leaves the cut, or the gap, to
+/// `render::fit` (#233).
 ///
-/// **"Mid-drag" means holding, not being dragged**, and until issue #123 those
-/// were different things. A *tiled* pane was being dragged and had no hold, so
-/// it took the `None` arm — the free-to-grow thumbnail arm — and a client
-/// sitting at its minimum width was stretched without limit for the whole of a
-/// gesture, with no `declined` bookkeeping anywhere to notice. The sentence
-/// above was describing the floating path and reading as though it described
-/// the function. Every pane a live gesture moves now carries a hold, so it
-/// describes the function again.
+/// **Every pane comes through here with the configured fill, not only one under
+/// a hold**, which is #233's change. Before it a pane no drag held took a
+/// stretch whatever `resize.fill` said, on the grounds that the ratio between
+/// a drawn rectangle and a committed one was also how a mode enlarged a
+/// window. That stopped being true at #133, which carries a frame's zoom apart
+/// from this factor, so a thumbnail's rectangle pictures the window at the
+/// size it committed and the factor here is 1 for it under every fill. What
+/// was left taking the stretch was exactly the glide #233 is about.
+/// `render::tests::fitting::each_fill_fits_a_picture_its_rectangle_has_outgrown`,
+/// `render::tests::fitting::a_frames_zoom_enlarges_a_window_under_every_fill`.
 pub(crate) fn factor(
-    fill: Option<Fill>,
+    fill: Fill,
     drawn: Size<f64, Logical>,
     real: Size<i32, Logical>,
 ) -> (f64, f64) {
     let (across, down) = (ratio(drawn.w, real.w), ratio(drawn.h, real.h));
     match fill {
-        None | Some(Fill::Stretch) => (across, down),
-        // Held at its own size where there is room for it, scaled down where
-        // there is not: nothing here can clip, and an oversized buffer drawn
-        // unclipped spills over the neighbouring window. See [`Fill::Hold`].
-        Some(Fill::Hold | Fill::Scene) => (across.min(1.0), down.min(1.0)),
+        Fill::Stretch => (across, down),
+        Fill::Anchor | Fill::Crop | Fill::Scene => (1.0, 1.0),
     }
+}
+
+/// Which of a rectangle's left and top edges a glide from `from` to `to` moves
+/// while the edge opposite stands still: [`Hold::pins`]'s question, asked of a
+/// change no pointer is making (#233).
+///
+/// A layout's glide is a pane transform from the frame on screen to the new
+/// tile, so its two ends say which edges the layout pinned: a window that
+/// halves itself for a new neighbour on its right keeps its left edge, and the
+/// neighbour across a seam keeps its far edge. Measured with [`moved_edges`]
+/// once each edge is rounded to the logical pixel it is drawn on, so a glide
+/// that begins part of the way through another, at a fractional rectangle,
+/// does not call an edge that is standing still moved by a rounding.
+/// `tests::a_glide_pins_the_edges_it_does_not_move`.
+pub(crate) fn pins(from: Rectangle<f64, Logical>, to: Rectangle<f64, Logical>) -> (bool, bool) {
+    let edges = |rect: Rectangle<f64, Logical>| {
+        let far: Point<f64, Logical> = (rect.loc.x + rect.size.w, rect.loc.y + rect.size.h).into();
+        Rectangle::<i32, Logical>::from_extremities(rect.loc.to_i32_round(), far.to_i32_round())
+    };
+    let moved = moved_edges(edges(from), edges(to));
+    (pulls_left(moved), pulls_top(moved))
 }
 
 /// Which of a pane's *own* edges a rectangle change moved.
@@ -893,7 +1005,7 @@ pub(crate) fn factor(
 /// opposite one — the user pulls their window's right edge and the pane to the
 /// right of it has its *left* edge pulled — and a corner drag moves two seams,
 /// so up to four panes each have their own answer. Handing a neighbour's hold
-/// the pointer's `edges` would pin [`Hold::anchored`] and [`Fill::Hold`]'s
+/// the pointer's `edges` would pin [`Hold::anchored`] and [`Fill::Anchor`]'s
 /// slack against the wrong side of it: the picture would travel with the
 /// pointer inside a window the user is not touching, and a refusal would give
 /// the pixels back on the edge that never moved.
@@ -969,7 +1081,7 @@ pub(crate) fn moved_edges(
 /// **pane moved without being resized** is a `slot` whose origin walks at an
 /// unchanged size with `asked` not following. A **rounding mistaken for a
 /// refusal** is `refused=1` with `committed` a handful of pixels from `asked`,
-/// and `fill` reading `Hold` in a session configured for `Stretch`.
+/// and `fill` reading `Anchor` in a session configured for `Stretch`.
 ///
 /// **`unanswered` is what tells the last of those from its opposite**, because
 /// [`Hold::refused`] weighs a different pair either side of [`SILENCE`] and the
@@ -1180,7 +1292,7 @@ mod tests {
         // And the bridge that makes the pane's rectangle drawable: the client's
         // old buffer scaled into it, which is how the pane can be right before
         // the client is.
-        let (across, down) = factor(Some(Fill::Stretch), pane.size.to_f64(), client);
+        let (across, down) = factor(Fill::Stretch, pane.size.to_f64(), client);
         assert!((across - 350.0 / 400.0).abs() < f64::EPSILON);
         assert!((down - 260.0 / 300.0).abs() < f64::EPSILON);
     }
@@ -1205,7 +1317,7 @@ mod tests {
         assert_eq!(hold.settle(size(400, 300), ms(216)), Settle::Waiting);
         // It answers with exactly that.
         assert_eq!(hold.settle(size(520, 400), ms(280)), Settle::Done);
-        let (across, down) = factor(Some(Fill::Stretch), size(520, 400).to_f64(), size(520, 400));
+        let (across, down) = factor(Fill::Stretch, size(520, 400).to_f64(), size(520, 400));
         assert!((across - 1.0).abs() < f64::EPSILON);
         assert!((down - 1.0).abs() < f64::EPSILON);
     }
@@ -1232,20 +1344,30 @@ mod tests {
         assert_eq!(hold.settle(size(450, 600), ms(120)), Settle::Waiting);
         assert_eq!(
             hold.fill(Fill::Stretch),
-            Fill::Hold,
+            Fill::Anchor,
             "a client that will not reach the size it was offered would never \
              bring the factor back to 1"
         );
-        // And the clamp is what makes that safe to draw: the pane is 300 wide
-        // and the buffer is 450, so it comes down rather than spilling.
+        assert_eq!(
+            hold.fill(Fill::Crop),
+            Fill::Crop,
+            "a fill that does not stretch has no stretch to take away (#233)"
+        );
+        // And it is not scaled down either: the pane is 300 wide and the
+        // buffer is 450, and since #233 the 150 past the pane are cut away by
+        // `render::fit` rather than the whole of it squeezed in.
         let (across, _) = factor(
-            Some(hold.fill(Fill::Stretch)),
+            hold.fill(Fill::Stretch),
             size(300, 600).to_f64(),
             size(450, 600),
         );
-        assert!(across < 1.0);
-        // Growing past the buffer is where holding actually holds.
-        let (wider, _) = factor(Some(Fill::Hold), size(900, 600).to_f64(), size(450, 600));
+        assert!(
+            (across - 1.0).abs() < f64::EPSILON,
+            "an anchored picture narrower than its buffer is drawn at its own \
+             size and cut; got {across}"
+        );
+        // Growing past the buffer holds it at its own size too.
+        let (wider, _) = factor(Fill::Anchor, size(900, 600).to_f64(), size(450, 600));
         assert!((wider - 1.0).abs() < f64::EPSILON);
 
         // The gesture ends. The client's answer wins, and the edge the drag was
@@ -1280,7 +1402,7 @@ mod tests {
     fn a_refusal_lifts_on_an_answer_and_not_on_a_new_offer() {
         let mut hold = dragging(ResizeEdge::Left, size(800, 600), want(300, 600), ms(0));
         hold.settle(size(450, 600), ms(100));
-        assert_eq!(hold.fill(Fill::Stretch), Fill::Hold);
+        assert_eq!(hold.fill(Fill::Stretch), Fill::Anchor);
         // Dragged back out, and told so.
         assert_eq!(
             hold.dragged(want(700, 600), size(450, 600), ms(200)),
@@ -1288,7 +1410,7 @@ mod tests {
         );
         assert_eq!(
             hold.fill(Fill::Stretch),
-            Fill::Hold,
+            Fill::Anchor,
             "the client has not answered yet; what is on screen is still its \
              own size, and 450 smeared across 700 is not an improvement"
         );
@@ -1414,7 +1536,7 @@ mod tests {
     /// of the change. A cell-grid answer is close enough that the stretch it
     /// leaves behind is invisible, so the user's configured fill stands —
     /// otherwise kitty, the ordinary tiled client, loses `stretch` on the first
-    /// answer of every seam drag and gets [`Fill::Hold`]'s uncovered strip
+    /// answer of every seam drag and gets [`Fill::Anchor`]'s uncovered strip
     /// instead. It is still an answer, so the end of the gesture still adopts
     /// it: a client's own size wins by six pixels as readily as by two hundred.
     ///
@@ -1446,7 +1568,7 @@ mod tests {
         let mut firefox = dragging(ResizeEdge::Left, size(800, 600), want(300, 600), ms(0));
         firefox.settle(size(450, 600), ms(50));
         assert!(firefox.refused());
-        assert_eq!(firefox.fill(Fill::Stretch), Fill::Hold);
+        assert_eq!(firefox.fill(Fill::Stretch), Fill::Anchor);
 
         // The proportion, on a pane big enough for it to be the term that
         // decides: a twentieth of a thousand is fifty.
@@ -1487,10 +1609,10 @@ mod tests {
     /// **Both halves are asserted because they fail at different depths.**
     /// `fill` is the verdict — what the trace's `refused=` column reports and
     /// what #115's guard is — and it is wrong from the first frame of the
-    /// runaway. `factor` is the picture, and it is only wrong where
-    /// [`Fill::Hold`] has teeth: the element path cannot clip, so a *shrinking*
-    /// pane scales down under either fill and the two draw the same thing. The
-    /// growing half below is the one a user sees, and it is the same fault.
+    /// runaway. `factor` is the picture, and it is only wrong where the two
+    /// fills differ: a *shrinking* pane is drawn at 1.0 under
+    /// [`Fill::Anchor`] and scaled down under a stretch. The growing half below
+    /// is the one where a stretch would scale up, and it is the same fault.
     #[test]
     fn a_client_that_answers_once_and_then_says_nothing_stops_stretching() {
         // 850 wide, a left edge pulled in to 790, and 800 is as narrow as this
@@ -1523,7 +1645,7 @@ mod tests {
         );
         assert_eq!(
             hold.fill(Fill::Stretch),
-            Fill::Hold,
+            Fill::Anchor,
             "#115's guard is that a refusing client must not be stretched, and \
              a guard that lasts one frame of a drag is not one"
         );
@@ -1541,7 +1663,7 @@ mod tests {
             );
         }
         let (across, _) = factor(
-            Some(hung.fill(Fill::Stretch)),
+            hung.fill(Fill::Stretch),
             size(820, 300).to_f64(),
             size(412, 292),
         );
@@ -1559,7 +1681,7 @@ mod tests {
     /// answer arrives a frame or two later, so a client that is keeping up
     /// perfectly well is *always* an interval behind for those frames. Judging
     /// the live ask the moment it moves would call that a refusal once per
-    /// interval, and one frame of [`Fill::Hold`] is one frame of its
+    /// interval, and one frame of [`Fill::Anchor`] is one frame of its
     /// deliberately uncovered strip — which is the band of background
     /// [`ROUNDING`] exists to keep off a terminal's drags, back again at ten
     /// hertz instead of for the whole gesture.
@@ -1634,19 +1756,6 @@ mod tests {
             Settle::Done,
             "the client answered the size it was actually told"
         );
-    }
-
-    /// A pane that is not mid-drag is not clamped, whatever the setting says.
-    ///
-    /// The ratio between a drawn rectangle and a real one is also how a mode
-    /// enlarges a window, and an overview thumbnail scaled *up* comes through
-    /// the same arithmetic. Clamping it because someone set `fill = "hold"`
-    /// would shrink every enlarged window on the desktop.
-    #[test]
-    fn a_window_that_is_not_being_dragged_is_never_clamped() {
-        let (across, down) = factor(None, size(1600, 1200).to_f64(), size(800, 600));
-        assert!((across - 2.0).abs() < f64::EPSILON);
-        assert!((down - 2.0).abs() < f64::EPSILON);
     }
 
     /// **A hold born after its own gesture ended still lets go.**
@@ -1736,24 +1845,113 @@ mod tests {
     fn a_held_picture_leaves_its_slack_on_the_edge_being_dragged() {
         let drawn: Size<f64, Logical> = Size::from((900.0, 600.0));
         let real = size(450, 600);
-        let (across, _) = factor(Some(Fill::Hold), drawn, real);
+        let (across, _) = factor(Fill::Anchor, drawn, real);
         assert!((drawn.w - f64::from(real.w) * across - 450.0).abs() < f64::EPSILON);
 
-        let (stretched, _) = factor(Some(Fill::Stretch), drawn, real);
+        let (stretched, _) = factor(Fill::Stretch, drawn, real);
         assert!(
             (drawn.w - f64::from(real.w) * stretched).abs() < f64::EPSILON,
             "a stretched buffer fills its rectangle, so anchoring it is a no-op"
         );
     }
 
+    /// **The fills `resize.fill` names, and the default (#233).** `anchor`
+    /// is the default; `hold`, its predecessor without the cut, is no longer a
+    /// name, so a configuration still saying it is told and given the default,
+    /// which is what `hold` became.
     #[test]
     fn a_fill_is_named_in_the_configuration_or_it_is_not_one() {
         assert_eq!(Fill::named("stretch"), Some(Fill::Stretch));
-        assert_eq!(Fill::named("hold"), Some(Fill::Hold));
+        assert_eq!(Fill::named("anchor"), Some(Fill::Anchor));
+        assert_eq!(Fill::named("crop"), Some(Fill::Crop));
         assert_eq!(Fill::named("scene"), Some(Fill::Scene));
+        assert_eq!(Fill::named("hold"), None);
         assert_eq!(Fill::named("Stretch"), None);
         assert_eq!(Fill::named(""), None);
-        assert_eq!(Fill::default(), Fill::Stretch);
+        assert_eq!(Fill::default(), Fill::Anchor);
+    }
+
+    /// **`resize.background` is a colour, `none`, or not one.**
+    #[test]
+    fn a_background_is_a_colour_or_none_or_not_one() {
+        use super::{BACKGROUND, Settings, background_named};
+        assert_eq!(background_named("none"), Some(None));
+        assert_eq!(
+            background_named("#1c2b3a"),
+            Some(Some([0x1c, 0x2b, 0x3a, 0xff])),
+            "six digits are opaque"
+        );
+        assert_eq!(
+            background_named("#1C2B3A80"),
+            Some(Some([0x1c, 0x2b, 0x3a, 0x80])),
+            "eight carry their alpha"
+        );
+        for not_one in [
+            "", "#", "1c2b3a", "#1c2b3", "#1c2b3g", "#1c2b3a8", "black", "#ééé",
+        ] {
+            assert_eq!(background_named(not_one), None, "{not_one:?}");
+        }
+        assert_eq!(
+            Settings::default().background,
+            BACKGROUND,
+            "the default is the one `config.lua` ships"
+        );
+        assert_eq!(background_named("#1c1c1c"), Some(BACKGROUND));
+    }
+
+    /// **A glide pins the edges it does not move (#233).** The two ends of a
+    /// pane's glide say which edges the layout pinned, as a drag's `edges`
+    /// say which the pointer has: a window halved for a neighbour on its
+    /// right keeps its left edge, the window shrunk from the left keeps its
+    /// right, one from the top keeps its bottom, and a pane that only moves,
+    /// or moves both edges of an axis, has no edge to stand against.
+    #[test]
+    fn a_glide_pins_the_edges_it_does_not_move() {
+        use super::pins;
+        let r = |x: f64, y: f64, w: f64, h: f64| -> Rectangle<f64, Logical> {
+            Rectangle::new((x, y).into(), (w, h).into())
+        };
+        let whole = r(0.0, 0.0, 1900.0, 1000.0);
+        assert_eq!(
+            pins(whole, r(0.0, 0.0, 950.0, 1000.0)),
+            (false, false),
+            "right edge moved"
+        );
+        assert_eq!(
+            pins(whole, r(950.0, 0.0, 950.0, 1000.0)),
+            (true, false),
+            "left edge moved"
+        );
+        assert_eq!(
+            pins(whole, r(0.0, 500.0, 1900.0, 500.0)),
+            (false, true),
+            "top edge moved"
+        );
+        assert_eq!(
+            pins(whole, r(0.0, 0.0, 1900.0, 500.0)),
+            (false, false),
+            "bottom edge moved"
+        );
+        assert_eq!(
+            pins(whole, r(950.0, 500.0, 950.0, 500.0)),
+            (true, true),
+            "a corner"
+        );
+        assert_eq!(
+            pins(whole, r(100.0, 0.0, 1900.0, 1000.0)),
+            (false, false),
+            "only moved"
+        );
+        assert_eq!(
+            pins(whole, r(100.0, 0.0, 1700.0, 1000.0)),
+            (false, false),
+            "both moved"
+        );
+        assert_eq!(
+            pins(r(0.4, 0.0, 1899.4, 1000.0), r(950.0, 0.0, 950.0, 1000.0)),
+            (true, false),
+            "a fractional start whose right edge rounds to the same pixel has not moved it"
+        );
     }
 
     /// **The two panes a seam moves are pulled by opposite edges.**

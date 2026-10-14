@@ -641,13 +641,19 @@ function sol.loading(options) end
 ---@return nil
 function sol.client_sizes(options) end
 
----Set what fills a window while a resize drag is ahead of its client.
+---Set how a window's picture is fitted while the window changes size -- an
+---edge or seam drag, a layout's glide, a fullscreen or maximise glide -- and
+---what fills the part it does not cover.
 ---
----`"stretch"` (the default) scales the last picture; `"hold"` leaves it at its
----own size; `"scene"` draws the window's QML scene, which today reaches only a
----window resized before its application painted. Another name is logged and
+---`fill`: `"anchor"` (the default) draws the picture at its own size against
+---the edges that are not moving, cut to the window; `"crop"` the same from the
+---window's top-left whichever edge moves; `"stretch"` scales it to fill;
+---`"scene"` draws the window's QML scene, which today reaches only a window
+---resized before its application painted, and is `"anchor"` elsewhere.
+---`background`: `"#rrggbb"`, `"#rrggbbaa"` or `"none"`, what shows where the
+---picture does not reach (default `"#1c1c1c"`). Another value is logged and
 ---the default kept.
----@param options? { fill?: "stretch"|"hold"|"scene" }
+---@param options? { fill?: "anchor"|"crop"|"stretch"|"scene", background?: string }
 ---@return nil
 function sol.resize(options) end
 

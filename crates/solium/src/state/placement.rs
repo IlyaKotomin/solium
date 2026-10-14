@@ -924,9 +924,10 @@ impl Solium {
     ///
     /// **Until its client answers it is held at the new rectangle**, as an
     /// edge drag holds a window ([`Self::hold_for_answer`]), and its last
-    /// picture is stretched into it, through the glide and after it lands --
-    /// for `resizing::PATIENCE` after, if the client says nothing, and then
-    /// the client's own size wins. `a_slow_client_is_drawn_stretched_until_it_answers`,
+    /// picture is fitted into it as `resize.fill` says (#233), through the
+    /// glide and after it lands -- for `resizing::PATIENCE` after, if the
+    /// client says nothing, and then the client's own size wins.
+    /// `a_slow_client_is_held_at_its_new_rectangle_until_it_answers`,
     /// `a_client_that_never_answers_is_drawn_as_it_is_once_its_patience_runs_out`.
     ///
     /// **The motion is the scripts'**: the listeners of `change`'s event set

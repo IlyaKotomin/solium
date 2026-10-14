@@ -925,35 +925,55 @@ local defaults = {
         quiet_ms = 300,
     },
 
-    -- What a window looks like while you are dragging its edge.
+    -- What a window looks like while it is changing size: while you drag
+    -- its edge or a seam, while a layout glides it to a new tile, and while
+    -- it glides into or out of fullscreen or maximised.
     --
     -- A client cannot be resized; it can only be *asked*, and it answers when
     -- it gets round to it -- a few milliseconds for a terminal, rather more
-    -- for a browser. The compositor no longer waits for that answer: the
-    -- rectangle you are dragging is what it draws, from the first frame, and
-    -- the client's last picture fills it until the real one arrives. This
-    -- decides what that filling looks like, which is entirely taste.
+    -- for a browser. The compositor does not wait for that answer: the
+    -- rectangle you are dragging, or the glide has reached, is what it draws,
+    -- from the first frame, and the client's picture -- the old one, or its
+    -- answer while the glide is still on its way -- goes into it until the
+    -- two agree. This decides how, which is entirely taste.
     resize = {
-        -- "stretch" scales the last picture into the new rectangle. Smooth,
-        -- momentarily soft while a slow client catches up, and what most
-        -- compositors do. The default.
+        -- "anchor", the default: the picture at its own size, never scaled,
+        -- against the edges that are not moving -- the right edge of a window
+        -- you shrink from the left, the top-left when every edge moves. What
+        -- is larger than the window is cut off on the moving side, and what
+        -- it does not cover is `background` below. Text keeps its size on
+        -- every frame.
         --
-        -- "hold" leaves the picture at its own size where there is room for
-        -- it, so nothing is resampled and what you see uncovered as the window
-        -- grows is the pane underneath. Crisp instead of smooth. A window
-        -- being made *smaller* is still scaled down, because a picture larger
-        -- than the window it is in would spill over its neighbour.
+        -- "crop": the same, but always from the window's top-left corner,
+        -- whichever edge moves -- so the left of a left-aligned page, a
+        -- prompt or a gutter, moves with a left edge you drag, and what is
+        -- cut off or uncovered is on the right or the bottom.
+        --
+        -- "stretch": the picture scaled to fill the window, each way on its
+        -- own. Nothing is ever uncovered, but text is drawn wider or taller
+        -- than the application drew it until it catches up -- nearly twice
+        -- as wide on a glide that halves a terminal. What most compositors
+        -- do, and what Solium did before #233.
         --
         -- "scene" draws the window's QML scene over it -- the same one a
         -- window wears before its application has painted. Today that only
         -- reaches a window resized before its application ever arrived;
-        -- anywhere else it behaves as "hold".
+        -- anywhere else it behaves as "anchor".
         --
         -- Whatever this says, a client that *refuses* the size it is offered
-        -- -- Firefox will not go under its minimum width -- stops being
-        -- stretched the moment it says so, and the window takes the size the
-        -- client chose when you let go of the edge.
-        fill = "stretch",
+        -- -- Firefox will not go under its minimum width -- is never
+        -- stretched once it has said so, and the window takes the size the
+        -- client chose when you let go of the edge. Anything else is named in
+        -- the log and the default kept.
+        fill = "anchor",
+
+        -- What shows in the part of a window its picture does not cover
+        -- under "anchor", "crop" or "scene": "#rrggbb", or "#rrggbbaa" with
+        -- an alpha. The default is the theme's darkest grey, so the gap reads
+        -- as part of the window. "none" draws nothing there, so what is
+        -- behind the window -- or a style's own `behind` layer -- shows.
+        -- Anything else is named in the log and the default kept.
+        background = "#1c1c1c",
     },
 
     -- A fullscreen window: what it covers, and how a window goes fullscreen

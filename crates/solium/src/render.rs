@@ -1701,9 +1701,17 @@ fn panes(
         }
 
         let corner = client.loc.to_physical_precise_round(scale);
-        // Where the buffer's corner goes, which a held picture's slack can move
-        // off the client's. See [`place_client`].
+        // Where the buffer's corner goes, which an anchored picture's offset
+        // can move off the client's. See [`fit`].
         let origin = placed.origin.to_physical_precise_round(scale);
+        // And the pane's background where the picture does not reach, behind
+        // the client: a picture smaller than its rectangle under a fill that
+        // does not stretch (#233). See [`uncovered`].
+        let mut background = state
+            .panes
+            .get(pane)
+            .map(|held| background_elements(state, held, &placed, real.size, frame.opacity, scale))
+            .unwrap_or_default();
 
         // Popups go in ahead of the sandwich, which means above all of it.
         //
@@ -1793,6 +1801,9 @@ fn panes(
                         )
                         .map(Fitted::into_clipped)
                     }));
+                    // Square at a rounded style's corners: the strips are
+                    // plain solids, read and not tested, as the remains are.
+                    elements.append(&mut background);
                     return;
                 }
                 // Cut to the tile when there is anything to cut, and a surface
@@ -1802,6 +1813,9 @@ fn panes(
                 elements.extend(window_elements.into_iter().filter_map(|element| {
                     fitted(element, origin, fitting, output_scale).map(Fitted::into_element)
                 }));
+                // Later in the list is further back: behind the client, in
+                // front of the style's `behind` layers, which follow.
+                elements.append(&mut background);
             }
         });
     }
@@ -2301,65 +2315,40 @@ pub(crate) fn place_client(
         committed,
         state.tile_of(pane).is_some(),
         state.resize_fill(pane.id()),
+        state.resize_pins(pane.id()),
     );
-
-    // **A picture that is not stretched stays against the edges the drag is
-    // not moving.**
-    //
-    // `Fill::Hold` keeps the buffer at its own size where the pane has grown
-    // past it, which leaves a strip the buffer does not cover. Anchoring at
-    // the drawn rectangle's top-left puts that strip on the bottom and the
-    // right, which is correct for a bottom or right drag -- those are exactly
-    // the drags whose top-left corner is standing still -- and wrong for every
-    // drag that pulls a left or top edge, where the picture would travel with
-    // the pointer and the gap would open against the stationary edge. The
-    // whole of the window's contents would slide while the user dragged one of
-    // four corners.
-    //
-    // **Zero for a stretch, by the arithmetic rather than by a branch.** A
-    // stretched buffer covers its rectangle exactly, so the slack below is
-    // `client.size.w - real.size.w * (client.size.w / real.size.w)`, which is
-    // nothing -- the default path and every window that is not being dragged
-    // at all get the client's corner back, to the bit.
-    let (pulls_left, pulls_top) = state.resize_pins(pane.id()).unwrap_or((false, false));
-    let slack = |pulled: bool, drawn: f64, real: i32, factor: f64| {
-        if pulled {
-            (drawn - f64::from(real) * factor).max(0.0)
-        } else {
-            0.0
-        }
-    };
-    let origin = client.loc
-        + Point::<f64, Logical>::from((
-            slack(pulls_left, client.size.w, committed.w, fitting.factor.x),
-            slack(pulls_top, client.size.h, committed.h, fitting.factor.y),
-        ));
     Placed {
         client,
-        origin,
+        origin: client.loc + fitting.offset,
         fit: fitting,
     }
 }
 
 /// How a client's surfaces go into the rectangle they are drawn in: the
-/// factor every surface is scaled by, about the client's corner, and the
-/// rectangle they are cut to when there is one.
+/// factor every surface is scaled by, about the client's corner, where that
+/// corner is, and the rectangle they are cut to when there is one.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Fit {
     /// What the whole committed buffer is scaled by. Also what the popups are
     /// scaled by, which is why it is separate from the cut: they take this and
     /// never the other.
     pub(crate) factor: Scale<f64>,
-    /// The drawn client rectangle, for a tiled client whose tile cuts some of
-    /// what it committed. `None` for every other client -- every client that
-    /// is not tiled, and every one its tile does not cut -- which is drawn
-    /// through no crop at all, so a rounding in this rectangle cannot shave a
-    /// pixel off a window that had nothing to cut. `fitted` rounds it to the
-    /// output's pixels.
+    /// Where the buffer's top-left corner is drawn, from the drawn client
+    /// rectangle's, in drawn logical pixels: nothing, except where
+    /// [`crate::resizing::Fill::Anchor`] keeps a picture against a far edge
+    /// that is standing still. Then it is the drawn width (or height) less the
+    /// picture's, which is the gap a smaller picture leaves on the moving side,
+    /// or, negative, the part of a larger picture that is cut away past the
+    /// moving side. `tests::an_anchored_picture_stays_against_the_edge_that_does_not_move`.
+    pub(crate) offset: Point<f64, Logical>,
+    /// The drawn client rectangle, for a client whose picture is cut to it.
+    /// `None` for every other client, which is drawn through no crop at all,
+    /// so a rounding in this rectangle cannot shave a pixel off a window that
+    /// had nothing to cut. `fitted` rounds it to the output's pixels.
     pub(crate) crop: Option<Rectangle<f64, Logical>>,
-    /// How much of the committed buffer, from its top-left corner, is in the
-    /// picture: all of it, except along an axis the tile cuts. What a masked
-    /// client is captured at, so its corners are the picture's corners.
+    /// How much of the committed buffer is in the picture: all of it, except
+    /// along an axis it is cut on. From its top-left corner unless `offset`
+    /// moves the picture, which only an anchored fill does.
     pub(crate) shown: Size<i32, Logical>,
 }
 
@@ -2387,17 +2376,35 @@ const CUT: f64 = 0.5;
 /// frame is a picture of, at the pane's own scale: the tile's share for a
 /// settled tiled pane, a rectangle part of the way between two tiles on a
 /// frame of a layout's glide, and the window's own size in a thumbnail.
-/// `tiled` is whether a layout holds the pane in a tile, and `fill` is the
-/// resize hold's, `None` when there is no hold.
+/// `tiled` is whether a layout holds the pane in a tile, `fill` how the
+/// picture goes into a rectangle it was not drawn at (`resize.fill`,
+/// [`crate::resizing::Fill`]), and `pins` which of its left and top edges are
+/// moving with the edge opposite standing still (`Solium::resize_pins`).
 ///
-/// **Per axis, the buffer is drawn at its own size where the pictured
-/// rectangle is narrower than it and the pane is tiled** -- the tile cuts it --
-/// and is scaled to fill the pictured rectangle everywhere else, which is the
-/// arithmetic `render::elements` always had. Then the whole of it is scaled by
-/// `zoom`, and the cut, when there is one, is `client` itself. So:
+/// **Under every fill but `stretch` the picture is never scaled** (#233):
+/// each axis is drawn at the size the client drew it, cut to the pictured
+/// rectangle where it is larger, and short of it where it is smaller, the
+/// rest filled by the pane's background ([`uncovered`]). `anchor` keeps it
+/// against the edges `pins` says are standing still, `crop` at the top-left.
+/// Then the whole of it is scaled by `zoom`, and the cut, when there is one,
+/// is `client` itself. So, with `crate::resizing::Fill::Anchor`:
+///
+/// * A glide that shrinks a window whose client has answered draws the
+///   answer at its own size and leaves the rest of the rectangle to the
+///   background, rather than stretching it up to 1.8x:
+///   `a_glide_that_shrinks_a_window_draws_its_answer_at_its_own_size`.
+/// * One that grows a window before its client has answered does the same
+///   with the old picture, and one whose client answered first cuts the
+///   larger picture: `a_grow_is_not_stretched_either_way`.
+/// * A one-pixel buffer is a one-pixel strip, not a pane (#125):
+///   `a_one_pixel_buffer_is_not_stretched_across_its_pane`.
+///
+/// **`stretch` is what this did before #233, kept exactly.** Per axis, the buffer is drawn at its own size where the pictured
+/// rectangle is narrower than it and the pane is tiled -- the tile cuts it --
+/// and is scaled to fill the pictured rectangle everywhere else:
 ///
 /// * A settled client that committed more than its tile is shown 1:1, cut to
-///   the tile, and not squashed into it:
+///   the tile, and not squashed into it (under every fill):
 ///   `a_tiled_client_is_cut_to_its_tile_and_not_squashed_into_it`.
 /// * An open, a close or a thumbnail scales that cut picture as one:
 ///   `an_animated_tiled_client_is_scaled_with_its_cut_and_not_cut_by_it`.
@@ -2410,15 +2417,16 @@ const CUT: f64 = 0.5;
 ///   what `a_glide_that_narrows_a_tiled_window_is_drawn_1_to_1_on_its_first_frame`
 ///   measured against that arithmetic.
 /// * A glide that grows a window past what its client committed stretches the
-///   buffer into it, as every glide did before #133, and one that changes the
-///   two axes by different amounts does each axis on its own:
+///   buffer into it, and one that changes the two axes by different amounts
+///   does each axis on its own:
 ///   `a_glide_between_tiles_of_different_shapes_is_fitted_per_axis`.
 pub(crate) fn fit(
     client: Rectangle<f64, Logical>,
     zoom: (f64, f64),
     committed: Size<i32, Logical>,
     tiled: bool,
-    fill: Option<crate::resizing::Fill>,
+    fill: crate::resizing::Fill,
+    pins: (bool, bool),
 ) -> Fit {
     // A frame drawn at no size pictures nothing in particular; the committed
     // size keeps the arithmetic finite, and the zoom draws it at nothing.
@@ -2434,13 +2442,31 @@ pub(crate) fn fit(
         pictured(client.size.h, zoom.1, committed.h),
     )
         .into();
-    let cuts = |pictured: f64, committed: i32| tiled && pictured < f64::from(committed) - CUT;
+    // A stretch cuts only what a tile holds (#133) and scales the rest; every
+    // other fill cuts whatever is larger than the picture, tiled or not, since
+    // it never scales.
+    // `tests::fitting::a_picture_larger_than_its_rectangle_is_cut_and_never_squashed`.
+    let cuts = |pictured: f64, committed: i32| {
+        (tiled || !fill.stretches()) && pictured < f64::from(committed) - CUT
+    };
     let (cut_x, cut_y) = (cuts(pictured.w, committed.w), cuts(pictured.h, committed.h));
     let (across, down) = crate::resizing::factor(fill, pictured, committed);
     let factor = Scale::from((
         zoom.0 * if cut_x { 1.0 } else { across },
         zoom.1 * if cut_y { 1.0 } else { down },
     ));
+    // An anchored picture's far edge on the rectangle's, on an axis whose near
+    // edge is the one moving: the drawn size less the picture's, which is the
+    // gap left on the moving side or, negative, what is cut away past it.
+    // Nothing for any other fill, and nothing on an axis that is not pinned.
+    // `tests::fitting::an_anchored_picture_stays_against_the_edge_that_does_not_move`.
+    let offset = |pinned: bool, drawn: f64, committed: i32, factor: f64| {
+        if pinned && fill.anchors() {
+            drawn - f64::from(committed) * factor
+        } else {
+            0.0
+        }
+    };
     #[expect(
         clippy::cast_possible_truncation,
         reason = "a cut is narrower than the committed size, which is an i32"
@@ -2454,6 +2480,11 @@ pub(crate) fn fit(
     };
     Fit {
         factor,
+        offset: (
+            offset(pins.0, client.size.w, committed.w, factor.x),
+            offset(pins.1, client.size.h, committed.h, factor.y),
+        )
+            .into(),
         crop: (cut_x || cut_y).then_some(client),
         shown: (
             kept(cut_x, pictured.w, committed.w),
@@ -2461,6 +2492,106 @@ pub(crate) fn fit(
         )
             .into(),
     }
+}
+
+/// The parts of a client's drawn rectangle its picture does not cover, in the
+/// output's pixels: what the pane's background (`resize.background`) fills
+/// under a fill that does not stretch (#233).
+///
+/// `client` is the drawn client rectangle, `origin` where the picture's corner
+/// is drawn and `picture` its drawn size -- the committed size times the fit's
+/// factor. Four strips, in this order: the band above the picture and the band
+/// below it, each the whole width, and the strips left and right of it between
+/// them. Each is empty where the picture reaches that side, and all are when
+/// it covers the rectangle, which is every stretched picture and every picture
+/// at rest.
+///
+/// **The rectangle is rounded as [`fitted`] rounds a cut, and the picture
+/// inward**, so the strips end exactly where a cut picture would and reach
+/// under the picture's own edge by up to a pixel rather than stopping a pixel
+/// short of it: the background is drawn behind the client, so an overlap is
+/// hidden by it, and a gap would be a line of whatever is behind the window.
+/// `tests::the_background_fills_what_the_picture_leaves_uncovered`.
+pub(crate) fn uncovered(
+    client: Rectangle<f64, Logical>,
+    origin: Point<f64, Logical>,
+    picture: Size<f64, Logical>,
+    scale: f64,
+) -> [Rectangle<i32, Physical>; 4] {
+    let room = Rectangle::new(
+        client.loc.to_physical_precise_round(scale),
+        client.size.to_physical_precise_round(scale),
+    );
+    let drawn: Rectangle<i32, Physical> = Rectangle::new(origin, picture)
+        .to_physical(scale)
+        .to_i32_down();
+    let nothing = Rectangle::new(room.loc, Size::default());
+    let Some(covered) = room.intersection(drawn) else {
+        return [room, nothing, nothing, nothing];
+    };
+    let (left, top) = (room.loc.x, room.loc.y);
+    let (right, bottom) = (left + room.size.w, top + room.size.h);
+    let (inner_left, inner_top) = (covered.loc.x, covered.loc.y);
+    let (inner_right, inner_bottom) = (inner_left + covered.size.w, inner_top + covered.size.h);
+    [
+        Rectangle::from_extremities((left, top), (right, inner_top)),
+        Rectangle::from_extremities((left, inner_bottom), (right, bottom)),
+        Rectangle::from_extremities((left, inner_top), (inner_left, inner_bottom)),
+        Rectangle::from_extremities((inner_right, inner_top), (right, inner_bottom)),
+    ]
+}
+
+/// `resize.background` as the premultiplied colour a strip of it is drawn in,
+/// at a frame's `opacity`; `None` for `"none"`, which draws no strip at all.
+/// `tests::the_background_is_drawn_in_its_configured_colour`.
+pub(crate) fn background_colour(
+    background: crate::resizing::Background,
+    opacity: f32,
+) -> Option<[f32; 4]> {
+    let [red, green, blue, alpha] = background?;
+    let alpha = f32::from(alpha) / 255.0 * opacity;
+    let channel = |value: u8| f32::from(value) / 255.0 * alpha;
+    Some([channel(red), channel(green), channel(blue), alpha])
+}
+
+/// The strips of a pane's background round a picture that does not cover its
+/// rectangle, as elements: [`uncovered`]'s strips in [`background_colour`],
+/// each under its own identity from `Pane::background`. Empty when the
+/// picture covers the rectangle or the background is `"none"`. The two it
+/// joins are tested (`tests::fitting::the_background_fills_what_the_picture_leaves_uncovered`,
+/// `tests::fitting::the_background_is_drawn_in_its_configured_colour`); this,
+/// which needs the renderer's element list, is read, as `remains_elements` is.
+fn background_elements(
+    state: &Solium,
+    pane: &Pane,
+    placed: &Placed,
+    committed: Size<i32, Logical>,
+    opacity: f32,
+    scale: f64,
+) -> Vec<Element> {
+    let Some(colour) = background_colour(state.resizing.background, opacity) else {
+        return Vec::new();
+    };
+    let picture = Size::from((
+        f64::from(committed.w) * placed.fit.factor.x,
+        f64::from(committed.h) * placed.fit.factor.y,
+    ));
+    uncovered(placed.client, placed.origin, picture, scale)
+        .into_iter()
+        .zip(pane.background())
+        .filter(|(strip, _)| strip.size.w > 0 && strip.size.h > 0)
+        .map(|(strip, id)| {
+            Element::Solid(
+                smithay::backend::renderer::element::solid::SolidColorRenderElement::new(
+                    id.clone(),
+                    strip,
+                    CommitCounter::default(),
+                    colour,
+                    Kind::Unspecified,
+                ),
+            )
+        })
+        .collect()
 }
 
 /// One client surface through its [`Fit`].
@@ -2763,7 +2894,10 @@ pub(crate) fn ratio(drawn: f64, real: i32) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Drawn, Fit, Fitted, Painted, by_depth, fit, fitted, origin_at, ratio};
+    use super::{
+        Drawn, Fit, Fitted, Painted, background_colour, by_depth, fit, fitted, origin_at, ratio,
+        uncovered,
+    };
     use crate::qml::qt_test::on_the_qt_thread;
 
     /// **A window whose warp has no program is not captured**, and goes the
@@ -3049,7 +3183,8 @@ mod tests {
     /// `RescaleRenderElement` and `CropRenderElement` report for it: the
     /// numbers the damage tracker draws with.
     mod fitting {
-        use super::{Fit, Fitted, fit, fitted};
+        use super::{Fit, Fitted, background_colour, fit, fitted, uncovered};
+        use crate::resizing::Fill;
         use smithay::backend::renderer::element::{Element, Id};
         use smithay::backend::renderer::utils::CommitCounter;
         use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size};
@@ -3143,6 +3278,15 @@ mod tests {
         /// every frame of a layout's glide. See `present::Frame::zoom`.
         const AT_REST: (f64, f64) = (1.0, 1.0);
 
+        /// What every fit was before #233, and what `resize.fill = "stretch"`
+        /// still is.
+        const STRETCH: crate::resizing::Fill = crate::resizing::Fill::Stretch;
+
+        /// No left or top edge moving with the edge opposite standing still:
+        /// a pane at rest, or a change that moves a right or bottom edge, or
+        /// both of an axis' edges.
+        const STILL: (bool, bool) = (false, false);
+
         /// **A client that committed more than its tile is cut to the tile, at
         /// its own scale.**
         ///
@@ -3161,7 +3305,12 @@ mod tests {
             let committed = Size::from((1000, 600));
             let client = logical(100.0, 50.0, 500.0, 600.0);
 
-            let settled = fit(client, AT_REST, committed, true, None);
+            for fill in [STRETCH, Fill::Anchor, Fill::Crop, Fill::Scene] {
+                let settled = fit(client, AT_REST, committed, true, fill, STILL);
+                assert_eq!(settled.factor, Scale::from((1.0, 1.0)), "{fill:?}");
+                assert_eq!(settled.crop, Some(client), "{fill:?}");
+            }
+            let settled = fit(client, AT_REST, committed, true, STRETCH, STILL);
             assert_eq!(
                 settled.factor,
                 Scale::from((1.0, 1.0)),
@@ -3213,12 +3362,14 @@ mod tests {
                     AT_REST,
                     committed,
                     tiled,
-                    None,
+                    STRETCH,
+                    STILL,
                 );
                 assert_eq!(
                     settled,
                     Fit {
                         factor: Scale::from((1.0, 1.0)),
+                        offset: Point::default(),
                         crop: None,
                         shown: committed,
                     },
@@ -3236,12 +3387,14 @@ mod tests {
                 AT_REST,
                 small,
                 false,
-                Some(crate::resizing::Fill::Stretch),
+                STRETCH,
+                STILL,
             );
             assert_eq!(
                 held,
                 Fit {
                     factor: Scale::from((300.0 / 64.0, 200.0 / 64.0)),
+                    offset: Point::default(),
                     crop: None,
                     shown: small,
                 },
@@ -3256,7 +3409,8 @@ mod tests {
                 AT_REST,
                 committed,
                 false,
-                None,
+                STRETCH,
+                STILL,
             );
             assert_eq!(free.factor, Scale::from((0.5, 1.0)));
             assert_eq!(free.crop, None, "nothing cuts a window that is in no tile");
@@ -3283,7 +3437,8 @@ mod tests {
                 (0.5, 0.5),
                 committed,
                 true,
-                None,
+                STRETCH,
+                STILL,
             );
             assert_eq!(half.factor, Scale::from((0.5, 0.5)));
             assert_eq!(
@@ -3303,7 +3458,8 @@ mod tests {
                 (1.5, 1.5),
                 committed,
                 true,
-                None,
+                STRETCH,
+                STILL,
             );
             assert_eq!(larger.factor, Scale::from((1.5, 1.5)));
             assert_eq!(
@@ -3345,12 +3501,14 @@ mod tests {
                 AT_REST,
                 committed,
                 true,
-                None,
+                STRETCH,
+                STILL,
             );
             assert_eq!(
                 first,
                 Fit {
                     factor: Scale::from((1.0, 1.0)),
+                    offset: Point::default(),
                     crop: None,
                     shown: committed,
                 },
@@ -3362,7 +3520,8 @@ mod tests {
                 AT_REST,
                 committed,
                 true,
-                None,
+                STRETCH,
+                STILL,
             );
             assert_eq!(
                 early.factor,
@@ -3381,7 +3540,8 @@ mod tests {
                 AT_REST,
                 committed,
                 true,
-                None,
+                STRETCH,
+                STILL,
             );
             assert_eq!(
                 drawn(Surface::new((0, 0), (1900, 1000)), (0, 0), landed, 1.0),
@@ -3394,7 +3554,8 @@ mod tests {
                 AT_REST,
                 Size::from((600, 400)),
                 true,
-                None,
+                STRETCH,
+                STILL,
             );
             assert_eq!(
                 grown.factor,
@@ -3427,12 +3588,26 @@ mod tests {
         fn a_glide_between_tiles_of_different_shapes_is_fitted_per_axis() {
             let client = logical(0.0, 0.0, 1400.0, 1000.0);
 
-            let unanswered = fit(client, AT_REST, Size::from((1900, 1000)), true, None);
+            let unanswered = fit(
+                client,
+                AT_REST,
+                Size::from((1900, 1000)),
+                true,
+                STRETCH,
+                STILL,
+            );
             assert_eq!(unanswered.factor, Scale::from((1.0, 1.0)));
             assert_eq!(unanswered.crop, Some(client));
             assert_eq!(unanswered.shown, Size::from((1400, 1000)));
 
-            let answered = fit(client, AT_REST, Size::from((950, 1000)), true, None);
+            let answered = fit(
+                client,
+                AT_REST,
+                Size::from((950, 1000)),
+                true,
+                STRETCH,
+                STILL,
+            );
             assert_eq!(
                 answered.factor,
                 Scale::from((1400.0 / 950.0, 1.0)),
@@ -3440,7 +3615,14 @@ mod tests {
             );
             assert_eq!(answered.crop, None, "and nothing to cut");
 
-            let mixed = fit(client, AT_REST, Size::from((1900, 800)), true, None);
+            let mixed = fit(
+                client,
+                AT_REST,
+                Size::from((1900, 800)),
+                true,
+                STRETCH,
+                STILL,
+            );
             assert_eq!(mixed.factor, Scale::from((1.0, 1000.0 / 800.0)));
             assert_eq!(mixed.crop, Some(client));
             assert_eq!(
@@ -3461,7 +3643,8 @@ mod tests {
                 AT_REST,
                 Size::from((1000, 600)),
                 true,
-                None,
+                STRETCH,
+                STILL,
             );
             assert_eq!(
                 drawn(Surface::new((700, 50), (200, 100)), (100, 50), settled, 1.0),
@@ -3472,6 +3655,323 @@ mod tests {
                     .is_some_and(|shown| shown.cut && shown.geometry == physical(550, 50, 50, 100)),
                 "one that straddles the edge keeps the part inside it"
             );
+        }
+
+        /// A buffer rectangle that does not start at the buffer's corner.
+        fn part(x: f64, y: f64, w: f64, h: f64) -> Rectangle<f64, Buffer> {
+            Rectangle::new((x, y).into(), (w, h).into())
+        }
+
+        /// The fills that never scale a picture (#233).
+        const UNSCALED: [Fill; 3] = [Fill::Anchor, Fill::Crop, Fill::Scene];
+
+        /// **#233: each fill fits a picture its rectangle has outgrown.**
+        ///
+        /// The glide #233 is about: a terminal 1900 wide halved to 950 for a
+        /// new neighbour, whose client answered 950 within a frame or two,
+        /// drawn while the glide is still 1400 wide. `stretch` -- every glide
+        /// before #233 -- draws the 950 across 1400, glyphs 1.47x wide; the
+        /// others draw it at its own size and leave 450 to the background.
+        /// Nothing is cut either way: the picture is inside the rectangle.
+        #[test]
+        fn each_fill_fits_a_picture_its_rectangle_has_outgrown() {
+            let client = logical(0.0, 0.0, 1400.0, 1000.0);
+            let answered = Size::from((950, 1000));
+            let stretched = fit(client, AT_REST, answered, true, STRETCH, STILL);
+            assert_eq!(
+                stretched.factor,
+                Scale::from((1400.0 / 950.0, 1.0)),
+                "a stretch scales the answer into the glide"
+            );
+            for fill in UNSCALED {
+                let fitted = fit(client, AT_REST, answered, true, fill, STILL);
+                assert_eq!(
+                    fitted,
+                    Fit {
+                        factor: Scale::from((1.0, 1.0)),
+                        offset: Point::default(),
+                        crop: None,
+                        shown: answered,
+                    },
+                    "{fill:?} draws the answer at its own size, from the corner"
+                );
+            }
+            assert_eq!(
+                fit(client, (0.5, 0.5), answered, true, Fill::Anchor, STILL).factor,
+                Scale::from((0.5, 0.5)),
+                "and a frame's zoom still scales the whole window"
+            );
+        }
+
+        /// **A frame's zoom enlarges a window under every fill.** An
+        /// overview thumbnail scaled up, or a mode that enlarges, pictures
+        /// the window at the size it committed and scales the whole of it by
+        /// the zoom, so no fill has anything to decide there. Before #133 the
+        /// enlargement came through the fill's own factor, and `resizing`
+        /// pinned that no setting could clamp it
+        /// (`a_window_that_is_not_being_dragged_is_never_clamped`, gone with
+        /// that arithmetic).
+        #[test]
+        fn a_frames_zoom_enlarges_a_window_under_every_fill() {
+            for fill in [STRETCH, Fill::Anchor, Fill::Crop, Fill::Scene] {
+                let enlarged = fit(
+                    logical(0.0, 0.0, 1600.0, 1200.0),
+                    (2.0, 2.0),
+                    Size::from((800, 600)),
+                    false,
+                    fill,
+                    STILL,
+                );
+                assert_eq!(enlarged.factor, Scale::from((2.0, 2.0)), "{fill:?}");
+                assert_eq!(enlarged.crop, None, "{fill:?}");
+                assert_eq!(enlarged.offset, Point::default(), "{fill:?}");
+            }
+        }
+
+        /// **#233: an anchored picture stays against the edge that does not
+        /// move**, for a shrink from each of the four sides, before its
+        /// client answers -- the old picture larger than the rectangle, cut
+        /// on the moving side -- and after -- the answer smaller than the
+        /// rectangle the glide or drag has reached, the gap on the moving
+        /// side. `pins` is which of the left and top edges moves alone.
+        /// `crop` keeps the corner whatever moves, and `stretch` has nothing
+        /// to anchor.
+        #[test]
+        fn an_anchored_picture_stays_against_the_edge_that_does_not_move() {
+            // Shrinking from 800x500 towards 400x300, drawn at 600x400 at
+            // (100, 50) part of the way there.
+            let client = logical(100.0, 50.0, 600.0, 400.0);
+            let before = Size::from((800, 500));
+            let after = Size::from((400, 300));
+            // (pins, offset before the answer, offset after it)
+            for (side, pins, larger, smaller) in [
+                ("left", (true, false), (-200.0, 0.0), (200.0, 0.0)),
+                ("right", (false, false), (0.0, 0.0), (0.0, 0.0)),
+                ("top", (false, true), (0.0, -100.0), (0.0, 100.0)),
+                ("bottom", (false, false), (0.0, 0.0), (0.0, 0.0)),
+                (
+                    "top-left corner",
+                    (true, true),
+                    (-200.0, -100.0),
+                    (200.0, 100.0),
+                ),
+            ] {
+                let old = fit(client, AT_REST, before, false, Fill::Anchor, pins);
+                assert_eq!(
+                    old.offset,
+                    Point::from(larger),
+                    "shrunk from the {side}, the old picture keeps its far side"
+                );
+                assert_eq!(old.crop, Some(client), "and is cut on the {side}");
+                let new = fit(client, AT_REST, after, false, Fill::Anchor, pins);
+                assert_eq!(
+                    new.offset,
+                    Point::from(smaller),
+                    "shrunk from the {side}, the answer is against the far side"
+                );
+                assert_eq!(new.crop, None, "and inside the rectangle");
+                for unanchored in [Fill::Crop, STRETCH] {
+                    assert_eq!(
+                        fit(client, AT_REST, after, false, unanchored, pins).offset,
+                        Point::default(),
+                        "{unanchored:?} keeps the corner, shrunk from the {side}"
+                    );
+                }
+            }
+            // On screen, the left shrink: the right 600 of the old 800, at the
+            // rectangle, and not the left 600.
+            let old = fit(client, AT_REST, before, false, Fill::Anchor, (true, false));
+            assert_eq!(
+                drawn(Surface::new((-100, 50), (800, 500)), (-100, 50), old, 1.0),
+                Some(cut(
+                    physical(100, 50, 600, 400),
+                    part(200.0, 0.0, 600.0, 400.0)
+                )),
+                "the part of the picture against the edge standing still"
+            );
+        }
+
+        /// **#233: a picture larger than its rectangle is cut to it, never
+        /// squashed into it, tiled or not.** A floating window's drag and a
+        /// held tile (which `Solium::tile_of` answers no tile for) used to
+        /// scale such a picture down to fit, `stretch` still does; the
+        /// others cut it at its own size, at either output scale.
+        #[test]
+        fn a_picture_larger_than_its_rectangle_is_cut_and_never_squashed() {
+            let client = logical(100.0, 50.0, 300.0, 200.0);
+            let committed = Size::from((450, 600));
+            assert_eq!(
+                fit(client, AT_REST, committed, false, STRETCH, STILL).factor,
+                Scale::from((300.0 / 450.0, 200.0 / 600.0)),
+                "a stretch squashes what nothing tiles"
+            );
+            for fill in UNSCALED {
+                let fitted = fit(client, AT_REST, committed, false, fill, STILL);
+                assert_eq!(fitted.factor, Scale::from((1.0, 1.0)), "{fill:?}");
+                assert_eq!(fitted.crop, Some(client), "{fill:?}");
+                assert_eq!(fitted.shown, Size::from((300, 200)), "{fill:?}");
+                assert_eq!(
+                    drawn(Surface::new((100, 50), (450, 600)), (100, 50), fitted, 1.0),
+                    Some(cut(physical(100, 50, 300, 200), buffer(300.0, 200.0))),
+                    "{fill:?}: 300x200 of screen, the first 300x200 of buffer"
+                );
+                assert_eq!(
+                    drawn(
+                        Surface::new((200, 100), (900, 1200)),
+                        (200, 100),
+                        fitted,
+                        2.0
+                    ),
+                    Some(cut(physical(200, 100, 600, 400), buffer(600.0, 400.0))),
+                    "{fill:?}: and at 2x the same cut in twice the pixels"
+                );
+            }
+        }
+
+        /// **#233: a grow is not stretched either way.** Before the client
+        /// answers, its old picture is smaller than the rectangle the glide
+        /// has reached and a stretch scaled it up; anchored it stays at its
+        /// own size against the edge standing still. If the client answers
+        /// first, its new picture is larger than the rectangle still growing
+        /// and is cut, not squashed.
+        #[test]
+        fn a_grow_is_not_stretched_either_way() {
+            let client = logical(0.0, 0.0, 700.0, 400.0);
+            let old = Size::from((500, 400));
+            assert_eq!(
+                fit(client, AT_REST, old, true, STRETCH, STILL).factor,
+                Scale::from((700.0 / 500.0, 1.0)),
+                "a stretch scaled the old picture up into the growing glide"
+            );
+            let grown = fit(client, AT_REST, old, true, Fill::Anchor, STILL);
+            assert_eq!(grown.factor, Scale::from((1.0, 1.0)));
+            assert_eq!(grown.crop, None);
+            assert_eq!(
+                uncovered(
+                    client,
+                    client.loc + grown.offset,
+                    (500.0, 400.0).into(),
+                    1.0
+                ),
+                [
+                    physical(0, 0, 700, 0),
+                    physical(0, 400, 700, 0),
+                    physical(0, 0, 0, 400),
+                    physical(500, 0, 200, 400),
+                ],
+                "the 200 it has grown by is the background's, on the right"
+            );
+            assert_eq!(
+                fit(client, AT_REST, old, true, Fill::Anchor, (true, false)).offset,
+                Point::from((200.0, 0.0)),
+                "grown from the left, the old picture keeps to the right"
+            );
+            let answered = fit(
+                client,
+                AT_REST,
+                Size::from((900, 400)),
+                false,
+                Fill::Anchor,
+                STILL,
+            );
+            assert_eq!(answered.factor, Scale::from((1.0, 1.0)));
+            assert_eq!(answered.crop, Some(client), "the answer, cut to the glide");
+        }
+
+        /// **#125: a one-pixel buffer is not stretched across its pane.**
+        ///
+        /// A live trace caught clients committing `524x1` mid-drag, which the
+        /// bridge drew at the pane's full height, 342x. Under the default fill
+        /// it is a one-pixel strip at the top of the pane -- at the bottom
+        /// when the drag pulls the top edge -- and the background is the
+        /// rest.
+        #[test]
+        fn a_one_pixel_buffer_is_not_stretched_across_its_pane() {
+            let client = logical(0.0, 0.0, 524.0, 342.0);
+            let sliver = Size::from((524, 1));
+            assert_eq!(
+                fit(client, AT_REST, sliver, false, STRETCH, STILL).factor,
+                Scale::from((1.0, 342.0)),
+                "a stretch draws the row of pixels 342 times over"
+            );
+            let held = fit(client, AT_REST, sliver, false, Fill::default(), STILL);
+            assert_eq!(held.factor, Scale::from((1.0, 1.0)));
+            assert_eq!(held.crop, None);
+            assert_eq!(
+                uncovered(client, client.loc + held.offset, (524.0, 1.0).into(), 1.0)[1],
+                physical(0, 1, 524, 341),
+                "the background below the one row"
+            );
+            assert_eq!(
+                fit(
+                    client,
+                    AT_REST,
+                    sliver,
+                    false,
+                    Fill::default(),
+                    (false, true)
+                )
+                .offset,
+                Point::from((0.0, 341.0)),
+                "a pulled top edge keeps it against the bottom"
+            );
+        }
+
+        /// **The background fills what the picture leaves uncovered, and
+        /// nothing else**: the bands above and below the whole width, the
+        /// strips beside it between them, none where the picture reaches,
+        /// all of the rectangle when the picture misses it. Rounded to the
+        /// output's pixels with the picture rounded inward, so a strip ends
+        /// under the picture's edge and never a pixel short of it.
+        #[test]
+        fn the_background_fills_what_the_picture_leaves_uncovered() {
+            let client = logical(100.0, 50.0, 600.0, 400.0);
+            assert_eq!(
+                uncovered(client, (300.0, 50.0).into(), (400.0, 300.0).into(), 1.0),
+                [
+                    physical(100, 50, 600, 0),
+                    physical(100, 350, 600, 100),
+                    physical(100, 50, 200, 300),
+                    physical(700, 50, 0, 300),
+                ],
+                "anchored right and top: the left strip and the band below"
+            );
+            assert!(
+                uncovered(client, client.loc, client.size, 1.0)
+                    .iter()
+                    .all(|strip| strip.size.w == 0 || strip.size.h == 0),
+                "a picture that covers its rectangle leaves nothing"
+            );
+            assert_eq!(
+                uncovered(client, (900.0, 50.0).into(), (100.0, 100.0).into(), 1.0)[0],
+                physical(100, 50, 600, 400),
+                "a picture wholly off its rectangle leaves all of it"
+            );
+            assert_eq!(
+                uncovered(client, (300.25, 50.0).into(), (399.5, 400.0).into(), 2.0)[2],
+                physical(200, 100, 401, 800),
+                "at 2x, a fractional picture: the strip reaches its first whole pixel"
+            );
+        }
+
+        /// **`resize.background` is the colour the strips are drawn in**,
+        /// premultiplied, at the frame's opacity; `none` draws none.
+        #[test]
+        fn the_background_is_drawn_in_its_configured_colour() {
+            assert_eq!(background_colour(None, 1.0), None);
+            assert_eq!(
+                background_colour(Some([255, 0, 51, 255]), 1.0),
+                Some([1.0, 0.0, 0.2, 1.0])
+            );
+            let Some([red, green, _, alpha]) = background_colour(Some([255, 255, 0, 255]), 0.5)
+            else {
+                panic!("a colour is drawn");
+            };
+            assert!(
+                (alpha - 0.5).abs() < f32::EPSILON,
+                "half faded, half the alpha"
+            );
+            assert!((red - 0.5).abs() < f32::EPSILON && (green - 0.5).abs() < f32::EPSILON);
         }
 
         /// **A popup reaches past its parent's tile.**
@@ -3496,7 +3996,8 @@ mod tests {
                 AT_REST,
                 Size::from((1000, 600)),
                 true,
-                None,
+                STRETCH,
+                STILL,
             );
             let menu = || Surface::new((550, 80), (200, 300));
 

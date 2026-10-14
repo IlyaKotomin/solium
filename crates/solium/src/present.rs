@@ -748,6 +748,20 @@ pub(crate) fn frame(pane: &Pane, real: Rectangle<i32, Logical>, now: Duration) -
     .unwrap_or_else(|| Frame::real(real))
 }
 
+/// The rectangles a pane's transform runs from and to, while it has one.
+///
+/// What a glide's stationary edges are read from (#233,
+/// `resizing::pins`): the layout's `move_pane` starts a glide at the frame on
+/// screen and aims it at the new tile, so the two ends say which edges the
+/// layout pinned. `None` for a pane at rest, which has no edge moving.
+/// `state::tests::real_client::a_glide_that_shrinks_a_window_draws_its_answer_at_its_own_size`.
+pub(crate) fn course(pane: &Pane) -> Option<(Rectangle<f64, Logical>, Rectangle<f64, Logical>)> {
+    with_slot(pane, |slot| {
+        slot.map(|transform| (transform.from.rect, transform.to.rect))
+    })
+    .flatten()
+}
+
 /// Retire finished transforms. Returns whether this window is still animating.
 ///
 /// A releasing transform is dropped when it lands, and so is a held one that

@@ -189,9 +189,10 @@ impl Solium {
     ///
     /// **Or a fullscreen or maximise change waiting for its client's answer**
     /// (#49), [`Self::answering`]. That one only keeps the slot: it is not
-    /// [`Self::held_hold`], so `resize.fill` -- a drag's setting -- is not
-    /// asked, and the client's last picture is stretched into the rectangle
-    /// whatever it says. `a_slow_client_is_drawn_stretched_until_it_answers`.
+    /// [`Self::held_hold`], so no refusal is weighed for it, and the client's
+    /// last picture is fitted into the rectangle as `resize.fill` says, as
+    /// every glide's is (#233).
+    /// `a_slow_client_is_held_at_its_new_rectangle_until_it_answers`.
     pub(crate) fn holding_resize(&self, pane: crate::pane::PaneId) -> bool {
         self.held_hold(pane).is_some() || self.answering_for(pane).is_some()
     }
@@ -208,7 +209,7 @@ impl Solium {
     /// `resizing::PATIENCE` runs from there, as a drag's runs from the
     /// pointer letting go, so a client is never held for want of an answer
     /// it had no time to give. A second change replaces the first's hold.
-    /// `a_slow_client_is_drawn_stretched_until_it_answers`,
+    /// `a_slow_client_is_held_at_its_new_rectangle_until_it_answers`,
     /// `a_client_that_never_answers_is_drawn_as_it_is_once_its_patience_runs_out`.
     pub(super) fn hold_for_answer(
         &mut self,
@@ -243,7 +244,7 @@ impl Solium {
     ///
     /// A hold for a pane a drag has taken is dropped: the drag's rectangle is
     /// the truth now, and landing this one would move it.
-    /// `a_slow_client_is_drawn_stretched_until_it_answers`,
+    /// `a_slow_client_is_held_at_its_new_rectangle_until_it_answers`,
     /// `a_client_that_never_answers_is_drawn_as_it_is_once_its_patience_runs_out`.
     pub(crate) fn settle_answering(&mut self, now: Duration) -> bool {
         let mut waiting = false;
@@ -331,24 +332,45 @@ impl Solium {
         Some(bridge.panes.swap_remove(at))
     }
 
-    /// What fills this pane while its client catches up, or `None` if it is not
-    /// being dragged. See [`crate::resizing::factor`].
-    pub(crate) fn resize_fill(&self, pane: crate::pane::PaneId) -> Option<crate::resizing::Fill> {
-        Some(self.held_hold(pane)?.fill(self.resizing.fill))
+    /// How this pane's client picture is fitted to the rectangle it is drawn
+    /// at. See [`crate::resizing::Fill`].
+    ///
+    /// The configured `resize.fill` for every pane (#233): a glide, a
+    /// fullscreen or maximise change and a pane at rest take it as a drag does
+    /// -- at rest the picture and its rectangle agree, so it changes nothing
+    /// there. A pane a drag holds takes it through [`crate::resizing::Hold::fill`],
+    /// which takes a stretch away from a client that has refused its size.
+    /// `a_glide_that_shrinks_a_window_draws_its_answer_at_its_own_size`,
+    /// `a_slow_client_is_held_at_its_new_rectangle_until_it_answers`.
+    pub(crate) fn resize_fill(&self, pane: crate::pane::PaneId) -> crate::resizing::Fill {
+        self.held_hold(pane)
+            .map_or(self.resizing.fill, |hold| hold.fill(self.resizing.fill))
     }
 
-    /// Which of this pane's edges a live drag is pulling, or `None` if none is.
+    /// Which of this pane's left and top edges is moving while the edge
+    /// opposite stands still: `(false, false)` when neither is.
     ///
-    /// For a fill that does not stretch: the picture has to stay against the
-    /// edges that are standing still, or it travels with the pointer and the
-    /// window's contents slide about inside their own frame. See
-    /// [`crate::resizing::Fill::Hold`].
+    /// For a fill that anchors: the picture has to stay against the edges that
+    /// are standing still, or it travels with the moving edge and the window's
+    /// contents slide about inside their own frame. See
+    /// [`crate::resizing::Fill::Anchor`].
     ///
-    /// **A tiled pane's edges are its own**, which for the neighbour across a
-    /// seam is the opposite side from the one the pointer has hold of, and for a
-    /// pane merely pushed aside is neither. See [`crate::resizing::moved_edges`].
-    pub(crate) fn resize_pins(&self, pane: crate::pane::PaneId) -> Option<(bool, bool)> {
-        Some(self.held_hold(pane)?.pins())
+    /// **A drag's edges first, then a glide's.** A pane a drag holds answers
+    /// with the drag's edges, and **a tiled pane's edges are its own**, which
+    /// for the neighbour across a seam is the opposite side from the one the
+    /// pointer has hold of, and for a pane merely pushed aside is neither. See
+    /// [`crate::resizing::moved_edges`]. Any other pane answers with the edges
+    /// its glide does not move, from the glide's two ends (#233,
+    /// [`crate::resizing::pins`]), and a pane at rest with none.
+    /// `a_glide_that_shrinks_a_window_draws_its_answer_at_its_own_size`.
+    pub(crate) fn resize_pins(&self, pane: crate::pane::PaneId) -> (bool, bool) {
+        if let Some(hold) = self.held_hold(pane) {
+            return hold.pins();
+        }
+        self.panes
+            .get(pane)
+            .and_then(crate::present::course)
+            .map_or((false, false), |(from, to)| crate::resizing::pins(from, to))
     }
 
     /// The slot a held window's pane is keeping, if this is that window.
@@ -386,7 +408,7 @@ impl Solium {
         // And a window a fullscreen or maximise change holds until its
         // client answers, for the same reason: the slot's size is what the
         // change told it, and the space has its old size.
-        // `a_slow_client_is_drawn_stretched_until_it_answers`.
+        // `a_slow_client_is_held_at_its_new_rectangle_until_it_answers`.
         //
         // **Its size and not its place.** Position never needed a client's
         // consent, and nothing here is dragging the window: one moved by its

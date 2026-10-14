@@ -551,6 +551,14 @@ pub(crate) struct Pane {
     /// another `GRACE` on a question with a known answer, and holds the
     /// window invisible for it.
     x11_refused_once: bool,
+    /// The damage tracker's identities for the strips of background
+    /// `render::uncovered` finds round a picture smaller than its rectangle
+    /// (#233): one each for the band above, the band below and the two sides,
+    /// so a strip that moves from one frame to the next is damaged where it
+    /// was and where it is, rather than being a new element every frame.
+    /// Read by `render::background_elements`, which needs a renderer and is
+    /// not tested.
+    background: [smithay::backend::renderer::element::Id; 4],
 }
 
 /// A window going back from fullscreen or maximised, for as long as it is
@@ -608,6 +616,7 @@ impl Pane {
             cramped: false,
             shrinking: None,
             x11_refused_once: false,
+            background: std::array::from_fn(|_| smithay::backend::renderer::element::Id::new()),
         }
     }
 
@@ -640,6 +649,7 @@ impl Pane {
             cramped: false,
             shrinking: None,
             x11_refused_once: false,
+            background: std::array::from_fn(|_| smithay::backend::renderer::element::Id::new()),
         }
     }
 
@@ -696,6 +706,12 @@ impl Pane {
     /// How this pane is being drawn. `present` is the only thing that reads it.
     pub(crate) const fn drawn(&self) -> &crate::present::Slot {
         &self.drawn
+    }
+
+    /// The identities of this pane's background strips. See
+    /// [`Self::background`].
+    pub(crate) const fn background(&self) -> &[smithay::backend::renderer::element::Id; 4] {
+        &self.background
     }
 
     pub(crate) const fn id(&self) -> PaneId {

@@ -21,9 +21,10 @@ sol.loading(config.loading)
 -- Reload automatically when a file this configuration loaded changes
 -- (#223). See `config.lua`.
 sol.auto_reload(config.reload)
--- What fills a window while a resize drag is ahead of its client. An absent
--- table is not an error: a `config.lua` copied before this setting existed
--- keeps the default rather than failing the whole configuration.
+-- How a window's picture is fitted while it changes size, and what fills the
+-- rest. An absent table is not an error: a `config.lua` copied before this
+-- setting existed keeps the default rather than failing the whole
+-- configuration.
 sol.resize(config.resize)
 -- What a fullscreen window covers: the bars, or nothing. See `config.lua`.
 sol.fullscreen(config.fullscreen)
