@@ -1172,12 +1172,20 @@ impl Solium {
     /// (Ruling 28), and `xray` and `memo` (Rulings F29, F30): kept for what
     /// reads them, and the caps handed to the host and to the reader of a
     /// style's `effects.lua`, which read again what new caps may change.
-    /// `tests::effects_sandbox_reaches_the_host_and_the_styles_reader`.
+    /// `effects.memo.split` goes to the host before anything binds, so the
+    /// user's rules `apply_effects` binds next, and a style's rebound here
+    /// when it changed, are split by it.
+    /// `tests::effects_sandbox_reaches_the_host_and_the_styles_reader`,
+    /// `tests::real_client::the_memo_split_key_reaches_the_bound_chain`.
     pub(crate) fn apply_settings(&mut self, settings: crate::effect::settings::Settings) {
         let caps = settings.sandbox;
+        let split = self.effects.set_memo_split(settings.memo.split);
         self.effect_settings = settings;
-        if self.effects.set_caps(caps) {
+        let caps = self.effects.set_caps(caps).then_some(caps);
+        if let Some(caps) = caps {
             crate::style::set_caps(caps);
+        }
+        if caps.is_some() || split {
             self.apply_style_rules();
         }
     }
@@ -1185,7 +1193,7 @@ impl Solium {
     /// Rules from `sol.effects`: all of them bound and runnable, or none
     /// taken and the errors on the overlay, so a broken set keeps the rules
     /// that ran (`tests::a_broken_rule_keeps_the_rules_that_ran`,
-    /// `tests::a_blur_rule_without_source_is_refused_until_xray`). The rules
+    /// `tests::a_blur_rule_without_source_binds_and_live_is_refused`). The rules
     /// taken hold their programs and a set replaced gives its back
     /// (`tests::a_replaced_rule_set_holds_only_its_own_programs`); a set
     /// refused leaves no compile asked for

@@ -4,12 +4,15 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use smithay::utils::{Physical, Rectangle, Size};
-use solium_effects::stage::Plan;
+use smithay::utils::{Logical, Physical, Rectangle, Size};
+use solium_effects::stage::{Plan, Split};
 
 use super::element::EffectElement;
 use super::host::{Host, Problem};
-use super::rules::{Fill, Origin, Part, Rule, RuleKey, Slot, Tier, runnable, tier};
+use super::memo::MemoKey;
+use super::rules::{CutChoice, Fill, Origin, Part, Rule, RuleKey, Slot, Tier, runnable, tier};
+use super::run::BoxMap;
+use super::xray::Cut;
 use crate::pane::PaneId;
 
 /// One rule's chain, bound and checked.
@@ -31,6 +34,76 @@ pub(crate) struct BoundChain {
     /// changed runs again (`store::SlotState::needs_run`).
     /// `tests::a_chain_reaches_as_its_first_link_and_bleeds_as_all_of_them`.
     pub(crate) params_hash: u64,
+    /// How [`BoundChain::split`] splits `plan`: the configured
+    /// `effects.memo.split`, or `Off` for a rule with `memo = false`
+    /// (Ruling F30; amended 2026-10-08, configurable).
+    /// `state::tests::real_client::a_rule_with_memo_false_is_never_split`.
+    pub(crate) split_by: Split,
+    /// The xray cut the rule asks for (Ruling F29).
+    /// `state::tests::real_client::a_rule_may_read_the_wallpaper_alone`.
+    pub(crate) cut: CutChoice,
+    /// A T2 chain's memo split, derived from `plan` by [`BoundChain::split`]
+    /// and by nothing else; `None` for every other tier.
+    memo: Option<solium_effects::stage::Memo>,
+    /// One key per export of `memo`, in its order: the prefix's
+    /// `keys()[export.step]`.
+    memo_keys: Vec<u64>,
+}
+
+impl BoundChain {
+    /// Derive the memo split and one key per export from `plan`, the one
+    /// copy: at bind, and after every write into `plan` (Task 59's
+    /// `write_uniform`), so what a memo or a suffix runs is never a stale
+    /// clone (Ruling F30). By `split_by`, the configured
+    /// `effects.memo.split`, or `Off` for a rule with `memo = false`
+    /// (amended 2026-10-08, configurable).
+    /// `state::tests::real_client::a_backdrop_blur_binds_as_t2_with_its_memo_split`,
+    /// `state::tests::real_client::the_memo_split_key_reaches_the_bound_chain`,
+    /// `state::tests::real_client::a_rule_with_memo_false_is_never_split`.
+    fn split(&mut self) {
+        self.memo = (self.tier == Tier::Xray)
+            .then(|| solium_effects::stage::split_memo(&self.plan, self.split_by));
+        self.memo_keys = self.memo.as_ref().map_or_else(Vec::new, |memo| {
+            let keys = memo.prefix.as_ref().map(Plan::keys).unwrap_or_default();
+            memo.exports
+                .iter()
+                .filter_map(|export| keys.get(export.step).copied())
+                .collect()
+        });
+    }
+
+    /// The split every run reads: `render::run_xray` the plans of its memos
+    /// (the prefix up to each export), `render::run_slots` its suffix.
+    /// Nothing else holds a copy.
+    /// `state::tests::real_client::a_backdrop_blur_binds_as_t2_with_its_memo_split`.
+    pub(crate) fn memo(&self) -> Option<&solium_effects::stage::Memo> {
+        self.memo.as_ref()
+    }
+
+    /// One key per export, in `memo().exports`' order.
+    /// `state::tests::real_client::a_backdrop_blur_binds_as_t2_with_its_memo_split`.
+    pub(crate) fn memo_keys(&self) -> &[u64] {
+        &self.memo_keys
+    }
+
+    /// A T2 chain of `plan` with `params_hash`, split as the default
+    /// configuration splits it, for a test that needs no folder.
+    #[cfg(test)]
+    pub(crate) fn t2_for_test(plan: Plan, params_hash: u64) -> Self {
+        let mut chain = Self {
+            plan,
+            reach: 0.0,
+            bleed: 0.0,
+            tier: Tier::Xray,
+            params_hash,
+            split_by: Split::Resize,
+            cut: CutChoice::Below,
+            memo: None,
+            memo_keys: Vec::new(),
+        };
+        chain.split();
+        chain
+    }
 }
 
 /// Every rule's bound chain, by its key.
@@ -49,7 +122,8 @@ impl Chains {
     /// overlay names the `.frag`'s line and not the configuration
     /// (`state::tests::a_rule_whose_effect_is_broken_is_named_at_the_frags_line_until_mended`);
     /// a tier this build cannot run is refused by name
-    /// (`state::tests::a_blur_rule_without_source_is_refused_until_xray`).
+    /// (`state::tests::a_blur_rule_without_source_binds_and_live_is_refused`).
+    /// A T2 chain ends split for its memo ([`BoundChain::split`]).
     pub(crate) fn bind(host: &mut Host, rule: &Rule) -> Result<BoundChain, Problem> {
         let plain =
             |message: String| Problem::error("rules", Path::new("effects.rules"), None, message);
@@ -93,13 +167,23 @@ impl Chains {
                 links.first().map_or("", |link| link.effect.as_str())
             ))
         })?;
-        Ok(BoundChain {
+        let mut chain = BoundChain {
             plan,
             reach,
             bleed,
             tier,
             params_hash: solium_effects::glsl::content_hash(&[&hashed]),
-        })
+            split_by: if rule.memo {
+                host.memo_split()
+            } else {
+                Split::Off
+            },
+            cut: rule.cut,
+            memo: None,
+            memo_keys: Vec::new(),
+        };
+        chain.split();
+        Ok(chain)
     }
 
     pub(crate) fn insert(&mut self, key: RuleKey, chain: BoundChain) {
@@ -162,6 +246,16 @@ impl Chains {
         keys.sort_unstable();
         keys.dedup();
         keys
+    }
+
+    /// The newest bound chain of `origin`'s, for a test to read.
+    #[cfg(test)]
+    pub(crate) fn first_for_test(&self, origin: Origin) -> Option<&BoundChain> {
+        self.by_key
+            .iter()
+            .filter(|(key, _)| key.origin == origin)
+            .max_by_key(|(key, _)| (key.generation, std::cmp::Reverse(key.index)))
+            .map(|(_, chain)| chain)
     }
 
     /// The newest bound plan of `origin`'s, for a test to read.
@@ -259,6 +353,82 @@ fn uv(part: i32, whole: i32) -> f32 {
     (f64::from(part) / f64::from(whole.max(1))) as f32
 }
 
+/// Where a T2 slot's padded box lies on one monitor (Ruling F30): the
+/// monitor and the cut it reads, the box in that monitor's xray pixels
+/// (`padded`, where its crop of a memo lies), in its own physical pixels
+/// (`screen`, what `memo::T2Key` keys on, so a drag finer than an xray
+/// pixel still re-runs the suffix, Ruling F37), as a `BoxMap` into the
+/// monitor-sized textures, and its own size at the monitor's scale, which
+/// the suffix runs at whatever the xray's resolution (`own`).
+/// `tests::a_parts_place_in_a_monitors_xray_is_its_box_in_xray_pixels`,
+/// `tests::a_parts_box_on_a_monitor_is_in_its_physical_pixels`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct T2Place {
+    pub(crate) monitor: String,
+    pub(crate) cut: Cut,
+    pub(crate) padded: Rectangle<i32, Physical>,
+    pub(crate) screen: Rectangle<i32, Physical>,
+    pub(crate) map: BoxMap,
+    pub(crate) own: Size<i32, Physical>,
+}
+
+/// Where a T2 slot's padded box lies in one monitor's xray: in its pixels,
+/// as a `BoxMap` into the monitor-sized texture, and its own size at the
+/// monitor's `scale`, which the suffix runs at whatever the xray's size.
+/// `padded` and `monitor` are global logical; `xray` already carries the
+/// monitor's scale and `effects.xray.scale` (and Task 68's half rung), so
+/// the box and the crop follow the xray and `own` does not: a half-size
+/// xray halves the backdrop and never the refraction, the alpha cut or a
+/// shape's edge.
+/// `tests::a_parts_place_in_a_monitors_xray_is_its_box_in_xray_pixels`,
+/// `tests::a_rotated_monitors_place_is_its_whole_xray`.
+pub(crate) fn place_on(
+    padded: Rectangle<f64, Logical>,
+    monitor: Rectangle<i32, Logical>,
+    scale: f64,
+    xray: Size<i32, Physical>,
+) -> (Rectangle<i32, Physical>, BoxMap, Size<i32, Physical>) {
+    let local = Rectangle::<f64, Logical>::new(padded.loc - monitor.loc.to_f64(), padded.size);
+    let mw = f64::from(monitor.size.w.max(1));
+    let mh = f64::from(monitor.size.h.max(1));
+    let px = Rectangle::<f64, Physical>::new(
+        (
+            local.loc.x / mw * f64::from(xray.w),
+            local.loc.y / mh * f64::from(xray.h),
+        )
+            .into(),
+        (
+            local.size.w / mw * f64::from(xray.w),
+            local.size.h / mh * f64::from(xray.h),
+        )
+            .into(),
+    )
+    .to_i32_round();
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a fraction of a monitor, given to GL as a float"
+    )]
+    let map = BoxMap {
+        offset: [(local.loc.x / mw) as f32, (local.loc.y / mh) as f32],
+        scale: [(local.size.w / mw) as f32, (local.size.h / mh) as f32],
+    };
+    let own = padded.size.to_physical_precise_round(scale);
+    (px, map, own)
+}
+
+/// A padded box (global logical) in a monitor's own physical pixels, from
+/// the monitor's corner: what a T2 run's key holds, whatever the xray's
+/// resolution. `tests::a_parts_box_on_a_monitor_is_in_its_physical_pixels`.
+pub(crate) fn screen_box(
+    padded: Rectangle<f64, Logical>,
+    monitor: Rectangle<i32, Logical>,
+    scale: f64,
+) -> Rectangle<i32, Physical> {
+    Rectangle::<f64, Logical>::new(padded.loc - monitor.loc.to_f64(), padded.size)
+        .to_physical(scale)
+        .to_i32_round()
+}
+
 /// What effects this pass draws where: what the rules want, and what is
 /// ready. Built once a pass by `render::build_slots`, so every output and
 /// every screencopy places from the same answer.
@@ -268,6 +438,17 @@ pub(crate) struct Slots {
     wants: HashMap<(Owner, Slot), RuleKey>,
     boxes: HashMap<(Owner, Slot), PartBox>,
     ready: HashMap<(Owner, Slot), Option<Ready>>,
+    /// A T2 slot's places, one per monitor its padded box overlaps
+    /// (`render::record_boxes`).
+    places: HashMap<(Owner, Slot), Vec<T2Place>>,
+    /// A T2 slot's result on one monitor, by the monitor's name.
+    on: HashMap<(Owner, Slot, String), Option<Ready>>,
+    /// The T2 places whose memos were not held this pass, over
+    /// `effects.memo.budget_mib` (`render::want_t2`).
+    unshared: HashSet<(Owner, Slot, String)>,
+    /// Every memo a place reads this pass, each once, in order: what the
+    /// `xray` phase runs when its xray was redrawn (`render::want_t2`).
+    memos: Vec<MemoKey>,
     reach: HashMap<PaneId, i32>,
     facts: u32,
 }
@@ -342,11 +523,86 @@ impl Slots {
             .and_then(Option::as_ref)
     }
 
-    /// Whether the slot has a result to draw: what the walk asks.
+    /// Whether the slot has a result to draw on any monitor: what a walk
+    /// with no monitor asks (a warped pane's capture).
     /// `tests::a_slot_is_wanted_by_its_owner_and_slot_and_ready_apart`,
+    /// `tests::a_monitors_own_result_wins_over_the_slots_one`,
     /// `render::tests::a_wanted_slot_with_nothing_ready_draws_what_no_slot_draws`.
     pub(crate) fn is_ready(&self, owner: &Owner, slot: Slot) -> bool {
         self.ready.contains_key(&(owner.clone(), slot))
+            || self
+                .on
+                .keys()
+                .any(|(each, at, _)| each == owner && *at == slot)
+    }
+
+    /// A T2 slot's places (`render::record_boxes`).
+    /// `state::tests::real_client::a_window_across_two_monitors_has_a_t2_place_on_each`.
+    pub(crate) fn set_places(&mut self, owner: Owner, slot: Slot, places: Vec<T2Place>) {
+        self.places.insert((owner, slot), places);
+    }
+
+    /// A T2 slot's places, one per monitor its padded box overlaps; none
+    /// for any other slot.
+    /// `state::tests::real_client::a_window_across_two_monitors_has_a_t2_place_on_each`.
+    pub(crate) fn places(&self, owner: &Owner, slot: Slot) -> &[T2Place] {
+        self.places
+            .get(&(owner.clone(), slot))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// A T2 slot's result on one monitor (Ruling F30).
+    /// `tests::a_monitors_own_result_wins_over_the_slots_one`.
+    pub(crate) fn set_ready_on(&mut self, owner: Owner, slot: Slot, monitor: &str, ready: Ready) {
+        self.reached(&owner, ready.reach);
+        self.on
+            .insert((owner, slot, monitor.to_owned()), Some(ready));
+    }
+
+    /// The slot's result on `monitor`: its own there, else the one result
+    /// a slot of another tier has. What the walk places on that monitor.
+    /// `tests::a_monitors_own_result_wins_over_the_slots_one`.
+    pub(crate) fn at_on(&self, owner: &Owner, slot: Slot, monitor: &str) -> Option<&Ready> {
+        match self.on.get(&(owner.clone(), slot, monitor.to_owned())) {
+            Some(ready) => ready.as_ref(),
+            None => self.at(owner, slot),
+        }
+    }
+
+    /// Whether the slot has a result to draw on `monitor`: its own there,
+    /// else the slot's one result. What the walk on that monitor asks, so
+    /// a T2 slot ready on one monitor only brackets nothing on another.
+    /// `tests::a_monitors_own_result_wins_over_the_slots_one`.
+    pub(crate) fn is_ready_on(&self, owner: &Owner, slot: Slot, monitor: &str) -> bool {
+        self.on
+            .contains_key(&(owner.clone(), slot, monitor.to_owned()))
+            || self.ready.contains_key(&(owner.clone(), slot))
+    }
+
+    /// A T2 place whose memos were not held this pass: it runs its whole
+    /// plan per part (`effects.memo.budget_mib`).
+    /// `state::tests::real_client::over_the_memo_budget_a_slot_runs_its_whole_plan`.
+    pub(crate) fn set_unshared(&mut self, owner: Owner, slot: Slot, monitor: &str) {
+        self.unshared.insert((owner, slot, monitor.to_owned()));
+    }
+
+    /// Whether a T2 place reads its memos this pass.
+    /// `state::tests::real_client::over_the_memo_budget_a_slot_runs_its_whole_plan`.
+    pub(crate) fn shared_on(&self, owner: &Owner, slot: Slot, monitor: &str) -> bool {
+        !self
+            .unshared
+            .contains(&(owner.clone(), slot, monitor.to_owned()))
+    }
+
+    /// Every memo the places read this pass (`render::want_t2`).
+    /// `state::tests::real_client::two_windows_with_one_blur_want_one_memo`.
+    pub(crate) fn set_memos(&mut self, memos: Vec<MemoKey>) {
+        self.memos = memos;
+    }
+
+    /// `state::tests::real_client::two_windows_with_one_blur_want_one_memo`.
+    pub(crate) fn memos(&self) -> &[MemoKey] {
+        &self.memos
     }
 
     /// A slot made ready with no texture, so the walk's order is testable
@@ -357,11 +613,19 @@ impl Slots {
         self.ready.insert((owner, slot), None);
     }
 
-    /// How many slots have a result to draw, of every owner.
+    /// [`Self::mark_ready`] on one monitor.
+    /// `tests::a_monitors_own_result_wins_over_the_slots_one`.
+    #[cfg(test)]
+    pub(crate) fn mark_ready_on(&mut self, owner: Owner, slot: Slot, monitor: &str) {
+        self.on.insert((owner, slot, monitor.to_owned()), None);
+    }
+
+    /// How many slots have a result to draw, of every owner, a T2 slot's
+    /// once per monitor.
     /// `state::tests::real_client::every_failure_leaves_the_part_drawn`.
     #[cfg(test)]
     pub(crate) fn ready_count(&self) -> usize {
-        self.ready.len()
+        self.ready.len() + self.on.len()
     }
 
     /// `tests::a_pane_reaches_as_far_as_its_furthest_ready_slot`,
@@ -391,7 +655,7 @@ impl Slots {
 /// Lua counts, at its effect's own file and line when it has one and at the
 /// configuration otherwise.
 /// `state::tests::a_rule_whose_effect_is_broken_is_named_at_the_frags_line_until_mended`,
-/// `check::tests::a_rule_reading_xray_fails_the_check`.
+/// `check::tests::a_rule_reading_the_live_backdrop_fails_the_check`.
 pub(crate) fn rule_problem(number: usize, problem: Problem, config: &Path) -> Problem {
     Problem {
         effect: "rules".to_owned(),
@@ -609,6 +873,106 @@ mod tests {
         assert!(
             slots.at(&client, Slot::Behind).is_none(),
             "a slot marked ready in a test has no result to draw"
+        );
+    }
+
+    /// **A part's place in a monitor's xray**: its padded box in that
+    /// monitor's xray pixels, and where that box lies in the monitor-sized
+    /// texture, at the xray's own scale.
+    #[test]
+    fn a_parts_place_in_a_monitors_xray_is_its_box_in_xray_pixels() {
+        use smithay::utils::Rectangle;
+        let monitor = Rectangle::new((2560, 0).into(), (1920, 1080).into());
+        let padded = Rectangle::new((2660.0, 50.0).into(), (200.0, 100.0).into());
+        let (px, map, own) = super::place_on(padded, monitor, 1.0, (960, 540).into());
+        assert_eq!(px, Rectangle::new((50, 25).into(), (100, 50).into()));
+        assert!(
+            (map.offset[0] - 100.0 / 1920.0).abs() < 1e-6
+                && (map.offset[1] - 50.0 / 1080.0).abs() < 1e-6
+        );
+        assert!(
+            (map.scale[0] - 200.0 / 1920.0).abs() < 1e-6
+                && (map.scale[1] - 100.0 / 1080.0).abs() < 1e-6
+        );
+        assert_eq!(
+            own,
+            (200, 100).into(),
+            "a half-size xray, or the Half rung, keeps the suffix at the part's own size"
+        );
+    }
+
+    /// **A part's box on a monitor is in that monitor's own physical
+    /// pixels**, whatever the xray's size: what a T2 run is keyed on, so a
+    /// drag finer than an xray pixel still moves the key (Ruling F37).
+    #[test]
+    fn a_parts_box_on_a_monitor_is_in_its_physical_pixels() {
+        use smithay::utils::Rectangle;
+        let monitor = Rectangle::new((2560, 0).into(), (1536, 864).into());
+        let padded = Rectangle::new((2660.0, 50.0).into(), (200.0, 100.0).into());
+        assert_eq!(
+            super::screen_box(padded, monitor, 1.25),
+            Rectangle::new((125, 63).into(), (250, 125).into())
+        );
+        let moved = Rectangle::new((2661.0, 50.0).into(), (200.0, 100.0).into());
+        let (half, _, _) = super::place_on(padded, monitor, 1.25, (960, 540).into());
+        let (half_moved, _, _) = super::place_on(moved, monitor, 1.25, (960, 540).into());
+        assert_eq!(
+            half, half_moved,
+            "the premise: one logical pixel is under an xray pixel"
+        );
+        assert_ne!(
+            super::screen_box(padded, monitor, 1.25),
+            super::screen_box(moved, monitor, 1.25)
+        );
+    }
+
+    /// **On a rotated monitor at a fractional scale the whole monitor is the
+    /// whole xray**: `place_on` and `offscreen::xray_size_of` agree with the
+    /// output's geometry, which is already turned.
+    #[test]
+    fn a_rotated_monitors_place_is_its_whole_xray() {
+        use smithay::utils::{Rectangle, Transform};
+        for transform in [Transform::_90, Transform::Flipped270] {
+            let xray = crate::offscreen::xray_size_of((2560, 1440).into(), transform, 1.0);
+            let monitor = Rectangle::new((0, 0).into(), (1152, 2048).into()); // 1440×2560 at 1.25
+            let (px, map, own) = super::place_on(monitor.to_f64(), monitor, 1.25, xray);
+            assert_eq!(
+                px,
+                Rectangle::new((0, 0).into(), (1440, 2560).into()),
+                "{transform:?}"
+            );
+            assert_eq!(map, crate::effect::run::BoxMap::WHOLE);
+            assert_eq!(own, (1440, 2560).into());
+        }
+    }
+
+    /// **A monitor's own result wins, and a slot with none falls back to
+    /// the one result a T1 slot has.**
+    #[test]
+    fn a_monitors_own_result_wins_over_the_slots_one() {
+        use super::{Owner, PaneSlot, Slots};
+        use crate::effect::rules::Slot;
+        let owner = Owner::Pane(crate::pane::PaneId::from_raw(1), PaneSlot::Client);
+        let mut slots = Slots::default();
+        assert!(!slots.is_ready_on(&owner, Slot::Behind, "DP-1"));
+        slots.mark_ready_on(owner.clone(), Slot::Behind, "DP-2");
+        assert!(slots.is_ready_on(&owner, Slot::Behind, "DP-2"));
+        assert!(
+            !slots.is_ready_on(&owner, Slot::Behind, "DP-1"),
+            "a T2 result on one monitor is on another"
+        );
+        assert!(
+            slots.is_ready(&owner, Slot::Behind),
+            "ready on some monitor"
+        );
+        slots.mark_ready(owner.clone(), Slot::Behind);
+        assert!(
+            slots.at_on(&owner, Slot::Behind, "DP-1").is_none(),
+            "a test's ready has no element"
+        );
+        assert!(
+            slots.is_ready_on(&owner, Slot::Behind, "DP-1"),
+            "the slot-wide answer is the fallback"
         );
     }
 

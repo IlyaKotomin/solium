@@ -421,6 +421,11 @@ pub(crate) struct Host<P = super::gl::Program> {
     formats: Option<crate::pool::Formats>,
     problems: Vec<Problem>,
     generation: u64,
+    /// How far a T2 chain's memo prefix runs, `effects.memo.split` (Ruling
+    /// F30; amended 2026-10-08, configurable): what `plan::Chains::bind`
+    /// splits a chain by, set before any rule binds.
+    /// `state::tests::real_client::the_memo_split_key_reaches_the_bound_chain`.
+    memo_split: solium_effects::stage::Split,
     /// Loads that read a folder: what `a_reload_loads_each_effect_once` counts.
     #[cfg(test)]
     pub(crate) loads: u32,
@@ -442,9 +447,25 @@ impl<P: Clone> Host<P> {
             formats: None,
             problems: Vec::new(),
             generation: 0,
+            memo_split: solium_effects::stage::Split::default(),
             #[cfg(test)]
             loads: 0,
         }
+    }
+
+    /// The split every chain bound from now on is made by,
+    /// `effects.memo.split`; whether it changed, so the caller binds every
+    /// chain again with it.
+    /// `state::tests::real_client::the_memo_split_key_reaches_the_bound_chain`.
+    pub(crate) fn set_memo_split(&mut self, split: solium_effects::stage::Split) -> bool {
+        let changed = self.memo_split != split;
+        self.memo_split = split;
+        changed
+    }
+
+    /// `state::tests::real_client::the_memo_split_key_reaches_the_bound_chain`.
+    pub(crate) fn memo_split(&self) -> solium_effects::stage::Split {
+        self.memo_split
     }
 
     /// The programs the bound rules hold, from now until the rules are bound

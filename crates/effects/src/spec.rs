@@ -8,10 +8,13 @@ pub const KEYS: [&str; 13] = [
 ];
 
 /// Names a param may not have: what a rule or `effects.on` says beside params
-/// (`reach` and `bleed` there override the file's, Ruling 5).
-pub const RESERVED: [&str; 15] = [
+/// (`reach` and `bleed` there override the file's, Ruling 5; a rule's `memo`
+/// and `cut`, FX3 Task 44). `tests::names_inputs_and_defaults_are_checked`.
+pub const RESERVED: [&str; 17] = [
     "source",
     "mask",
+    "memo",
+    "cut",
     "keep",
     "effect",
     "geometry",
@@ -473,6 +476,10 @@ mod tests {
             ..minimal()
         };
         assert!(with("source").check().is_err());
+        assert!(
+            with("memo").check().is_err() && with("cut").check().is_err(),
+            "a rule's memo and cut keys (FX3 Task 44)"
+        );
         assert!(
             with("bleed").check().is_err(),
             "a rule's extent override, Ruling 5"

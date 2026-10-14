@@ -36,10 +36,6 @@ pub(crate) enum Kind {
     Over,
     /// A monitor's xray cut, Ruling F29, held in `effect::xray::Xrays` and
     /// never by a pane: `tests::a_pane_holds_no_xray_capture`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Task 44's xray phase builds a cut's job")
-    )]
     Xray,
 }
 

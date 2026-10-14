@@ -110,10 +110,6 @@ pub(crate) enum PartSource<'a> {
 pub(crate) enum HeldIn {
     Pane(PaneId, crate::keyed::Kind),
     Slot(crate::effect::plan::Owner, crate::effect::rules::Slot),
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Task 44's xray phase builds a cut's job")
-    )]
     Xray(String, crate::effect::xray::Cut),
 }
 
@@ -412,8 +408,8 @@ pub(crate) fn over_job(
 /// Ruling 9). Each entry is drawn by `render::stacked_elements`, as
 /// `render::elements` draws it; an xray holds no pane (Ruling F29), the
 /// one entry a pass's `Prepared` is read for, so none is handed in.
-/// `state::tests::real_client::the_xray_capture_is_stale_only_when_its_cut_changes`.
-#[expect(dead_code, reason = "Task 44's xray phase builds each wanted cut")]
+/// `state::tests::real_client::the_xray_capture_is_stale_only_when_its_cut_changes`;
+/// `render`'s `xray` phase draws each wanted cut through it.
 pub(crate) fn xray_job(
     state: &mut Solium,
     renderer: &mut GlesRenderer,

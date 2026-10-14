@@ -49,11 +49,8 @@ impl Placement {
     }
 
     /// The same placement drawing only `crop` of its texture: a memo,
-    /// cropped to one part's padded box. `tests::a_cropped_placement_draws_only_its_crop`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Task 44 places a memo cropped to each part")
-    )]
+    /// cropped to one part's padded box (`render::run_slots`).
+    /// `tests::a_cropped_placement_draws_only_its_crop`.
     pub(crate) fn cropped(self, crop: Rectangle<f64, Buffer>) -> Self {
         Self {
             crop: Some(crop),
@@ -213,11 +210,8 @@ impl EffectElement {
     }
 
     /// The same result drawing only `crop` of its texture: a memo, cropped
-    /// to one part's padded box. Wirecheck's case 12h.
-    #[expect(
-        dead_code,
-        reason = "Task 44 places a memo cropped to each part; wirecheck's case 12h draws one"
-    )]
+    /// to one part's padded box (`render::run_slots`), the crop kept by
+    /// every later [`Self::at`]. Wirecheck's case 12h.
     pub(crate) fn cropped(&self, crop: Rectangle<f64, Buffer>) -> Self {
         Self {
             placement: self.placement.cropped(crop),

@@ -1,5 +1,3 @@
-#![cfg_attr(not(test), expect(dead_code, reason = "Task 44 runs the memos"))]
-
 //! The per-monitor memo (Ruling F30): one result per monitor, cut and
 //! prefix, shared by every slot whose chain's memoised prefix is the same,
 //! re-run only when the xray under it was redrawn or its key moved.
@@ -62,6 +60,17 @@ pub(crate) struct Memos {
     refused_logged: Option<u64>,
 }
 
+/// One place's ask of [`Memos::admit_pass`]: the memos it reads, each with
+/// the bytes it holds at its xray's size, and whether the place read its
+/// memos last pass, which is judged first, so two places that cannot both
+/// be held do not trade them back and forth as their keys move.
+/// `tests::a_place_that_read_its_memos_last_pass_keeps_them`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Ask {
+    pub(crate) memos: Vec<(MemoKey, u64)>,
+    pub(crate) read_last_pass: bool,
+}
+
 /// A MiB's bytes, what `effects.memo.budget_mib` counts in.
 /// `tests::a_memo_fits_at_exactly_its_budget`.
 const MIB: u64 = 1024 * 1024;
@@ -104,7 +113,10 @@ impl Memos {
         }
     }
 
-    /// `tests::a_memo_keeps_the_plan_it_was_first_wanted_with`.
+    /// `tests::a_memo_keeps_the_plan_it_was_first_wanted_with`; a run takes
+    /// it from `Memo::plan` beside the targets it draws into
+    /// (`render::run_xray`).
+    #[cfg(test)]
     pub(crate) fn plan(&self, key: &MemoKey) -> Option<&solium_effects::stage::Plan> {
         self.by_key.get(key)?.plan.as_ref()
     }
@@ -124,11 +136,8 @@ impl Memos {
         self.by_key.get(key).map(|memo| memo.generation)
     }
 
-    /// The memo's result, while it stands.
-    #[expect(
-        dead_code,
-        reason = "Task 44 reads a memo's result, which only a run on the GPU makes"
-    )]
+    /// The memo's result, while it stands: what a suffix reads as
+    /// `memo:<k>`, and a crop places (`render::run_slots`).
     pub(crate) fn output(&self, key: &MemoKey) -> Option<&GlesTexture> {
         self.by_key.get(key)?.held.output()
     }
@@ -150,22 +159,33 @@ impl Memos {
     }
 
     /// `tests::two_slots_with_one_prefix_share_one_memo`.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.by_key.len()
     }
 
+    /// Every memo held, for a test to read.
+    /// `state::tests::real_client::a_reload_changing_xray_scale_rebuilds_its_cut_and_reruns_its_memos_once`.
+    #[cfg(test)]
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &MemoKey> {
+        self.by_key.keys()
+    }
+
     /// One pass's memos, judged together (Ruling F30). `requests` holds
-    /// each place's memos, each with the bytes it holds at its xray's size,
-    /// and the answer says, place by place in the same order, whether the
-    /// place may read its memos (`true`) or must run its whole plan
-    /// (`false`, Task 44). A place gets all its memos or none.
+    /// each place's [`Ask`]: its memos, each with the bytes it holds at its
+    /// xray's size, and whether it read its memos last pass. The answer
+    /// says, place by place in the same order, whether the place may read
+    /// its memos (`true`) or must run its whole plan (`false`, Task 44). A
+    /// place gets all its memos or none.
     ///
     /// With `budget_mib` 0 (`effects.memo.budget_mib`, no cap) every place
     /// gets them. Else a memo is counted at the most any place asks for it,
     /// and the places are judged in an order of their own, never the order
-    /// the requests come in: those whose memos are all held already first,
-    /// so what is held stays held, then the rest, each group in its memos'
-    /// order. A place is admitted while the memos it asks for that are not
+    /// the requests come in: those that read their memos last pass first,
+    /// so a place keeps its memos while a prefix uniform it animates gives
+    /// it a new key every pass; then those whose memos are all held
+    /// already, so what is held stays held; then the rest, each group in
+    /// its memos' order. A place is admitted while the memos it asks for that are not
     /// admitted yet fit beside those that are, its other memos counted once.
     /// The memos admitted are marked wanted in `pass` at the bytes asked. A
     /// refused place's memos that no admitted place asks for are given back
@@ -186,42 +206,44 @@ impl Memos {
     /// `tests::two_memos_that_cannot_share_the_budget_do_not_trade_places`,
     /// `tests::a_key_that_changes_every_pass_is_admitted_every_pass`,
     /// `tests::the_outcome_is_the_same_whatever_order_the_places_ask_in`,
-    /// `tests::what_is_held_never_passes_the_budget`.
+    /// `tests::what_is_held_never_passes_the_budget`,
+    /// `tests::a_place_that_read_its_memos_last_pass_keeps_them`.
     pub(crate) fn admit_pass(
         &mut self,
-        requests: &[Vec<(MemoKey, u64)>],
+        requests: &[Ask],
         budget_mib: u64,
         pass: u64,
         pool: &mut crate::pool::Pool,
     ) -> Vec<bool> {
         let cap = budget_mib.saturating_mul(MIB);
         let mut asked: BTreeMap<&MemoKey, u64> = BTreeMap::new();
-        for (key, bytes) in requests.iter().flatten() {
+        for (key, bytes) in requests.iter().flat_map(|place| &place.memos) {
             let at = asked.entry(key).or_insert(0);
             *at = (*at).max(*bytes);
         }
         let places: Vec<Vec<&MemoKey>> = requests
             .iter()
             .map(|place| {
-                let mut keys: Vec<&MemoKey> = place.iter().map(|(key, _)| key).collect();
+                let mut keys: Vec<&MemoKey> = place.memos.iter().map(|(key, _)| key).collect();
                 keys.sort_unstable();
                 keys.dedup();
                 keys
             })
             .collect();
-        let mut order: Vec<(bool, &[&MemoKey], usize)> = places
+        let mut order: Vec<(bool, bool, &[&MemoKey], usize)> = places
             .iter()
+            .zip(requests)
             .enumerate()
-            .map(|(index, keys)| {
+            .map(|(index, (keys, ask))| {
                 let new = !keys.iter().all(|key| self.by_key.contains_key(*key));
-                (new, keys.as_slice(), index)
+                (!ask.read_last_pass, new, keys.as_slice(), index)
             })
             .collect();
         order.sort_unstable();
         let mut admitted: BTreeSet<&MemoKey> = BTreeSet::new();
         let mut total: u64 = 0;
         let mut answers = vec![false; requests.len()];
-        for (_, keys, index) in order {
+        for (_, _, keys, index) in order {
             let need = keys
                 .iter()
                 .filter(|key| !admitted.contains(**key))
@@ -421,8 +443,8 @@ pub(crate) struct T2Key {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{MemoKey, Memos, T2Key};
+pub(crate) mod tests {
+    use super::{Ask, MemoKey, Memos, T2Key};
     use crate::effect::xray::Cut;
 
     fn key(upto: u64) -> MemoKey {
@@ -437,7 +459,8 @@ mod tests {
     /// one: each step reads the one before it (the first reads `backdrop`),
     /// a `down*` frag at scale 0.5, an `up*` frag sized like the input of the
     /// down step it undoes, any other at 1, each keyed by its frag's hash.
-    fn chain(frags: &[&str]) -> solium_effects::stage::Plan {
+    /// `render`'s tests build their plans with it too.
+    pub(crate) fn chain(frags: &[&str]) -> solium_effects::stage::Plan {
         use solium_effects::glsl::{Host, Signature, content_hash};
         use solium_effects::stage::{Feed, Format, Plan, Reads, Size, Step};
         let backdrop = || Feed::Input("backdrop".to_owned());
@@ -622,12 +645,16 @@ mod tests {
         assert_eq!(memos.len(), 0);
     }
 
-    /// One place's request: its memos by `upto`, each with its bytes.
-    fn place(memos: &[(u64, u64)]) -> Vec<(MemoKey, u64)> {
-        memos
-            .iter()
-            .map(|&(upto, bytes)| (key(upto), bytes))
-            .collect()
+    /// One place's request: its memos by `upto`, each with its bytes, and
+    /// no memo read last pass.
+    fn place(memos: &[(u64, u64)]) -> Ask {
+        Ask {
+            memos: memos
+                .iter()
+                .map(|&(upto, bytes)| (key(upto), bytes))
+                .collect(),
+            read_last_pass: false,
+        }
     }
 
     /// Whether each memo of `uptos` is held.
@@ -906,6 +933,46 @@ mod tests {
         }
     }
 
+    /// **A place that read its memos last pass keeps them**: two parts on
+    /// one monitor and cut, each animating a prefix uniform (Task 59), ask
+    /// for a new memo key every pass, under a budget that holds one. The
+    /// part that read its memo last pass is judged first, so over 1000
+    /// passes the same part has it every time and the other runs its whole
+    /// plan, whichever new key sorts first (new keys sort by hash).
+    #[test]
+    fn a_place_that_read_its_memos_last_pass_keeps_them() {
+        let mib = 1024 * 1024;
+        let (mut memos, mut pool) = (Memos::default(), crate::pool::Pool::new(0));
+        let mut state: u64 = 0x5851_f42d_4c95_7f2d;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut read = [false, false];
+        let mut holder = None;
+        for pass in 1..=1000 {
+            let asks: Vec<Ask> = read
+                .iter()
+                .map(|read_last_pass| Ask {
+                    memos: vec![(key(next()), 3 * mib / 4)],
+                    read_last_pass: *read_last_pass,
+                })
+                .collect();
+            let answers = memos.admit_pass(&asks, 1, pass, &mut pool);
+            assert_eq!(answers.iter().filter(|yes| **yes).count(), 1, "pass {pass}");
+            let now = answers.iter().position(|yes| *yes);
+            assert_eq!(
+                *holder.get_or_insert(now),
+                now,
+                "pass {pass}: the memo changed hands"
+            );
+            read = [answers[0], answers[1]];
+            memos.sweep(pass, 0, &mut pool);
+        }
+    }
+
     /// **The outcome is the same whatever order the places ask in**: each
     /// of the 24 orders of four places, two sharing a memo that one asks for
     /// at a larger size than the other, from the same memos held, gives each
@@ -924,8 +991,7 @@ mod tests {
             let (mut memos, mut pool) = (Memos::default(), crate::pool::Pool::new(0));
             let earlier = [place(&[(5, mib / 4)]), place(&[(11, mib / 2)])];
             assert_eq!(memos.admit_pass(&earlier, 1, 1, &mut pool), [true, true]);
-            let asked: Vec<Vec<(MemoKey, u64)>> =
-                order.iter().map(|each| places[*each].clone()).collect();
+            let asked: Vec<Ask> = order.iter().map(|each| places[*each].clone()).collect();
             let answers = memos.admit_pass(&asked, 1, 2, &mut pool);
             let mut by_place = [false; 4];
             for (each, answer) in order.iter().zip(answers) {
@@ -978,14 +1044,15 @@ mod tests {
                 budget = 1 + next(4);
             }
             let sizes: Vec<u64> = (0..8).map(|_| (1 + next(8)) * mib / 4).collect();
-            let places: Vec<Vec<(MemoKey, u64)>> = (0..next(5))
-                .map(|_| {
-                    (0..1 + next(3))
+            let places: Vec<Ask> = (0..next(5))
+                .map(|_| Ask {
+                    memos: (0..1 + next(3))
                         .map(|_| {
                             let upto = next(8);
                             (key(upto), sizes[upto as usize])
                         })
-                        .collect()
+                        .collect(),
+                    read_last_pass: next(2) == 0,
                 })
                 .collect();
             let before: Vec<(u64, u64)> = memos
@@ -994,12 +1061,16 @@ mod tests {
                 .map(|(key, memo)| (key.upto, memo.bytes))
                 .collect();
             let answers = memos.admit_pass(&places, budget, pass, &mut pool);
-            let asked: BTreeSet<u64> = places.iter().flatten().map(|(key, _)| key.upto).collect();
+            let asked: BTreeSet<u64> = places
+                .iter()
+                .flat_map(|place| &place.memos)
+                .map(|(key, _)| key.upto)
+                .collect();
             let admitted: BTreeSet<u64> = places
                 .iter()
                 .zip(&answers)
                 .filter(|(_, yes)| **yes)
-                .flat_map(|(place, _)| place.iter().map(|(key, _)| key.upto))
+                .flat_map(|(place, _)| place.memos.iter().map(|(key, _)| key.upto))
                 .collect();
             let mut sum = 0;
             for (key, memo) in &memos.by_key {

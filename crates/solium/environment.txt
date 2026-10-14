@@ -278,6 +278,11 @@ SOLIUM_RECAPTURE=always
     as before captures were kept until what they show changes. For measuring
     the difference on one build.
 
+SOLIUM_XRAY_REBUILD=always
+    Draw every wanted xray cut on every pass, and run every memo over it
+    again, as if what is behind the windows changed each time. The control
+    of the `xray_builds` and `memo_runs` counts. For measuring on one build.
+
 SOLIUM_GEOMETRY_ORACLE=<effect>
     Debug builds only: the name of a geometry effect, `genie`, whose grid
     is built by Solium's Rust genie instead of its folder's `mesh`, for

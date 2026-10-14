@@ -1,11 +1,3 @@
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Task 44 builds each wanted cut in prepare and keys memos by it"
-    )
-)]
-
 //! xray (Ruling F29): the sharp picture of the layers below a part's band,
 //! per monitor, from which every T2 effect reads its `backdrop`. Its source
 //! is a parameter, so FX6's lock xray is a second one (Ruling F52).
@@ -311,11 +303,8 @@ impl Xrays {
         self.generations.get(&(output.to_owned(), cut)).copied()
     }
 
-    /// The cut's picture, while it is held.
-    #[expect(
-        dead_code,
-        reason = "Task 44 binds a cut's picture as `backdrop`, which only a draw on the GPU makes"
-    )]
+    /// The cut's picture, while it is held: what every T2 run binds as
+    /// `backdrop` (`render::run_xray`, `render::run_slots`).
     pub(crate) fn texture(&self, output: &str, cut: Cut) -> Option<&GlesTexture> {
         self.captures
             .get(&(output.to_owned(), cut))?
@@ -325,6 +314,10 @@ impl Xrays {
 
     /// Every cut ever wanted has been built once: the first frame has its
     /// xray (spec C14). `tests::a_cuts_generation_moves_only_when_it_is_redrawn`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Task 45's warm-up gate reads it")
+    )]
     pub(crate) fn ready(&self) -> bool {
         self.asked.iter().all(|key| self.built.contains(key))
     }

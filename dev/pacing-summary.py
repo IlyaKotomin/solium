@@ -7,8 +7,9 @@
 Reads the pass and flip records inside [--from, --to] (CLOCK_MONOTONIC
 nanoseconds; dev/README.md, "Measuring frame pacing on a TTY", lists the
 fields) and prints, for the passes, their number and rate, the spread of each
-time, the misses, the GPU's status and clocks, the captures and the effect
-chain runs per pass and Qt's costliest scenes; for the flips, the vblanks each
+time, the misses, the GPU's status and clocks, the captures, the effect
+chain runs, the xray builds and the memo runs per pass and Qt's costliest
+scenes; for the flips, the vblanks each
 monitor's flips were late by. Standard library only.
 
 Exit status: 0; 2 when fewer than half the passes captured --expect-captures
@@ -83,6 +84,9 @@ def main():
     print("captures per pass  " + ", ".join(f"{count} in {seen}" for count, seen in sorted(captures.items())))
     runs = sorted(one.get("effect_runs", 0) for one in passes)
     print(f"effect_runs per pass  median {runs[len(runs) // 2]}  total {sum(runs)}")
+    for field in ("xray_builds", "memo_runs"):
+        counts = sorted(one.get(field, 0) for one in passes)
+        print(f"{field} per pass  median {counts[len(counts) // 2]}  total {sum(counts)}")
     states = Counter(one.get("pstate", -1) for one in passes)
     print(f"clocks {passes[0].get('clocks', '?')}  pstates " + ", ".join(f"P{state}:{seen}" for state, seen in sorted(states.items())))
     print(f"  gpu_mhz {spread([one.get('gpu_mhz', 0) for one in passes])}")

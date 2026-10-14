@@ -255,6 +255,7 @@ reads one that file does not list.
 | `SOLIUM_PANE=<name or path>` | The frame style for this run. | |
 | `SOLIUM_FENCE_WAIT=off` | A window capture drops its fence instead of waiting for it on the CPU. The default waits, and each session's log says which it ran with. | |
 | `SOLIUM_RECAPTURE=always` | Draw every window capture (a warp's, a rounded client's, a self effect's part) on every pass, as before captures were kept until what they show changes, so every self effect's chain runs every pass too. For an A/B on one build, and the control of `dev/pacing-nested.sh`'s capture count. | |
+| `SOLIUM_XRAY_REBUILD=always` | Draw every wanted xray cut (the sharp picture of the layers behind the windows that T2 effects read) on every pass, and run every memo over it again, as if what is behind the windows changed each time. The control of the `xray_builds` and `memo_runs` counts. | |
 | `SOLIUM_PACING` | Say where a pass's time went, on passes that overran the tightest monitor's frame; with it, GPU time, clocks and late flips. Misses are counted without it. | |
 | `SOLIUM_TRACE=<path>` | One JSON line per pass and per flip, and `SOLIUM_PACING` on. See *Measuring frame pacing on a TTY*. | |
 | `SOLIUM_QML=<mode>` | `auto`, `gpu` or `software`; see *QML on the GPU*. | |
@@ -1282,7 +1283,11 @@ could not read its buffer age and would redraw everything.
 A pass record carries `pass`, `t_ns` (CLOCK_MONOTONIC at its start),
 `total_us`, `deadline_us`, `monitor`, `missed`, each phase as `<phase>_us`,
 `captures`, `effect_runs` (chains of effects run this pass; a self effect
-runs only when its part commits), `panes`, `drew`, `scenes`, `animating`,
+runs only when its part commits), `xray_builds` (xray cuts drawn this pass:
+one only when what is behind the windows changed) and `memo_runs` (memo
+prefixes run over a cut drawn anew; both every pass with
+`SOLIUM_XRAY_REBUILD=always`, and both on the PACING line as `xray=` and
+`memo=`), `panes`, `drew`, `scenes`, `animating`,
 `rendered`, `built`, `rebound`, `qml` (Qt's microseconds per scene),
 `clocks`, `gpu_mhz`, `mem_mhz`, `pstate`, `gpu` (`ok`, `unsupported`, `late`
 or `disjoint`), `gpu_us`, `gpu_prep_us` (the captures), `gpu_effects_us` (the

@@ -193,6 +193,10 @@ struct Slow {
     captures: u32,
     /// Effect chains run: `tests::effect_runs_are_counted_and_written`.
     effect_runs: u32,
+    /// xray cuts drawn, and memo prefixes run (Ruling F30):
+    /// `tests::xray_builds_and_memo_runs_are_counted_and_written`.
+    xray_builds: u32,
+    memo_runs: u32,
     /// The GPU's clocks as it ended, so a line made long after its pass
     /// shows that pass's clocks:
     /// `tests::a_line_made_long_after_its_pass_carries_that_passes_clocks`.
@@ -292,6 +296,12 @@ struct Counters {
     /// Effect chains run in this pass, a self effect's only when its part
     /// committed. `tests::effect_runs_are_counted_and_written`.
     effect_runs: Cell<u32>,
+    /// xray cuts drawn in this pass, a kept one not counted.
+    /// `tests::xray_builds_and_memo_runs_are_counted_and_written`.
+    xray_builds: Cell<u32>,
+    /// Memo prefixes run in this pass.
+    /// `tests::xray_builds_and_memo_runs_are_counted_and_written`.
+    memo_runs: Cell<u32>,
     /// Present geometries whose mesh was refused in this pass, each drawn by
     /// its `failed`. `tests::refused_meshes_are_counted_and_written`.
     meshes_refused: Cell<u32>,
@@ -356,6 +366,8 @@ thread_local! {
             parked_at: Cell::new(0),
             captures: Cell::new(0),
             effect_runs: Cell::new(0),
+            xray_builds: Cell::new(0),
+            memo_runs: Cell::new(0),
             meshes_refused: Cell::new(0),
             early: Cell::new(None),
             clocks: Cell::new(None),
@@ -520,6 +532,8 @@ impl Counters {
                 gpu: early,
                 captures: self.captures.get(),
                 effect_runs: self.effect_runs.get(),
+                xray_builds: self.xray_builds.get(),
+                memo_runs: self.memo_runs.get(),
                 clocks: self.clocks.get(),
                 qml_top: self.top(),
             });
@@ -637,6 +651,23 @@ impl Counters {
         if self.live.get() {
             self.effect_runs
                 .set(self.effect_runs.get().saturating_add(1));
+        }
+    }
+
+    /// One xray cut was drawn, inside a measured pass only.
+    /// `tests::xray_builds_and_memo_runs_are_counted_and_written`.
+    fn xray_built(&self) {
+        if self.live.get() {
+            self.xray_builds
+                .set(self.xray_builds.get().saturating_add(1));
+        }
+    }
+
+    /// One memo prefix ran, inside a measured pass only.
+    /// `tests::xray_builds_and_memo_runs_are_counted_and_written`.
+    fn memo_ran(&self) {
+        if self.live.get() {
+            self.memo_runs.set(self.memo_runs.get().saturating_add(1));
         }
     }
 
@@ -872,6 +903,7 @@ impl Counters {
                 r#"{{"pass":{},"t_ns":{},"total_us":{},"deadline_us":{},"monitor":{},"missed":{},"#,
                 r#""tick_us":{},"prep_us":{},"census_us":{},"qml_us":{},"elements_us":{},"gles_us":{},"#,
                 r#""commit_us":{},"settle_us":{},"loose_us":{},"captures":{},"effect_runs":{},"#,
+                r#""xray_builds":{},"memo_runs":{},"#,
                 r#""meshes_refused":{},"#,
                 r#""panes":{},"drew":{},"#,
                 r#""scenes":{},"animating":{},"rendered":{},"built":{},"rebound":{},"qml":{},"#,
@@ -894,6 +926,8 @@ impl Counters {
             phase(Phase::Loose),
             self.captures.get(),
             self.effect_runs.get(),
+            self.xray_builds.get(),
+            self.memo_runs.get(),
             self.meshes_refused.get(),
             self.panes_seen.get(),
             self.drew.get(),
@@ -947,6 +981,8 @@ pub(crate) fn frame() -> Frame {
         counters.drew.set(0);
         counters.captures.set(0);
         counters.effect_runs.set(0);
+        counters.xray_builds.set(0);
+        counters.memo_runs.set(0);
         counters.meshes_refused.set(0);
         for slot in &counters.scene_spent {
             slot.set((0, 0));
@@ -1342,6 +1378,18 @@ pub(crate) fn effect_ran() {
     COUNTERS.with(Counters::effect_ran);
 }
 
+/// An xray cut was drawn in this pass (`render`'s `xray` phase).
+/// `tests::xray_builds_and_memo_runs_are_counted_and_written`.
+pub(crate) fn xray_built() {
+    COUNTERS.with(Counters::xray_built);
+}
+
+/// A memo prefix ran in this pass (`render::run_xray`).
+/// `tests::xray_builds_and_memo_runs_are_counted_and_written`.
+pub(crate) fn memo_ran() {
+    COUNTERS.with(Counters::memo_ran);
+}
+
 /// A present geometry's mesh was refused in this pass (`render::present_grid`).
 /// `tests::refused_meshes_are_counted_and_written`.
 pub(crate) fn mesh_refused() {
@@ -1400,6 +1448,10 @@ pub(crate) struct Line {
     /// Effect chains run in the pass:
     /// `tests::every_pacing_line_carries_its_gpu_time_and_captures`.
     pub(crate) effect_runs: u32,
+    /// xray cuts drawn and memo prefixes run in the pass (Ruling F30):
+    /// `tests::every_pacing_line_carries_its_gpu_time_and_captures`.
+    pub(crate) xray_builds: u32,
+    pub(crate) memo_runs: u32,
     pub(crate) clocks: Option<crate::clocks::Clocks>,
     pub(crate) source: crate::clocks::Source,
     /// The pass's three costliest scenes, as `bar@DP-1=2140,rounded/Frame=410`:
@@ -1432,6 +1484,8 @@ impl Line {
             gpu: worst.gpu,
             captures: worst.captures,
             effect_runs: worst.effect_runs,
+            xray_builds: worst.xray_builds,
+            memo_runs: worst.memo_runs,
             clocks: worst.clocks,
             source: crate::clocks::source(),
             qml_top: worst.qml_top.clone(),
@@ -1558,6 +1612,8 @@ fn emit(line: &Line) {
         gpu_prep_us = line.gpu_prep_us(),
         captures = line.captures,
         effect_runs = (line.effect_runs > 0).then_some(line.effect_runs),
+        xray = (line.xray_builds > 0).then_some(line.xray_builds),
+        memo = (line.memo_runs > 0).then_some(line.memo_runs),
         clocks = line.source.name(),
         gpu_mhz = line.clocks.map_or(0, |clocks| clocks.gpu_mhz),
         mem_mhz = line.clocks.map_or(0, |clocks| clocks.mem_mhz),
@@ -2078,6 +2134,8 @@ mod tests {
             gpu,
             captures: 5,
             effect_runs: 3,
+            xray_builds: 1,
+            memo_runs: 2,
             clocks: Some(crate::clocks::Clocks {
                 gpu_mhz: 1080,
                 mem_mhz: 5001,
@@ -2104,9 +2162,11 @@ mod tests {
                 disjoint.gpu_us(),
                 disjoint.gpu_prep_us(),
                 line(None).captures,
-                line(None).effect_runs
+                line(None).effect_runs,
+                line(None).xray_builds,
+                line(None).memo_runs
             ),
-            (0, 0, 5, 3)
+            (0, 0, 5, 3, 1, 2)
         );
         let held = line(None);
         assert_eq!(
@@ -2415,6 +2475,25 @@ mod tests {
         assert!(
             record.contains(r#""effect_runs":2,"#),
             "two runs are not in {record}"
+        );
+    }
+
+    /// **xray builds and memo runs are counted in the pass record**, inside
+    /// a measured pass only, as a run is.
+    #[test]
+    fn xray_builds_and_memo_runs_are_counted_and_written() {
+        let counters = counters();
+        counters.live.set(false);
+        counters.xray_built();
+        counters.memo_ran();
+        counters.live.set(true);
+        counters.xray_built();
+        counters.memo_ran();
+        counters.memo_ran();
+        let record = counters.pass_record(1, ms(5), false);
+        assert!(
+            record.contains(r#""xray_builds":1,"memo_runs":2,"#),
+            "one build and two memo runs are not in {record}"
         );
     }
 
@@ -2768,6 +2847,8 @@ mod tests {
         "loose_us",
         "captures",
         "effect_runs",
+        "xray_builds",
+        "memo_runs",
         "panes",
         "drew",
         "scenes",
@@ -3031,6 +3112,8 @@ mod tests {
             parked_at: std::cell::Cell::new(0),
             captures: std::cell::Cell::new(0),
             effect_runs: std::cell::Cell::new(0),
+            xray_builds: std::cell::Cell::new(0),
+            memo_runs: std::cell::Cell::new(0),
             meshes_refused: std::cell::Cell::new(0),
             early: std::cell::Cell::new(None),
             clocks: std::cell::Cell::new(None),

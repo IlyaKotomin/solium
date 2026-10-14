@@ -384,6 +384,26 @@ pub(crate) fn recapture_always() -> bool {
     })
 }
 
+/// Whether every wanted xray cut is drawn on every pass, its memos run
+/// again over it: `SOLIUM_XRAY_REBUILD=always`, the control of every
+/// `xray_builds` and `memo_runs` count (Ruling F50). Dev only.
+/// `tests::xray_rebuild_always_is_asked_for_by_name`.
+pub(crate) fn xray_rebuild_named(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("always")
+}
+
+/// `SOLIUM_XRAY_REBUILD`, read once.
+pub(crate) fn xray_rebuild_always() -> bool {
+    thread_local! {
+        static DECIDED: std::cell::OnceCell<bool> = const { std::cell::OnceCell::new() };
+    }
+    DECIDED.with(|decided| {
+        *decided.get_or_init(|| {
+            xray_rebuild_named(std::env::var("SOLIUM_XRAY_REBUILD").ok().as_deref())
+        })
+    })
+}
+
 /// The geometry effect whose grid the Rust genie builds instead of its
 /// file, `SOLIUM_GEOMETRY_ORACLE`, read once: for comparing the two on one
 /// build in `dev/effects-check.sh genie` only. A debug build's knob alone,
@@ -471,5 +491,15 @@ mod tests {
         assert!(super::recapture_named(Some("always")));
         assert!(!super::recapture_named(Some("never")));
         assert!(!super::recapture_named(None));
+    }
+
+    /// `SOLIUM_XRAY_REBUILD=always` draws every wanted xray cut on every
+    /// pass; anything else keeps a cut until what it shows changes.
+    #[test]
+    fn xray_rebuild_always_is_asked_for_by_name() {
+        assert!(super::xray_rebuild_named(Some("always")));
+        assert!(super::xray_rebuild_named(Some(" always\n")));
+        assert!(!super::xray_rebuild_named(Some("never")));
+        assert!(!super::xray_rebuild_named(None));
     }
 }

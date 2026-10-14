@@ -67,12 +67,22 @@ impl SlotState {
 
     /// The T2 result on `monitor`, made on first use.
     /// `tests::a_t2_suffix_reruns_only_when_its_key_moves`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Task 44 runs each monitor's T2 suffix")
-    )]
     pub(crate) fn t2_mut(&mut self, monitor: &str) -> &mut T2State {
         self.t2.entry(monitor.to_owned()).or_default()
+    }
+
+    /// Keep the T2 results of the monitors the slot is placed on this pass,
+    /// giving every other monitor's targets back: a window moved off a
+    /// monitor holds nothing there.
+    /// `tests::a_t2_result_on_a_monitor_left_is_given_back`.
+    pub(crate) fn keep_t2(&mut self, monitors: &[&str], pool: &mut crate::pool::Pool) {
+        self.t2.retain(|monitor, t2| {
+            let keep = monitors.contains(&monitor.as_str());
+            if !keep {
+                t2.held.release(pool);
+            }
+            keep
+        });
     }
 
     /// Whether the chain must run this pass: it never has, its self input
@@ -119,12 +129,11 @@ impl SlotState {
 }
 
 /// One monitor's T2 result for a slot (Ruling F30): the key its suffix last
-/// ran at, its targets, and the id, commit and placement its result is
-/// drawn with there. `tests::a_t2_suffix_reruns_only_when_its_key_moves`.
-#[expect(
-    dead_code,
-    reason = "Task 44 places each monitor's T2 result with its id, commit and placement"
-)]
+/// ran at, its targets, the id, commit and placement its result is drawn
+/// with there, and the last pass its place read its memos (`read_at`), which
+/// `memo::Memos::admit_pass` judges first.
+/// `tests::a_t2_suffix_reruns_only_when_its_key_moves`,
+/// `tests::a_t2_results_commit_moves_only_when_rerun_or_placed_elsewhere`.
 #[derive(Debug)]
 pub(crate) struct T2State {
     pub(crate) key: Option<T2Key>,
@@ -132,6 +141,7 @@ pub(crate) struct T2State {
     pub(crate) id: Id,
     pub(crate) commit: CommitCounter,
     pub(crate) placed: Option<super::element::Placement>,
+    pub(crate) read_at: Option<u64>,
 }
 
 /// Never run, with an id of its own.
@@ -144,6 +154,7 @@ impl Default for T2State {
             id: Id::new(),
             commit: CommitCounter::default(),
             placed: None,
+            read_at: None,
         }
     }
 }
@@ -152,12 +163,29 @@ impl T2State {
     /// Whether the suffix must run: it never has (or its last run left no
     /// result, Task 44), or its key moved.
     /// `tests::a_t2_suffix_reruns_only_when_its_key_moves`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Task 44 runs each monitor's T2 suffix")
-    )]
     pub(crate) fn needs_run(&self, key: T2Key) -> bool {
         self.key != Some(key)
+    }
+
+    /// The commit its result carries at `placement` on this monitor, as
+    /// [`SlotState::commit_for`]: moved when it re-ran or is placed
+    /// elsewhere, a crop moved included.
+    /// `tests::a_t2_results_commit_moves_only_when_rerun_or_placed_elsewhere`.
+    pub(crate) fn commit_for(
+        &mut self,
+        placement: super::element::Placement,
+        rerun: bool,
+    ) -> CommitCounter {
+        let commit = super::element::commit_for(&mut self.commit, self.placed, placement, rerun);
+        self.placed = Some(placement);
+        commit
+    }
+
+    /// Whether its place read its memos in the pass before `pass`.
+    /// `tests::a_t2_results_commit_moves_only_when_rerun_or_placed_elsewhere`.
+    pub(crate) fn read_last_pass(&self, pass: u64) -> bool {
+        self.read_at
+            .is_some_and(|read| read.saturating_add(1) == pass)
     }
 }
 
@@ -200,6 +228,13 @@ impl Store {
     /// `state::tests::real_client::a_self_rule_captures_the_client_once_until_it_commits`.
     pub(crate) fn get_mut(&mut self, owner: &Owner, slot: Slot) -> Option<&mut SlotState> {
         self.slots.get_mut(&(owner.clone(), slot))
+    }
+
+    /// A slot's state as it is, to read.
+    /// `memo::tests::a_place_that_read_its_memos_last_pass_keeps_them`'s
+    /// flag is read here by `render::want_t2`.
+    pub(crate) fn get(&self, owner: &Owner, slot: Slot) -> Option<&SlotState> {
+        self.slots.get(&(owner.clone(), slot))
     }
 
     /// Drop every slot not wanted in `pass`, and every state a new rule
@@ -449,6 +484,59 @@ mod tests {
         assert!(
             state.t2_mut("DP-2").needs_run(key),
             "another monitor's result is its own"
+        );
+    }
+
+    /// **A T2 result's commit moves only when it re-ran or is placed
+    /// elsewhere**, a new crop of the same memo included, and its place
+    /// read its memos last pass only when it read them in the pass before.
+    #[test]
+    fn a_t2_results_commit_moves_only_when_rerun_or_placed_elsewhere() {
+        use crate::effect::element::Placement;
+        use smithay::utils::Rectangle;
+        let mut state = slot();
+        let t2 = state.t2_mut("DP-1");
+        let at = Placement::of(Rectangle::new((0, 0).into(), (10, 10).into()), None, 1.0);
+        let crop = Rectangle::new((5.0, 5.0).into(), (10.0, 10.0).into());
+        let first = t2.commit_for(at.cropped(crop), false);
+        assert_eq!(
+            t2.commit_for(at.cropped(crop), false),
+            first,
+            "placed again"
+        );
+        let moved = t2.commit_for(
+            at.cropped(Rectangle::new((6.0, 5.0).into(), (10.0, 10.0).into())),
+            false,
+        );
+        assert_ne!(moved, first, "a crop moved kept its commit");
+        assert_ne!(t2.commit_for(at.cropped(crop), true), moved, "a re-run");
+        assert!(!t2.read_last_pass(5));
+        t2.read_at = Some(4);
+        assert!(t2.read_last_pass(5));
+        assert!(!t2.read_last_pass(6), "read two passes ago");
+    }
+
+    /// **A T2 result on a monitor the slot left is given back**; the one
+    /// on the monitor it is on is kept, key and all.
+    #[test]
+    fn a_t2_result_on_a_monitor_left_is_given_back() {
+        let mut state = slot();
+        let key = crate::effect::memo::T2Key {
+            memo: 1,
+            xray: 1,
+            padded: smithay::utils::Rectangle::new((0, 0).into(), (10, 10).into()),
+            params: 0,
+            shape: 0,
+            own: None,
+        };
+        state.t2_mut("DP-1").key = Some(key);
+        state.t2_mut("DP-2").key = Some(key);
+        state.keep_t2(&["DP-2"], &mut crate::pool::Pool::new(0));
+        assert_eq!(state.t2.keys().collect::<Vec<_>>(), ["DP-2"]);
+        assert_eq!(
+            state.t2_mut("DP-2").key,
+            Some(key),
+            "the kept one kept its key"
         );
     }
 

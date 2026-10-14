@@ -120,7 +120,21 @@ pub(crate) enum Fill {
     Chain(Vec<Link>),
 }
 
-/// One rule, read. `tests::a_rule_reads_its_part_slot_match_and_chain`.
+/// Which xray cut a T2 chain reads (Ruling F29; amended 2026-10-08,
+/// configurable): every configured layer below its part's own (`Below`), or
+/// the wallpaper alone (`Background`), even where `effects.xray.layers`
+/// has `bottom`. `tests::rules_read_memo_and_cut`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) enum CutChoice {
+    #[default]
+    Below,
+    Background,
+}
+
+/// One rule, read. `memo = false` never shares its chain's backdrop-only
+/// part per monitor (Ruling F30), and `cut` picks the xray it reads.
+/// `tests::a_rule_reads_its_part_slot_match_and_chain`,
+/// `tests::rules_read_memo_and_cut`.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Rule {
     pub(crate) matches: Match,
@@ -129,6 +143,8 @@ pub(crate) struct Rule {
     pub(crate) fill: Fill,
     pub(crate) source: Option<Source>,
     pub(crate) mask: MaskKind,
+    pub(crate) memo: bool,
+    pub(crate) cut: CutChoice,
 }
 
 /// Where a list of rules came from, in the order a later one wins for one
@@ -158,7 +174,10 @@ const KINDS: [&str; 4] = ["layer", "region", "surface", "layer_shell"];
 const PART_LIST: &str =
     "pane, client, popup, layer:<name>, region:titlebar, surface:<name> or layer_shell:<namespace>";
 const SLOTS: [&str; 3] = ["behind", "front", "replace"];
-const KEYS: [&str; 6] = ["match", "part", "slot", "effect", "source", "mask"];
+const KEYS: [&str; 8] = [
+    "match", "part", "slot", "effect", "source", "mask", "memo", "cut",
+];
+const CUTS: [&str; 2] = ["below", "background"];
 const WINDOW_KEYS: [&str; 6] = [
     "app_id",
     "title",
@@ -345,7 +364,9 @@ fn rule(each: &Tree) -> Result<Rule, Refused> {
                 ),
                 None => (
                     "rule",
-                    format!("`{key}` is not a rule key: match, part, slot, effect, source or mask"),
+                    format!(
+                        "`{key}` is not a rule key: match, part, slot, effect, source, mask, memo or cut"
+                    ),
                 ),
             });
         }
@@ -428,6 +449,29 @@ fn rule(each: &Tree) -> Result<Rule, Refused> {
                 .to_owned(),
         ));
     }
+    // `memo = false` shares nothing of this rule's chain per monitor, and
+    // `cut` picks the xray it reads (Rulings F29, F30; amended 2026-10-08,
+    // configurable). `tests::rules_read_memo_and_cut`.
+    let memo = match each.field("memo") {
+        None => true,
+        Some(Tree::Bool(memo)) => *memo,
+        Some(_) => return Err(("memo", "`memo` is true or false".to_owned())),
+    };
+    let cut = match each.field("cut") {
+        None => CutChoice::Below,
+        Some(Tree::Text(text)) if text == "below" => CutChoice::Below,
+        Some(Tree::Text(text)) if text == "background" => CutChoice::Background,
+        Some(Tree::Text(text)) => {
+            return Err((
+                "cut",
+                format!(
+                    "`{text}` is not a cut: below or background{}",
+                    meant(text, &CUTS)
+                ),
+            ));
+        }
+        Some(_) => return Err(("cut", "`cut` is below or background".to_owned())),
+    };
     Ok(Rule {
         matches,
         part,
@@ -435,6 +479,8 @@ fn rule(each: &Tree) -> Result<Rule, Refused> {
         fill,
         source,
         mask,
+        memo,
+        cut,
     })
 }
 
@@ -897,14 +943,12 @@ pub(crate) fn tier(reads: Reads, source: Option<Source>) -> Tier {
         .unwrap_or(Tier::Generated)
 }
 
-/// Whether this build runs a tier; the error names what brings it.
+/// Whether this build runs a tier; the error names what brings it. T2
+/// runs from X2.1 on (Task 44): the backdrop from xray.
 /// `tests::tiers_follow_what_the_plan_reads_and_the_source`.
 pub(crate) fn runnable(tier: Tier) -> Result<(), &'static str> {
     match tier {
-        Tier::Generated | Tier::Own => Ok(()),
-        Tier::Xray => Err(
-            "reads the backdrop from xray, which arrives with X2.1 (FX3); give `source = \"self\"` to read the part's own pixels",
-        ),
+        Tier::Generated | Tier::Own | Tier::Xray => Ok(()),
         Tier::Live => Err("reads the live backdrop, which arrives with X4.1 (FX6)"),
     }
 }
@@ -1200,6 +1244,48 @@ mod tests {
             (read[4].source, read[4].mask),
             (Some(Source::Own), MaskKind::Alpha)
         );
+    }
+
+    /// **A rule reads `memo` and `cut`** (Rulings F29, F30; amended
+    /// 2026-10-08, configurable): `memo` true unless it says false, `cut`
+    /// below unless it says background; anything else refused at its key.
+    #[test]
+    fn rules_read_memo_and_cut() {
+        use super::CutChoice;
+        let read = parse(&rules(
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur" },
+                 { match = "*", part = "client", slot = "behind", effect = "blur", memo = false, cut = "background" },
+                 { match = "*", part = "client", slot = "behind", effect = "blur", memo = true, cut = "below" } }"#,
+        ))
+        .expect("parses");
+        assert_eq!((read[0].memo, read[0].cut), (true, CutChoice::Below));
+        assert_eq!((read[1].memo, read[1].cut), (false, CutChoice::Background));
+        assert_eq!((read[2].memo, read[2].cut), (true, CutChoice::Below));
+        for (lua, key, says) in [
+            (
+                r#"{ match = "*", part = "client", slot = "behind", effect = "blur", memo = 1 }"#,
+                "memo",
+                "true or false",
+            ),
+            (
+                r#"{ match = "*", part = "client", slot = "behind", effect = "blur", cut = "top" }"#,
+                "cut",
+                "below or background",
+            ),
+            (
+                r#"{ match = "*", part = "client", slot = "behind", effect = "blur", cut = "backgrund" }"#,
+                "cut",
+                "did you mean `background`",
+            ),
+        ] {
+            let refused = parse(&rules(&format!("{{ {lua} }}"))).expect_err(lua);
+            assert_eq!(refused[0].key, key, "{lua}");
+            assert!(
+                refused[0].message.contains(says),
+                "{lua}: {}",
+                refused[0].message
+            );
+        }
     }
 
     /// Each way a rule can be broken is refused at its key, never read as a
@@ -1568,7 +1654,7 @@ mod tests {
             "reading its own pixels is T1 until X1.4b's inline tier"
         );
         assert!(runnable(Tier::Generated).is_ok() && runnable(Tier::Own).is_ok());
-        assert!(runnable(Tier::Xray).expect_err("refused").contains("X2.1"));
+        assert!(runnable(Tier::Xray).is_ok(), "T2 runs from X2.1 on");
         assert!(runnable(Tier::Live).expect_err("refused").contains("X4.1"));
     }
 

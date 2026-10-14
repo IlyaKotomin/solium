@@ -752,6 +752,12 @@ pub(crate) struct Solium {
     /// `effects.xray.keep_ms` once nothing reads them.
     /// `effect::xray::tests::a_cut_nobody_wants_is_kept_for_keep_ms`.
     pub(crate) xrays: crate::effect::xray::Xrays,
+    /// Every memo: a T2 chain's backdrop-only prefix, run once per monitor,
+    /// cut and prefix result and read by every place whose chain begins the
+    /// same way (Ruling F30). Held outside the pool's free-list budget,
+    /// capped by `effects.memo.budget_mib`, swept with the store.
+    /// `effect::memo::tests::two_slots_with_one_prefix_share_one_memo`.
+    pub(crate) memos: crate::effect::memo::Memos,
 
     /// Hardware buffer sharing: `zwp_linux_dmabuf_v1`.
     ///
@@ -1293,6 +1299,7 @@ impl Solium {
             pool: crate::pool::Pool::new(0),
             store: crate::effect::store::Store::default(),
             xrays: crate::effect::xray::Xrays::default(),
+            memos: crate::effect::memo::Memos::default(),
             textures: None,
             focusing: false,
             closing: None,

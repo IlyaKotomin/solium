@@ -807,8 +807,17 @@ pub(crate) trait Phases {
     /// `Programs::masked` when an effect is wanted (Ruling 7, spec C14).
     fn compile(&mut self);
     /// Resolve the slots once this pass ([`build_slots`] over the panes a
-    /// monitor shows) and record their boxes ([`record_boxes`]).
+    /// monitor shows), record their boxes and T2 places ([`record_boxes`]),
+    /// and want each T2 place's cut and memos ([`want_t2`]).
     fn resolve(&mut self) -> Slots;
+    /// Render every hosted scene instance this pass needs as pixels before
+    /// `elements`, at the size and scale `elements` will ask for, so
+    /// `elements` draws the cached picture ([`scenes_needed`], Ruling F31).
+    fn scenes(&mut self, slots: &Slots);
+    /// Build each wanted xray cut, a capture kept unless what it is drawn
+    /// from differs, then run each wanted memo prefix over a cut redrawn
+    /// since it last ran ([`memos_to_run`], [`run_xray`]; Ruling F31).
+    fn xray(&mut self, slots: &Slots);
     /// Build and draw one nest's self captures; a capture that is not stale
     /// is kept. Both go into the pass's `Drawn`.
     fn captures(&mut self, slots: &Slots, nest: Nest);
@@ -823,11 +832,17 @@ pub(crate) trait Phases {
 
 /// `prepare`'s order (Ruling 17): the warp and `over` jobs are built only
 /// once every chain that can put a result in them has run this pass, and a
-/// whole pane's self capture only once the chains inside it have.
-/// `tests::prepare_compiles_first_and_builds_the_warps_after_the_chains`.
+/// whole pane's self capture only once the chains inside it have. The
+/// scenes a cut holds and the cuts and memos themselves come after
+/// `resolve` and before any capture or chain (Ruling F31), since a T2
+/// suffix in the inner nest reads them.
+/// `tests::prepare_compiles_first_and_builds_the_warps_after_the_chains`,
+/// `tests::prepare_renders_scenes_then_xray_before_the_chains`.
 pub(crate) fn effect_phases(phases: &mut impl Phases) -> Slots {
     phases.compile();
     let mut slots = phases.resolve();
+    phases.scenes(&slots);
+    phases.xray(&slots);
     for nest in [Nest::Inner, Nest::Whole] {
         phases.captures(&slots, nest);
         phases.chains(&mut slots, nest);
@@ -906,7 +921,112 @@ impl Phases for Gpu<'_> {
         for (owner, slot, key) in slots.wants() {
             state.store.slot_mut(owner, slot, key).seen = self.pass;
         }
+        // Each T2 place's cut and memos wanted, the rest not, so a cut or a
+        // memo nobody reads this pass is neither built nor run
+        // (`state::tests::real_client::xray_is_wanted_only_on_a_monitor_a_t2_slot_reads`).
+        want_t2(state, &mut slots, self.pass);
         slots
+    }
+
+    fn scenes(&mut self, _slots: &Slots) {
+        let (state, renderer) = (&mut *self.state, &mut *self.renderer);
+        // Nothing with no cut wanted, which is every pass with no T2 slot
+        // (spec §8.4): `tests::the_scenes_phase_renders_only_what_a_wanted_cut_holds`.
+        let needed = scenes_needed(state);
+        if needed.is_empty() {
+            return;
+        }
+        let now = state.clock.now();
+        for scene in needed {
+            let SceneRef::Surface(id, monitor) = scene;
+            let Some(output) = output_named(state, &monitor) else {
+                continue;
+            };
+            let (Some(screen), Some((area, alpha))) = (
+                state.space.output_geometry(&output),
+                surface_drawn_at(state, id, &output),
+            ) else {
+                continue;
+            };
+            // As `elements` will draw it: through the same call, at the
+            // output's own scale, so its `Gpu::sample` is a hit there.
+            let scale = output.current_scale().fractional_scale();
+            let _ = scripted(
+                state, renderer, &output, id, area, alpha, screen, now, scale,
+            );
+        }
+    }
+
+    fn xray(&mut self, slots: &Slots) {
+        let (state, renderer) = (&mut *self.state, &mut *self.renderer);
+        let wanted = state.xrays.wanted();
+        // No cut wanted, no capture, no carrier (spec §8.4).
+        if wanted.is_empty() {
+            return;
+        }
+        let mut jobs = Vec::new();
+        for (monitor, cut) in wanted {
+            let Some(output) = output_named(state, &monitor) else {
+                continue;
+            };
+            let Some(job) = crate::offscreen::xray_job(
+                state,
+                renderer,
+                &output,
+                cut,
+                &crate::effect::xray::SessionLayers,
+            ) else {
+                continue;
+            };
+            // Kept while what it is drawn from is the same ([fx0] Ruling 9),
+            // never with `SOLIUM_XRAY_REBUILD=always`, the control of every
+            // count here (`dev::tests::xray_rebuild_always_is_asked_for_by_name`).
+            if !crate::dev::xray_rebuild_always() && crate::offscreen::kept(state, &job).is_some() {
+                state.xrays.drawn(&monitor, cut, false);
+            } else {
+                jobs.push((job, (monitor, cut)));
+            }
+        }
+        for ((monitor, cut), _texture, _id, _commit) in
+            crate::offscreen::draw(state, renderer, jobs)
+        {
+            state.xrays.drawn(&monitor, cut, true);
+            crate::pacing::xray_built();
+        }
+        // Each memo a place reads, run once over its cut when that was
+        // redrawn since it last ran
+        // (`tests::a_memo_runs_when_its_xray_was_redrawn_and_once_for_every_slot`).
+        let run = memos_to_run(&state.memos, &state.xrays, slots.memos());
+        if run.is_empty() {
+            return;
+        }
+        let pass = self.pass;
+        let Solium {
+            store,
+            pool,
+            effects,
+            chains,
+            programs,
+            timer,
+            clock,
+            memos,
+            xrays,
+            ..
+        } = &mut *state;
+        let mut cx = RunCx {
+            store,
+            effects: &*effects,
+            chains,
+            masked: programs.masked_compiled().cloned(),
+            now: clock.now().as_secs_f32(),
+            pass,
+            memos,
+            xrays: &*xrays,
+        };
+        let _ = with_carrier(pool, renderer, |renderer, carrier, pool| {
+            let mut runner = GlRunner::new(renderer, carrier, timer.as_mut());
+            run_xray(&mut cx, pool, &mut runner, &run);
+        });
     }
 
     fn captures(&mut self, slots: &Slots, nest: Nest) {
@@ -977,6 +1097,8 @@ impl Phases for Gpu<'_> {
             programs,
             timer,
             clock,
+            memos,
+            xrays,
             ..
         } = &mut **state;
         let mut cx = RunCx {
@@ -986,6 +1108,8 @@ impl Phases for Gpu<'_> {
             masked: programs.masked_compiled().cloned(),
             now: clock.now().as_secs_f32(),
             pass: *pass,
+            memos,
+            xrays: &*xrays,
         };
         let drawn = &*drawn;
         let _ = with_carrier(pool, renderer, |renderer, carrier, pool| {
@@ -1223,6 +1347,20 @@ impl Phases for Gpu<'_> {
         // `effect::store::tests::a_slot_no_rule_wanted_this_pass_is_dropped`.
         let state = &mut *self.state;
         state.store.sweep(self.pass, &mut state.pool);
+        // A memo no place read for `effects.memo.keep_passes` passes, and a
+        // cut nobody wanted for `effects.xray.keep_ms`, give their targets
+        // back (Rulings F29, F30): `effect::memo::tests::a_memo_is_kept_for_keep_passes`,
+        // `effect::xray::tests::a_cut_nobody_wants_is_kept_for_keep_ms`.
+        state.memos.sweep(
+            self.pass,
+            state.effect_settings.memo.keep_passes,
+            &mut state.pool,
+        );
+        state.xrays.sweep(
+            state.clock.now(),
+            std::time::Duration::from_millis(state.effect_settings.xray.keep_ms),
+            &mut state.pool,
+        );
         state.pool.sweep(self.renderer);
     }
 }
@@ -1337,6 +1475,14 @@ pub(crate) fn build_slots(state: &mut Solium) -> crate::effect::plan::Slots {
     {
         return slots;
     }
+    // While the session is locked no slot of the session is wanted, T1 or
+    // T2: nothing of it is captured (a self or a mask capture), run or read
+    // behind the lock, and no xray is built ([16] §5, Ruling F29). The
+    // pointer's own scene keeps its slots from Task 61 on.
+    // `state::tests::real_client::nothing_of_the_session_is_captured_while_locked`.
+    if state.lock.is_some() {
+        return slots;
+    }
     for held in state.panes.iter() {
         let pane = held.id();
         if !shown(state, pane) {
@@ -1444,8 +1590,16 @@ fn want_resolved(
     use crate::effect::rules::Slot;
     for slot in [Slot::Behind, Slot::Front, Slot::Replace] {
         if let Some(key) = resolved.get(slot)
-            && state.chains.get(key).is_some()
+            && let Some(chain) = state.chains.get(key)
         {
+            // A T2 chain on a part no xray layer lies below (a part on
+            // `background`) reads nothing: no slot, and no problem (Ruling
+            // F29). `effect::xray::tests::a_part_reads_the_xray_layers_strictly_below_its_band`.
+            if chain.tier == crate::effect::rules::Tier::Xray
+                && t2_cut(state, owner, chain).is_none()
+            {
+                continue;
+            }
             slots.want(owner.clone(), slot, key);
         }
     }
@@ -1649,9 +1803,44 @@ pub(crate) fn record_boxes(state: &Solium, slots: &mut Slots) {
             (Found::Titlebar(pane), None) => titlebar_box(state, *pane, scale, pad),
             (_, None) => None,
         };
-        if let Some(part) = part {
-            slots.set_box(owner, slot, part);
+        let Some(part) = part else {
+            continue;
+        };
+        // A T2 slot's places, one per monitor its padded box overlaps
+        // (Ruling F30), each logged as `effect slot` for the nested checks:
+        // `state::tests::real_client::a_window_across_two_monitors_has_a_t2_place_on_each`.
+        if chain.tier == crate::effect::rules::Tier::Xray
+            && let Some(cut) = t2_cut(state, &owner, chain)
+        {
+            let places = t2_places(state, &owner, &found, cut, scale, pad);
+            for place in &places {
+                let at = place.screen;
+                tracing::debug!(
+                    ?owner,
+                    part = part_name(&owner),
+                    monitor = %place.monitor,
+                    padded = %format!("{},{},{},{}", at.loc.x, at.loc.y, at.size.w, at.size.h),
+                    "effect slot"
+                );
+            }
+            slots.set_places(owner.clone(), slot, places);
         }
+        slots.set_box(owner, slot, part);
+    }
+}
+
+/// A slot owner's part as a rule names it, for the `effect slot` log line
+/// Task 46's nested frost check reads.
+fn part_name(owner: &crate::effect::plan::Owner) -> String {
+    use crate::effect::plan::Owner as Whose;
+    match owner {
+        Whose::Pane(_, PaneSlot::Pane) => "pane".to_owned(),
+        Whose::Pane(_, PaneSlot::Client) => "client".to_owned(),
+        Whose::Pane(_, PaneSlot::Popups) => "popup".to_owned(),
+        Whose::Pane(_, PaneSlot::Titlebar) => "region:titlebar".to_owned(),
+        Whose::Pane(_, PaneSlot::Layer(index)) => format!("layer:{index}"),
+        Whose::Surface(..) => "surface".to_owned(),
+        Whose::LayerShell(_) => "layer_shell".to_owned(),
     }
 }
 
@@ -1708,6 +1897,10 @@ pub(crate) struct RunCx<'a> {
     pub(crate) now: f32,
     /// The store's pass, which a slot run in it is marked with.
     pub(crate) pass: u64,
+    /// Every memo: what `run_xray` runs into and a T2 place reads.
+    pub(crate) memos: &'a mut crate::effect::memo::Memos,
+    /// Every xray cut: what a memo prefix and a T2 run bind as `backdrop`.
+    pub(crate) xrays: &'a crate::effect::xray::Xrays,
 }
 
 impl std::fmt::Debug for RunCx<'_> {
@@ -1937,6 +2130,18 @@ pub(crate) fn run_slots(
         if Nest::of(&owner, chain.tier) != nest {
             continue;
         }
+        // T2: each place on its own monitor, from that monitor's memo
+        // (Ruling F30;
+        // `state::tests::real_client::a_window_across_two_monitors_has_a_t2_place_on_each`).
+        if chain.tier == Tier::Xray {
+            if run_t2(cx, pool, runner, slots, &owner, slot, key, part, &mut began) {
+                let _ = cx.chains.refuse_once(
+                    key,
+                    "an effect's chain failed; its part is drawn without it",
+                );
+            }
+            continue;
+        }
         let (first, redrawn) = match chain.tier {
             Tier::Own => match drawn.get(&owner, slot) {
                 Some((texture, captured)) => {
@@ -1950,7 +2155,7 @@ pub(crate) fn run_slots(
             // change (`tests::twenty_runs_in_a_phase_open_one_region`,
             // `effect::store::tests::a_generated_effect_runs_once_and_not_again_until_its_size_or_params_change`).
             Tier::Generated => (runner.blank(pool), input_redrawn(chain.tier, false)),
-            // T2 and T3 were refused at load (Ruling 14).
+            // T3 was refused at load (Ruling 14); T2 ran above.
             Tier::Xray | Tier::Live => continue,
         };
         let size = part.size();
@@ -2027,6 +2232,761 @@ pub(crate) fn run_slots(
                     key,
                     "an effect's chain failed; its part is drawn without it",
                 );
+            }
+        }
+    }
+    if began {
+        runner.end();
+    }
+}
+
+/// One T2 slot's places, each on its own monitor (Ruling F30): a crop of
+/// its memo placed with no pass (`T2Work::Crop`), else its suffix or, over
+/// `effects.memo.budget_mib`, its whole plan run at the part's own size,
+/// reading the cut through the place's `BoxMap`, only when its `T2Key`
+/// moved and otherwise its last result placed again. A place whose cut or
+/// memo has no picture yet draws nothing this pass. Whether a run failed.
+/// `tests::an_empty_suffix_is_a_crop_and_a_suffix_runs`,
+/// `state::tests::real_client::a_t2_slot_with_memo_false_reruns_when_its_xray_is_redrawn`;
+/// what it draws is wirecheck 13a and 13b's (Task 45).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "`run_slots`' own context, and the one slot it is on"
+)]
+fn run_t2(
+    cx: &mut RunCx<'_>,
+    pool: &mut crate::pool::Pool,
+    runner: &mut dyn Runner,
+    slots: &mut Slots,
+    owner: &crate::effect::plan::Owner,
+    slot: Slot,
+    rule: crate::effect::rules::RuleKey,
+    part: crate::effect::plan::PartBox,
+    began: &mut bool,
+) -> bool {
+    use crate::effect::memo::MemoKey;
+    use crate::effect::run::{BoxMap, Inputs, Keys, Outcome};
+    use smithay::backend::renderer::Texture as _;
+    let Some(chain) = cx.chains.get(rule) else {
+        return false;
+    };
+    let Some(memo) = chain.memo() else {
+        return false;
+    };
+    let places = slots.places(owner, slot).to_vec();
+    let state = cx.store.slot_mut(owner, slot, rule);
+    state.seen = cx.pass;
+    // A monitor the part left gives its result's targets back
+    // (`effect::store::tests::a_t2_result_on_a_monitor_left_is_given_back`).
+    let on: Vec<&str> = places.iter().map(|place| place.monitor.as_str()).collect();
+    state.keep_t2(&on, pool);
+    let mut failed = false;
+    for place in places {
+        let Some(xray) = cx.xrays.texture(&place.monitor, place.cut).cloned() else {
+            continue;
+        };
+        let work = t2_work(memo, slots.shared_on(owner, slot, &place.monitor));
+        let now = t2_key(
+            cx.memos,
+            cx.xrays,
+            &place,
+            chain,
+            &work,
+            part.content,
+            part.radii,
+            None,
+        );
+        let memo_of = |upto: u64| MemoKey {
+            monitor: place.monitor.clone(),
+            cut: place.cut,
+            upto,
+        };
+        let t2 = state.t2_mut(&place.monitor);
+        let (texture, rerun, crop) = match &work {
+            // No pass: the memo, cropped to the part's padded box, its
+            // commit moved when the memo re-ran or the crop moved.
+            T2Work::Crop(export) => {
+                let Some(upto) = memo
+                    .exports
+                    .iter()
+                    .position(|each| each == export)
+                    .and_then(|index| chain.memo_keys().get(index))
+                else {
+                    continue;
+                };
+                let Some(texture) = cx.memos.output(&memo_of(*upto)).cloned() else {
+                    continue;
+                };
+                let rerun = t2.key.is_none_or(|was| was.memo != now.memo);
+                t2.key = Some(now);
+                let size = texture.size();
+                let crop = crop_of(
+                    place.map,
+                    (
+                        u32::try_from(size.w).unwrap_or(1),
+                        u32::try_from(size.h).unwrap_or(1),
+                    ),
+                );
+                (texture, rerun, Some(crop))
+            }
+            T2Work::Suffix | T2Work::Whole if !t2.needs_run(now) => {
+                let Some(texture) = t2.held.output().cloned() else {
+                    continue;
+                };
+                (texture, false, None)
+            }
+            T2Work::Suffix | T2Work::Whole => {
+                let plan = if work == T2Work::Whole {
+                    &chain.plan
+                } else {
+                    &memo.suffix
+                };
+                let mut textures: Vec<(&str, GlesTexture, BoxMap)> =
+                    vec![("backdrop", xray, place.map)];
+                if work == T2Work::Suffix {
+                    let mut missing = false;
+                    for (export, upto) in memo.exports.iter().zip(chain.memo_keys()) {
+                        match cx.memos.output(&memo_of(*upto)) {
+                            Some(texture) => {
+                                textures.push((export.name.as_str(), texture.clone(), place.map));
+                            }
+                            None => missing = true,
+                        }
+                    }
+                    if missing {
+                        continue;
+                    }
+                }
+                let inputs = Inputs {
+                    padded: (
+                        u32::try_from(place.own.w).unwrap_or(1),
+                        u32::try_from(place.own.h).unwrap_or(1),
+                    ),
+                    content: part.content,
+                    textures: &textures,
+                    radii: part.radii,
+                    time: cx.now,
+                    transition: crate::effect::run::Transition::default(),
+                    clamp_first: false,
+                };
+                let keys = Keys {
+                    params: chain.params_hash,
+                    own: None,
+                    shape: shape_hash(part.content, part.radii),
+                };
+                if !*began {
+                    runner.begin();
+                    *began = true;
+                }
+                let effects = cx.effects;
+                match runner.run(
+                    pool,
+                    &|program| effects.lookup(program),
+                    effects.formats(),
+                    plan,
+                    &mut t2.held,
+                    &inputs,
+                    &keys,
+                ) {
+                    Outcome::Done(texture, sync) => {
+                        let _ = crate::offscreen::settle(
+                            Ok::<_, std::convert::Infallible>(sync),
+                            crate::dev::fence_wait(),
+                            "an effect",
+                        );
+                        crate::pacing::effect_ran();
+                        t2.key = Some(now);
+                        (texture, true, None)
+                    }
+                    // Not compiled yet, or a format waiting for the rebind:
+                    // nothing behind the part this pass, nothing latched.
+                    Outcome::Pending => continue,
+                    Outcome::Failed => {
+                        failed = true;
+                        continue;
+                    }
+                }
+            }
+        };
+        if let Some(ready) = t2_ready(t2, cx.masked.as_ref(), texture, rerun, part, crop) {
+            slots.set_ready_on(owner.clone(), slot, &place.monitor, ready);
+        }
+    }
+    failed
+}
+
+/// A T2 place's result as the walk places it on its monitor: the texture in
+/// an `EffectElement` with that monitor's own id, cropped when it is a
+/// memo's, the crop kept by every later `at` (`EffectElement::cropped`),
+/// its commit moved only when it re-ran or its placement (a crop included)
+/// differs; `None` with no masked program, as [`ready_from`].
+/// `effect::store::tests::a_t2_results_commit_moves_only_when_rerun_or_placed_elsewhere`,
+/// `effect::element::tests::a_cropped_result_placed_again_keeps_its_crop`.
+fn t2_ready(
+    t2: &mut crate::effect::store::T2State,
+    masked: Option<&GlesTexProgram>,
+    texture: GlesTexture,
+    rerun: bool,
+    part: crate::effect::plan::PartBox,
+    crop: Option<Rectangle<f64, smithay::utils::Buffer>>,
+) -> Option<crate::effect::plan::Ready> {
+    let program = masked?.clone();
+    let placement = crate::effect::element::Placement::of(part.padded, None, 1.0);
+    let placement = crop.map_or(placement, |crop| placement.cropped(crop));
+    let commit = t2.commit_for(placement, rerun);
+    let element =
+        crate::effect::element::EffectElement::new(t2.id.clone(), commit, texture, program);
+    let element = match crop {
+        Some(crop) => element.cropped(crop),
+        None => element,
+    };
+    Some(crate::effect::plan::Ready {
+        element,
+        padded: part.padded,
+        reach: part.reach,
+    })
+}
+
+/// The output of this name, if it is still in the space.
+/// `state::tests::real_client::reflow_on_close::stacking::the_scenes_phase_renders_only_what_a_wanted_cut_holds`.
+fn output_named(state: &Solium, name: &str) -> Option<smithay::output::Output> {
+    state
+        .space
+        .outputs()
+        .find(|output| output.name() == name)
+        .cloned()
+}
+
+/// One hosted scene instance whose pixels this pass needs before
+/// `elements` (Ruling F31). Task 60 adds pane-style decorations and the
+/// pointer. `tests::the_scenes_phase_renders_only_what_a_wanted_cut_holds`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum SceneRef {
+    Surface(crate::scripted::SurfaceId, String),
+}
+
+/// Every scripted surface in a wanted xray cut, on that cut's monitor, each
+/// once: what the `scenes` phase renders.
+/// `state::tests::real_client::reflow_on_close::stacking::the_scenes_phase_renders_only_what_a_wanted_cut_holds`.
+pub(crate) fn scenes_needed(state: &Solium) -> Vec<SceneRef> {
+    use crate::effect::xray::XraySource as _;
+    let mut needed: Vec<SceneRef> = Vec::new();
+    for (monitor, cut) in state.xrays.wanted() {
+        let Some(output) = output_named(state, &monitor) else {
+            continue;
+        };
+        for each in crate::effect::xray::SessionLayers.entries(state, &output, cut) {
+            if let Stacked::Surface(id, ..) = each {
+                let scene = SceneRef::Surface(id, monitor.clone());
+                if !needed.contains(&scene) {
+                    needed.push(scene);
+                }
+            }
+        }
+    }
+    needed
+}
+
+/// Where a scripted surface's instance on `output` is drawn this pass, and
+/// at what alpha: its declared area carried by its selection, as
+/// [`stacked`] lists it (`wanted`'s two calls). `None` with no instance
+/// there. What the `scenes` phase renders it at, so `elements`' sample is a
+/// hit; a nested run's `qml_us` shows it, as Task 45's `effects-check xray`
+/// measures.
+fn surface_drawn_at(
+    state: &Solium,
+    id: crate::scripted::SurfaceId,
+    output: &smithay::output::Output,
+) -> Option<(Rectangle<i32, Logical>, f32)> {
+    let geometry = state.space.output_geometry(output)?;
+    let primary = state.primary_output();
+    let area = state
+        .surfaces
+        .get(id)?
+        .area_on(output, geometry, primary.as_ref())?;
+    Some((
+        state.carried(id, output, area),
+        state.carried_alpha(id, output),
+    ))
+}
+
+/// The wanted memos whose xray was redrawn since they ran (or that never
+/// ran, or whose run made nothing), each once, in the order wanted; a memo
+/// whose cut has no picture yet waits for one.
+/// `tests::a_memo_runs_when_its_xray_was_redrawn_and_once_for_every_slot`.
+pub(crate) fn memos_to_run(
+    memos: &crate::effect::memo::Memos,
+    xrays: &crate::effect::xray::Xrays,
+    wanted: &[crate::effect::memo::MemoKey],
+) -> Vec<crate::effect::memo::MemoKey> {
+    let mut run: Vec<crate::effect::memo::MemoKey> = Vec::new();
+    for key in wanted {
+        let Some(generation) = xrays.generation(&key.monitor, key.cut) else {
+            continue;
+        };
+        if memos.needs_run(key, generation) && !run.contains(key) {
+            run.push(key.clone());
+        }
+    }
+    run
+}
+
+/// What a T2 place does with its memo: place a crop of it (an empty
+/// suffix, no pass), run its suffix, or, when its memos were not held (over
+/// `effects.memo.budget_mib`), run its whole plan at the part's size.
+/// `tests::an_empty_suffix_is_a_crop_and_a_suffix_runs`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum T2Work {
+    /// An empty suffix: a crop of this export's memo, no pass.
+    Crop(solium_effects::stage::Export),
+    /// The suffix, at the part's own size, over the memos and the xray.
+    Suffix,
+    /// No memo held (over `effects.memo.budget_mib`): the whole plan at the
+    /// part's own size, over the xray.
+    Whole,
+}
+
+/// `tests::an_empty_suffix_is_a_crop_and_a_suffix_runs`.
+pub(crate) fn t2_work(memo: &solium_effects::stage::Memo, shared: bool) -> T2Work {
+    if !shared {
+        return T2Work::Whole;
+    }
+    match (memo.suffix.steps.is_empty(), memo.exports.first()) {
+        (true, Some(export)) => T2Work::Crop(export.clone()),
+        _ => T2Work::Suffix,
+    }
+}
+
+/// What a T2 place's result is made from (Ruling F52's struct): a hash of
+/// the memos it reads, each as its prefix key (`upto`) with its generation,
+/// so reading another memo of the same generation moves it too (0 for
+/// `Whole`, and for a chain with no memo); the generation of the cut it
+/// binds as `backdrop`, which every T2 run reads, so a run that reads no
+/// memo still re-runs when the wallpaper or a `bottom` surface redraws; the
+/// padded box in the monitor's own physical pixels (`T2Place.screen`, never
+/// its xray pixels, so a drag finer than an xray pixel re-runs it, Ruling
+/// F37); the params; the shape; and the self capture's commit (Task 52).
+/// Pure. `tests::a_t2_key_reads_each_memo_by_its_prefix_and_generation`,
+/// `tests::a_t2_key_moves_with_a_drag_finer_than_an_xray_pixel`,
+/// `state::tests::real_client::a_t2_slot_with_memo_false_reruns_when_its_xray_is_redrawn`,
+/// `state::tests::real_client::a_t2_slot_over_the_memo_budget_reruns_when_its_xray_is_redrawn`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "everything a T2 result is made from, as the plan names it"
+)]
+pub(crate) fn t2_key(
+    memos: &crate::effect::memo::Memos,
+    xrays: &crate::effect::xray::Xrays,
+    place: &crate::effect::plan::T2Place,
+    chain: &crate::effect::plan::BoundChain,
+    work: &T2Work,
+    content: [f32; 4],
+    radii: [f32; 4],
+    own: Option<u64>,
+) -> crate::effect::memo::T2Key {
+    use std::hash::{Hash, Hasher};
+    let memo = match work {
+        T2Work::Whole => 0,
+        T2Work::Crop(_) | T2Work::Suffix if chain.memo_keys().is_empty() => 0,
+        T2Work::Crop(_) | T2Work::Suffix => {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            for upto in chain.memo_keys() {
+                let key = crate::effect::memo::MemoKey {
+                    monitor: place.monitor.clone(),
+                    cut: place.cut,
+                    upto: *upto,
+                };
+                (*upto, memos.generation(&key)).hash(&mut hasher);
+            }
+            hasher.finish()
+        }
+    };
+    crate::effect::memo::T2Key {
+        memo,
+        xray: xrays.generation(&place.monitor, place.cut).unwrap_or(0),
+        padded: place.screen,
+        params: chain.params_hash,
+        shape: shape_hash(content, radii),
+        own,
+    }
+}
+
+/// A part's box in a memo's own pixels.
+/// `tests::a_crop_is_the_parts_box_in_the_memos_pixels`.
+pub(crate) fn crop_of(
+    map: crate::effect::run::BoxMap,
+    memo: (u32, u32),
+) -> Rectangle<f64, smithay::utils::Buffer> {
+    let (w, h) = (f64::from(memo.0), f64::from(memo.1));
+    Rectangle::new(
+        (f64::from(map.offset[0]) * w, f64::from(map.offset[1]) * h).into(),
+        (f64::from(map.scale[0]) * w, f64::from(map.scale[1]) * h).into(),
+    )
+}
+
+/// The cut a T2 chain on `owner` reads: the configured xray layers
+/// strictly below its part's band (`effects.xray.layers`), then the rule's
+/// `cut`, `background` turning a bottom cut into the wallpaper alone; none
+/// for a part on `background`, which then wants no slot.
+/// `state::tests::real_client::a_rule_may_read_the_wallpaper_alone`.
+fn t2_cut(
+    state: &Solium,
+    owner: &crate::effect::plan::Owner,
+    chain: &crate::effect::plan::BoundChain,
+) -> Option<crate::effect::xray::Cut> {
+    use crate::effect::plan::Owner as Whose;
+    use crate::stack::{Band, Owner as By};
+    use smithay::reexports::wayland_server::Resource as _;
+    let band = match owner {
+        Whose::Pane(..) => Band::Windows,
+        Whose::Surface(id, _) => Band::Layer(state.surfaces.get(*id)?.layer(), By::Script),
+        Whose::LayerShell(object) => state.space.outputs().find_map(|output| {
+            layer_map_for_output(output)
+                .layers()
+                .find(|layer| layer.wl_surface().id() == *object)
+                .map(|layer| Band::Layer(layer::ours(layer.layer()), By::Client))
+        })?,
+    };
+    let cut = state.effect_settings.xray.cut_below(band)?;
+    Some(match chain.cut {
+        crate::effect::rules::CutChoice::Below => cut,
+        crate::effect::rules::CutChoice::Background => crate::effect::xray::Cut::Background,
+    })
+}
+
+/// Where a part lies at rest, in global logical pixels: the rectangle its
+/// T2 places are measured from (Ruling F37: a warped pane's at rest).
+/// `state::tests::real_client::a_window_across_two_monitors_has_a_t2_place_on_each`.
+fn part_rect(state: &Solium, found: &Found) -> Option<Rectangle<i32, Logical>> {
+    let outer_of = |window: &Window| {
+        state
+            .panes
+            .of(window)
+            .map(|pane| state.pane_outer(pane))
+            .or_else(|| state.outer_geometry(window))
+    };
+    let client_of = |window: &Window| {
+        let outer = outer_of(window)?;
+        let client = flat(state, window)?.client;
+        Some(Rectangle::new(outer.loc + client.loc, client.size))
+    };
+    match found {
+        Found::Client(window) => client_of(window),
+        Found::Popups(window) => {
+            let client = client_of(window)?;
+            let covered = popups_covered(window)?;
+            Some(Rectangle::new(client.loc + covered.loc, covered.size))
+        }
+        Found::Pane(window) => outer_of(window),
+        Found::Layer(pane, index) => {
+            let outer = state.pane_outer_of(*pane)?;
+            let canvas = layer_canvas(state, *pane, *index)?;
+            Some(Rectangle::new(outer.loc + canvas.loc, canvas.size))
+        }
+        Found::Titlebar(pane) => {
+            let held = state.panes.get(*pane)?;
+            let outer = state.pane_outer(held);
+            let regions = crate::effect::mask::FromInsets {
+                insets: held.decoration()?.insets(),
+                outer: outer.size,
+                radii: declared_rounding(state, *pane)
+                    .map_or(Corners::all(0.0), |effect| effect.radii()),
+            };
+            let (band, _) = regions.region("titlebar")?;
+            Some(Rectangle::new(outer.loc + band.loc, band.size))
+        }
+        Found::Surface(id, output) => instance_area(state, *id, output),
+        Found::LayerShell(surface) => state.space.outputs().find_map(|output| {
+            let at = layer_map_for_output(output).layer_geometry(surface)?;
+            let screen = state.space.output_geometry(output)?;
+            Some(Rectangle::new(screen.loc + at.loc, at.size))
+        }),
+    }
+}
+
+/// The monitor a part is its own on: a pane's by its centre, a scripted
+/// surface's instance's, a layer surface's map's. What
+/// `effects.xray.straddle = "own"` keeps.
+/// `state::tests::real_client::a_window_across_two_monitors_has_a_t2_place_on_each`.
+fn own_monitor(
+    state: &Solium,
+    owner: &crate::effect::plan::Owner,
+    found: &Found,
+) -> Option<String> {
+    use crate::effect::plan::Owner as Whose;
+    match (owner, found) {
+        (Whose::Surface(_, name), _) => Some(name.clone()),
+        (_, Found::LayerShell(surface)) => state
+            .space
+            .outputs()
+            .find(|output| {
+                layer_map_for_output(output)
+                    .layer_geometry(surface)
+                    .is_some()
+            })
+            .map(smithay::output::Output::name),
+        (Whose::Pane(pane, _), _) => state
+            .pane_outer_of(*pane)
+            .and_then(|outer| state.output_of(outer))
+            .map(|output| output.name()),
+        (Whose::LayerShell(_), _) => None,
+    }
+}
+
+/// A T2 slot's places: one per monitor its padded box (the part at rest
+/// grown by `pad` physical pixels at `scale`, its own monitor's) overlaps,
+/// or only its own monitor's under `effects.xray.straddle = "own"`.
+/// `state::tests::real_client::a_window_across_two_monitors_has_a_t2_place_on_each`.
+fn t2_places(
+    state: &Solium,
+    owner: &crate::effect::plan::Owner,
+    found: &Found,
+    cut: crate::effect::xray::Cut,
+    scale: f64,
+    pad: i32,
+) -> Vec<crate::effect::plan::T2Place> {
+    let Some(rect) = part_rect(state, found) else {
+        return Vec::new();
+    };
+    let grow = f64::from(pad) / scale.max(f64::EPSILON);
+    let padded = Rectangle::<f64, Logical>::new(
+        (f64::from(rect.loc.x) - grow, f64::from(rect.loc.y) - grow).into(),
+        (
+            f64::from(rect.size.w) + 2.0 * grow,
+            f64::from(rect.size.h) + 2.0 * grow,
+        )
+            .into(),
+    );
+    let only = match state.effect_settings.xray.straddle {
+        crate::effect::xray::Straddle::Each => None,
+        crate::effect::xray::Straddle::Own => Some(own_monitor(state, owner, found)),
+    };
+    let mut places = Vec::new();
+    for output in state.space.outputs() {
+        let Some(geometry) = state.space.output_geometry(output) else {
+            continue;
+        };
+        if !padded.overlaps(geometry.to_f64()) {
+            continue;
+        }
+        let monitor = output.name();
+        if only
+            .as_ref()
+            .is_some_and(|only| only.as_deref() != Some(monitor.as_str()))
+        {
+            continue;
+        }
+        let at = output.current_scale().fractional_scale();
+        let xray = crate::offscreen::xray_size(state, output);
+        let (px, map, own) = crate::effect::plan::place_on(padded, geometry, at, xray);
+        places.push(crate::effect::plan::T2Place {
+            monitor,
+            cut,
+            padded: px,
+            screen: crate::effect::plan::screen_box(padded, geometry, at),
+            map,
+            own,
+        });
+    }
+    places.sort_by(|a, b| a.monitor.cmp(&b.monitor));
+    places
+}
+
+/// After [`record_boxes`]: each T2 place's cut wanted, and its memos judged
+/// together under `effects.memo.budget_mib` (`memo::Memos::admit_pass`,
+/// once a pass), a place that read its memos last pass first; an admitted
+/// place's memos wanted with the plan their key was made from, a refused
+/// place unshared (it runs its whole plan). Every cut and memo nobody reads
+/// this pass is not wanted. The memos wanted go into `slots` for the
+/// `xray` phase.
+/// `state::tests::real_client::xray_is_wanted_only_on_a_monitor_a_t2_slot_reads`,
+/// `state::tests::real_client::two_windows_with_one_blur_want_one_memo`,
+/// `state::tests::real_client::over_the_memo_budget_a_slot_runs_its_whole_plan`.
+pub(crate) fn want_t2(state: &mut Solium, slots: &mut Slots, pass: u64) {
+    use crate::effect::memo::{Ask, MemoKey};
+    state.xrays.clear_wants();
+    if slots.is_empty() {
+        slots.set_memos(Vec::new());
+        return;
+    }
+    let mut placed: Vec<(
+        crate::effect::plan::Owner,
+        Slot,
+        crate::effect::rules::RuleKey,
+        String,
+    )> = Vec::new();
+    let mut asks: Vec<Ask> = Vec::new();
+    let wanted: Vec<_> = slots
+        .wants()
+        .map(|(owner, slot, key)| (owner.clone(), slot, key))
+        .collect();
+    for (owner, slot, key) in wanted {
+        let Some(chain) = state.chains.get(key) else {
+            continue;
+        };
+        let Some(memo) = chain.memo() else {
+            continue;
+        };
+        for place in slots.places(&owner, slot) {
+            state.xrays.want(&place.monitor, place.cut);
+            let size = output_named(state, &place.monitor).map_or((1, 1), |output| {
+                let xray = crate::offscreen::xray_size(state, &output);
+                (
+                    u32::try_from(xray.w).unwrap_or(1),
+                    u32::try_from(xray.h).unwrap_or(1),
+                )
+            });
+            let memos = memo
+                .prefix
+                .as_ref()
+                .map(|prefix| {
+                    memo.exports
+                        .iter()
+                        .zip(chain.memo_keys())
+                        .map(|(export, upto)| {
+                            let key = MemoKey {
+                                monitor: place.monitor.clone(),
+                                cut: place.cut,
+                                upto: *upto,
+                            };
+                            let bytes =
+                                crate::effect::memo::plan_bytes(&prefix.upto(export.step), size);
+                            (key, bytes)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let read_last_pass = state
+                .store
+                .get(&owner, slot)
+                .filter(|held| held.rule == key)
+                .and_then(|held| held.t2.get(&place.monitor))
+                .is_some_and(|t2| t2.read_last_pass(pass));
+            asks.push(Ask {
+                memos,
+                read_last_pass,
+            });
+            placed.push((owner.clone(), slot, key, place.monitor.clone()));
+        }
+    }
+    let answers = state.memos.admit_pass(
+        &asks,
+        state.effect_settings.memo.budget_mib,
+        pass,
+        &mut state.pool,
+    );
+    let mut wanted_memos: Vec<MemoKey> = Vec::new();
+    for (((owner, slot, key, monitor), ask), admitted) in placed.into_iter().zip(asks).zip(answers)
+    {
+        if !admitted {
+            slots.set_unshared(owner, slot, &monitor);
+            continue;
+        }
+        if let Some(chain) = state.chains.get(key)
+            && let Some(prefix) = chain.memo().and_then(|memo| memo.prefix.as_ref())
+        {
+            let steps: Vec<usize> = chain
+                .memo()
+                .map(|memo| memo.exports.iter().map(|export| export.step).collect())
+                .unwrap_or_default();
+            for ((memo_key, _), step) in ask.memos.iter().zip(steps) {
+                state.memos.set_plan(memo_key, || prefix.upto(step));
+                if !wanted_memos.contains(memo_key) {
+                    wanted_memos.push(memo_key.clone());
+                }
+            }
+        }
+        state
+            .store
+            .slot_mut(&owner, slot, key)
+            .t2_mut(&monitor)
+            .read_at = Some(pass);
+    }
+    wanted_memos.sort();
+    slots.set_memos(wanted_memos);
+}
+
+/// Run each memo of `run` (`memos_to_run`'s) over its cut: its plan, the
+/// prefix up to the export it holds, at the xray's size, `backdrop` the
+/// cut's picture, held in the memo. `Done` moves its generation and counts
+/// `memo_runs`; `Pending` and `Failed` leave it with no result, so it runs
+/// again. One `begin` and one `end` around them (Ruling 10).
+/// `tests::a_memo_runs_when_its_xray_was_redrawn_and_once_for_every_slot`;
+/// what it draws is wirecheck 13a's (Task 45).
+pub(crate) fn run_xray(
+    cx: &mut RunCx<'_>,
+    pool: &mut crate::pool::Pool,
+    runner: &mut dyn Runner,
+    run: &[crate::effect::memo::MemoKey],
+) {
+    use crate::effect::run::{BoxMap, Inputs, Keys, Outcome};
+    use smithay::backend::renderer::Texture as _;
+    let mut began = false;
+    for key in run {
+        let (Some(generation), Some(texture)) = (
+            cx.xrays.generation(&key.monitor, key.cut),
+            cx.xrays.texture(&key.monitor, key.cut).cloned(),
+        ) else {
+            continue;
+        };
+        let size = texture.size();
+        let textures = [("backdrop", texture, BoxMap::WHOLE)];
+        let inputs = Inputs {
+            padded: (
+                u32::try_from(size.w).unwrap_or(1),
+                u32::try_from(size.h).unwrap_or(1),
+            ),
+            content: [0.0, 0.0, 1.0, 1.0],
+            textures: &textures,
+            radii: [0.0; 4],
+            time: cx.now,
+            transition: crate::effect::run::Transition::default(),
+            clamp_first: false,
+        };
+        let keys = Keys {
+            params: key.upto,
+            own: None,
+            shape: 0,
+        };
+        let effects = cx.effects;
+        let outcome = {
+            let Some(memo) = cx.memos.get_mut(key) else {
+                continue;
+            };
+            let crate::effect::memo::Memo { plan, held, .. } = memo;
+            let Some(plan) = plan.as_ref() else {
+                continue;
+            };
+            if !began {
+                runner.begin();
+                began = true;
+            }
+            runner.run(
+                pool,
+                &|program| effects.lookup(program),
+                effects.formats(),
+                plan,
+                held,
+                &inputs,
+                &keys,
+            )
+        };
+        match outcome {
+            Outcome::Done(_, sync) => {
+                let _ = crate::offscreen::settle(
+                    Ok::<_, std::convert::Infallible>(sync),
+                    crate::dev::fence_wait(),
+                    "a memo",
+                );
+                cx.memos.ran(key, generation);
+                crate::pacing::memo_ran();
+            }
+            // No result: it runs again on a later pass, and the places that
+            // read it draw nothing behind their part meanwhile ([16] §5).
+            Outcome::Pending | Outcome::Failed => {
+                if let Some(memo) = cx.memos.get_mut(key) {
+                    memo.made = false;
+                }
             }
         }
     }
@@ -2343,21 +3303,35 @@ pub(crate) fn place_around<T>(
 /// Whether a pane's slot has a result to draw: readiness and not wanting,
 /// so a wanted slot whose chain failed, or has not run, draws the part
 /// (`replace`) or nothing (`behind`, `front`). The one predicate the pane
-/// walk asks. `tests::a_wanted_slot_with_nothing_ready_draws_what_no_slot_draws`.
-pub(crate) fn slot_ready(
-    slots: &Slots,
+/// walk asks; on `monitor` a T2 slot is ready where it has that monitor's
+/// result (`effect::plan::tests::a_monitors_own_result_wins_over_the_slots_one`).
+/// `tests::a_wanted_slot_with_nothing_ready_draws_what_no_slot_draws`.
+pub(crate) fn slot_ready<'a>(
+    slots: &'a Slots,
     pane: crate::pane::PaneId,
-) -> impl Fn(PaneSlot, Slot) -> bool + '_ {
-    move |part, slot| slots.is_ready(&crate::effect::plan::Owner::Pane(pane, part), slot)
+    monitor: Option<&'a str>,
+) -> impl Fn(PaneSlot, Slot) -> bool + 'a {
+    move |part, slot| {
+        let owner = crate::effect::plan::Owner::Pane(pane, part);
+        match monitor {
+            // On one monitor, a T2 slot's result there or the slot's one.
+            Some(monitor) => slots.is_ready_on(&owner, slot, monitor),
+            None => slots.is_ready(&owner, slot),
+        }
+    }
 }
 
 /// A warped pane's capture: every slot ready this pass, in the flat path's
 /// order. `tests::a_warped_panes_capture_walks_its_client_slot`.
 pub(crate) fn capture_pieces(slots: &Slots, pane: crate::pane::PaneId) -> Vec<Piece> {
     let mut pieces = Vec::new();
-    pane_walk(&mut pieces, &slot_ready(slots, pane), |into, piece| {
-        into.push(piece);
-    });
+    pane_walk(
+        &mut pieces,
+        &slot_ready(slots, pane, None),
+        |into, piece| {
+            into.push(piece);
+        },
+    );
     pieces
 }
 
@@ -2365,7 +3339,7 @@ pub(crate) fn capture_pieces(slots: &Slots, pane: crate::pane::PaneId) -> Vec<Pi
 /// `pane` slots, which would read the last pass's result of the effect being
 /// run. `tests::a_whole_panes_capture_walks_its_inner_slots_and_not_its_own`.
 pub(crate) fn inner_pieces(slots: &Slots, pane: crate::pane::PaneId) -> Vec<Piece> {
-    let ready = slot_ready(slots, pane);
+    let ready = slot_ready(slots, pane, None);
     let mut pieces = Vec::new();
     pane_walk(
         &mut pieces,
@@ -2455,7 +3429,12 @@ fn corners_times(radii: Corners, by: f64) -> Corners {
 
 /// A ready slot's result placed over its part, `part` being the part's
 /// mask on this output in logical pixels (`effect::mask`), cut by it as
-/// [`cut_by_shape`] says, at `alpha`; nothing for a slot with no result.
+/// [`cut_by_shape`] says, at `alpha`; nothing for a slot with no result on
+/// `monitor`, the output it is drawn on.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one slot placed: whose, which, over what, on which monitor, at what scale and alpha"
+)]
 fn slot_element(
     state: &Solium,
     slots: &Slots,
@@ -2464,8 +3443,14 @@ fn slot_element(
     part: Mask,
     scale: f64,
     alpha: f32,
+    monitor: Option<&str>,
 ) -> Option<Element> {
-    let ready = slots.at(owner, slot)?;
+    // On `monitor`, its own result there (a T2 slot's) or the slot's one
+    // (`effect::plan::tests::a_monitors_own_result_wins_over_the_slots_one`).
+    let ready = match monitor {
+        Some(monitor) => slots.at_on(owner, slot, monitor),
+        None => slots.at(owner, slot),
+    }?;
     let Mask::Rect { rect, radii } = part else {
         return None;
     };
@@ -2507,6 +3492,7 @@ fn slot_element(
 fn layer_slots(
     state: &Solium,
     slots: &Slots,
+    monitor: Option<&str>,
     pane: crate::pane::PaneId,
     depth: Depth,
     drawing: crate::decoration::Drawing,
@@ -2535,7 +3521,11 @@ fn layer_slots(
         }
         for (part, slot, around) in around_layer(index, titlebar) {
             let owner = crate::effect::plan::Owner::Pane(pane, part);
-            if !slots.is_ready(&owner, slot) {
+            let ready = match monitor {
+                Some(monitor) => slots.is_ready_on(&owner, slot, monitor),
+                None => slots.is_ready(&owner, slot),
+            };
+            if !ready {
                 continue;
             }
             let mask = match part {
@@ -2570,6 +3560,7 @@ fn layer_slots(
                     mask,
                     drawing.scale,
                     drawing.alpha,
+                    monitor,
                 )
             }) {
                 placed.push((index, around, Some(element)));
@@ -2594,11 +3585,16 @@ fn layer_slots(
 /// appears on hover, a border that does not push the client around — is a
 /// decoration too. And it covers the whole window rather than a strip of it,
 /// which is what lets one put its bar on any side, or draw a border, or both.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the frame's own state, and the slots and monitor its layers' slots are placed from"
+)]
 fn chrome(
     state: &mut Solium,
     renderer: &mut GlesRenderer,
     elements: &mut Vec<Element>,
     slots: Option<&Slots>,
+    monitor: Option<&str>,
     pane: crate::pane::PaneId,
     depth: Depth,
     drawing: crate::decoration::Drawing,
@@ -2614,7 +3610,7 @@ fn chrome(
         values: state.decorations.values(),
     };
     let mut around = slots
-        .map(|slots| layer_slots(state, slots, pane, depth, drawing))
+        .map(|slots| layer_slots(state, slots, monitor, pane, depth, drawing))
         .unwrap_or_default();
     let mut animating = false;
     if let Some(decoration) = state.panes.get_mut(pane).and_then(Pane::decoration_mut) {
@@ -3075,6 +4071,13 @@ pub(crate) fn elements(
     // and nothing more, with the slots beside a surface when any slot is
     // wanted ([`stacked_walk`]).
     let output = state.output_for(screen);
+    // The monitor a T2 slot's result is placed from (Ruling F30), named only
+    // while a slot is wanted (spec §8.4):
+    // `effect::plan::tests::a_monitors_own_result_wins_over_the_slots_one`.
+    let monitor = output
+        .as_ref()
+        .filter(|_| !prepared.slots.is_empty())
+        .map(smithay::output::Output::name);
     let listed = stacked(state, screen, now);
     let mut draw = |each: Walked| match each {
         Walked::Stacked(each) => stacked_elements(
@@ -3107,14 +4110,15 @@ pub(crate) fn elements(
                 part,
                 scale,
                 alpha,
+                monitor.as_deref(),
             ));
         }
     };
-    match output.as_ref().filter(|_| !prepared.slots.is_empty()) {
+    match monitor.as_deref() {
         Some(on) => stacked_walk(
             listed,
-            &on.name(),
-            &|owner, slot| prepared.slots.is_ready(owner, slot),
+            on,
+            &|owner, slot| prepared.slots.is_ready_on(owner, slot, on),
             &mut draw,
         ),
         None => listed.into_iter().map(Walked::Stacked).for_each(&mut draw),
@@ -3432,6 +4436,14 @@ fn panes(
     let onto = |rect: smithay::utils::Rectangle<f64, smithay::utils::Logical>| {
         smithay::utils::Rectangle::new(rect.loc + shift, rect.size)
     };
+    // The monitor a T2 slot's result is placed from (Ruling F30), asked once
+    // and only while a slot is wanted (spec §8.4):
+    // `effect::plan::tests::a_monitors_own_result_wins_over_the_slots_one`.
+    let monitor = if prepared.slots.is_empty() {
+        None
+    } else {
+        state.output_for(screen).map(|output| output.name())
+    };
 
     for ((pane, window, global, mut frame), _) in order {
         let outer = smithay::utils::Rectangle::new(global.loc - screen.loc, global.size);
@@ -3553,7 +4565,7 @@ fn panes(
             let mut client = Some(remains_elements(state, pane, &frame, outer.size, scale));
             pane_pieces(elements, |elements, piece| match piece {
                 Piece::Layers(depth) => {
-                    chrome(state, renderer, elements, None, pane, depth, drawing);
+                    chrome(state, renderer, elements, None, None, pane, depth, drawing);
                 }
                 Piece::Client => elements.extend(client.take().into_iter().flatten()),
                 Piece::Slot(..) => {}
@@ -3574,7 +4586,7 @@ fn panes(
             // cover the client, and the handover does not restack anything.
             pane_pieces(elements, |elements, piece| match piece {
                 Piece::Layers(depth) if state.loading.decorated => {
-                    chrome(state, renderer, elements, None, pane, depth, drawing);
+                    chrome(state, renderer, elements, None, None, pane, depth, drawing);
                 }
                 Piece::Layers(_) | Piece::Slot(..) => (),
                 Piece::Client => scene(state, renderer, elements, pane, frame, now, scale),
@@ -3803,7 +4815,10 @@ fn panes(
         let mut popups = Some(popups);
         // With their slots around them, as any part's (`bracket`).
         bracket(
-            |slot| prepared.slots.is_ready(&popups_owner, slot),
+            |slot| match monitor.as_deref() {
+                Some(monitor) => prepared.slots.is_ready_on(&popups_owner, slot, monitor),
+                None => prepared.slots.is_ready(&popups_owner, slot),
+            },
             |slot| match slot {
                 Some(slot) => elements.extend(popups_part.and_then(|part| {
                     slot_element(
@@ -3814,6 +4829,7 @@ fn panes(
                         part,
                         scale,
                         frame.opacity,
+                        monitor.as_deref(),
                     )
                 })),
                 // Scaled with the window and not cut to its tile: a menu has
@@ -3853,7 +4869,7 @@ fn panes(
         // With its slots: what is ready this pass goes around the pieces it
         // belongs to, and with none the walk is `PANE_ORDER`
         // (`tests::with_no_slots_the_pane_walk_is_pane_order`).
-        let ready = slot_ready(&prepared.slots, pane);
+        let ready = slot_ready(&prepared.slots, pane, monitor.as_deref());
         let zoom = frame.rect.size.w / f64::from(outer.size.w.max(1));
         pane_walk(elements, &ready, |elements, piece| match piece {
             Piece::Layers(depth) => chrome(
@@ -3861,6 +4877,7 @@ fn panes(
                 renderer,
                 elements,
                 Some(&prepared.slots),
+                monitor.as_deref(),
                 pane,
                 depth,
                 drawing,
@@ -3885,6 +4902,7 @@ fn panes(
                     mask,
                     scale,
                     frame.opacity,
+                    monitor.as_deref(),
                 ));
             }
             Piece::Client => {
@@ -4386,6 +5404,16 @@ fn flat_pane(
     // around the old single `frame` call did: a window drawn without its chrome
     // is a window, and one skipped entirely is a hole in the picture.
     let pane = state.panes.id_of(window);
+    // A T2 slot's result is placed from the pane's own monitor's, where its
+    // capture is taken (Ruling F30;
+    // `effect::plan::tests::a_monitors_own_result_wins_over_the_slots_one`).
+    let monitor = if slots.is_empty() {
+        None
+    } else {
+        pane.and_then(|pane| state.pane_outer_of(pane))
+            .and_then(|outer| state.output_of(outer))
+            .map(|output| output.name())
+    };
 
     // Fully opaque, and over the whole texture: this pass draws the window flat
     // at its real size and the warp applies the transform's opacity to the
@@ -4412,6 +5440,7 @@ fn flat_pane(
                         renderer,
                         &mut elements,
                         Some(slots),
+                        monitor.as_deref(),
                         pane,
                         depth,
                         drawing,
@@ -4450,6 +5479,7 @@ fn flat_pane(
                     mask,
                     scale,
                     1.0,
+                    monitor.as_deref(),
                 ));
             }
             // A style's rounding, drawn here as on the flat path, so a deformed
@@ -5243,6 +6273,10 @@ pub(crate) mod tests {
             PartBox::around((100, 80).into(), 0, [0.0; 4]),
         );
         let mut store = crate::effect::store::Store::default();
+        let (mut memos, xrays) = (
+            crate::effect::memo::Memos::default(),
+            crate::effect::xray::Xrays::default(),
+        );
         let mut cx = super::RunCx {
             store: &mut store,
             effects: &host,
@@ -5250,6 +6284,8 @@ pub(crate) mod tests {
             masked: None,
             now: 0.0,
             pass: 1,
+            memos: &mut memos,
+            xrays: &xrays,
         };
         let (mut runner, mut pool) = (NoGpu::default(), crate::pool::Pool::new(0));
         for nest in [super::Nest::Inner, super::Nest::Whole] {
@@ -5329,6 +6365,10 @@ pub(crate) mod tests {
             slots.set_box(owner, Slot::Behind, part);
         }
         let mut store = crate::effect::store::Store::default();
+        let (mut memos, xrays) = (
+            crate::effect::memo::Memos::default(),
+            crate::effect::xray::Xrays::default(),
+        );
         let mut cx = super::RunCx {
             store: &mut store,
             effects: &host,
@@ -5336,6 +6376,8 @@ pub(crate) mod tests {
             masked: None,
             now: 0.0,
             pass: 1,
+            memos: &mut memos,
+            xrays: &xrays,
         };
         let mut runner = NoGpu::default();
         super::run_slots(
@@ -6739,7 +7781,7 @@ pub(crate) mod tests {
                 }
             }
             let decoration = example();
-            let ready = super::slot_ready(&slots, pane);
+            let ready = super::slot_ready(&slots, pane, None);
             assert_eq!(
                 walked(&decoration, &ready),
                 walked(&decoration, &|_, _| false),
@@ -7228,6 +8270,12 @@ pub(crate) mod tests {
             );
             slots
         }
+        fn scenes(&mut self, _slots: &crate::effect::plan::Slots) {
+            self.did.push("scenes".to_owned());
+        }
+        fn xray(&mut self, _slots: &crate::effect::plan::Slots) {
+            self.did.push("xray".to_owned());
+        }
         fn captures(&mut self, _slots: &crate::effect::plan::Slots, nest: super::Nest) {
             self.did.push(format!("captures {nest:?}"));
         }
@@ -7270,6 +8318,8 @@ pub(crate) mod tests {
             [
                 "compile",
                 "resolve",
+                "scenes",
+                "xray",
                 "captures Inner",
                 "chains Inner",
                 "captures Whole",
@@ -7288,6 +8338,185 @@ pub(crate) mod tests {
         assert!(
             !recorder.walked.contains(&super::Piece::Client),
             "the bare client is in the warp's capture"
+        );
+    }
+
+    /// **The pass is in order** (Ruling F31): scenes and xray after resolve
+    /// and before any capture or chain; the warps after the chains.
+    #[test]
+    fn prepare_renders_scenes_then_xray_before_the_chains() {
+        let mut recorder = Recorder {
+            pane: crate::pane::PaneId::from_raw(1),
+            did: Vec::new(),
+            walked: Vec::new(),
+        };
+        let _ = super::effect_phases(&mut recorder);
+        let at = |phase: &str| recorder.did.iter().position(|did| did == phase);
+        assert!(at("resolve") < at("scenes") && at("scenes") < at("xray"));
+        assert!(at("xray") < at("captures Inner") && at("chains Whole") < at("warps"));
+    }
+
+    fn mkey(upto: u64) -> crate::effect::memo::MemoKey {
+        crate::effect::memo::MemoKey {
+            monitor: "DP-1".to_owned(),
+            cut: crate::effect::xray::Cut::Background,
+            upto,
+        }
+    }
+
+    /// **A memo runs when its xray was redrawn, and not otherwise**; two
+    /// slots wanting one memo run it once.
+    #[test]
+    fn a_memo_runs_when_its_xray_was_redrawn_and_once_for_every_slot() {
+        let (mut memos, mut xrays) = (
+            crate::effect::memo::Memos::default(),
+            crate::effect::xray::Xrays::default(),
+        );
+        xrays.want("DP-1", crate::effect::xray::Cut::Background);
+        memos.want(&mkey(7), 1);
+        let wanted = [mkey(7), mkey(7)];
+        assert!(
+            super::memos_to_run(&memos, &xrays, &wanted).is_empty(),
+            "a memo ran over a cut not drawn yet"
+        );
+        xrays.drawn("DP-1", crate::effect::xray::Cut::Background, true);
+        memos.want(&mkey(7), 1);
+        assert_eq!(super::memos_to_run(&memos, &xrays, &wanted), vec![mkey(7)]);
+        memos.ran(
+            &mkey(7),
+            xrays
+                .generation("DP-1", crate::effect::xray::Cut::Background)
+                .unwrap_or(0),
+        );
+        assert!(
+            super::memos_to_run(&memos, &xrays, &wanted).is_empty(),
+            "re-ran over the same xray"
+        );
+        xrays.drawn("DP-1", crate::effect::xray::Cut::Background, false);
+        assert!(
+            super::memos_to_run(&memos, &xrays, &wanted).is_empty(),
+            "a kept xray re-ran it"
+        );
+        xrays.drawn("DP-1", crate::effect::xray::Cut::Background, true);
+        assert_eq!(super::memos_to_run(&memos, &xrays, &wanted), vec![mkey(7)]);
+    }
+
+    /// **An empty suffix runs no pass: its result is a crop of the memo**;
+    /// a suffix that reads the part runs; a place whose memo was not held
+    /// (over `effects.memo.budget_mib`) runs the whole plan (amended
+    /// 2026-10-08, configurable).
+    #[test]
+    fn an_empty_suffix_is_a_crop_and_a_suffix_runs() {
+        use crate::effect::memo::tests::chain;
+        let plain = solium_effects::stage::Memo {
+            prefix: None,
+            suffix: chain(&[]),
+            exports: vec![solium_effects::stage::Export {
+                step: 5,
+                name: "memo:5".to_owned(),
+                scale: 1.0,
+            }],
+        };
+        assert_eq!(
+            super::t2_work(&plain, true),
+            super::T2Work::Crop(plain.exports[0].clone())
+        );
+        let glass = solium_effects::stage::Memo {
+            prefix: None,
+            suffix: chain(&["tint"]),
+            exports: Vec::new(),
+        };
+        assert_eq!(super::t2_work(&glass, true), super::T2Work::Suffix);
+        assert_eq!(super::t2_work(&plain, false), super::T2Work::Whole);
+        assert_eq!(super::t2_work(&glass, false), super::T2Work::Whole);
+    }
+
+    /// **A crop is the part's box in the memo's own pixels.**
+    #[test]
+    fn a_crop_is_the_parts_box_in_the_memos_pixels() {
+        let map = crate::effect::run::BoxMap {
+            offset: [0.25, 0.5],
+            scale: [0.125, 0.25],
+        };
+        assert_eq!(
+            super::crop_of(map, (2560, 1440)),
+            smithay::utils::Rectangle::new((640.0, 720.0).into(), (320.0, 360.0).into())
+        );
+    }
+
+    /// A T2 place on `DP-1`, its box in the monitor's pixels at `x`.
+    fn t2_place(x: i32) -> crate::effect::plan::T2Place {
+        crate::effect::plan::T2Place {
+            monitor: "DP-1".to_owned(),
+            cut: crate::effect::xray::Cut::Background,
+            padded: smithay::utils::Rectangle::new((50, 25).into(), (100, 50).into()),
+            screen: smithay::utils::Rectangle::new((x, 50).into(), (200, 100).into()),
+            map: crate::effect::run::BoxMap {
+                offset: [0.05, 0.05],
+                scale: [0.1, 0.1],
+            },
+            own: (200, 100).into(),
+        }
+    }
+
+    /// **A T2 key moves with a drag finer than an xray pixel** (Ruling F37):
+    /// it holds the padded box in the monitor's own pixels, not in the
+    /// xray's, so at `effects.xray.scale` 0.5 (or the half rung) a window
+    /// moved by one monitor pixel re-runs its suffix even where its box in
+    /// the xray did not move.
+    #[test]
+    fn a_t2_key_moves_with_a_drag_finer_than_an_xray_pixel() {
+        use crate::effect::memo::tests::chain;
+        let (memos, xrays) = (
+            crate::effect::memo::Memos::default(),
+            crate::effect::xray::Xrays::default(),
+        );
+        let blur = crate::effect::plan::BoundChain::t2_for_test(chain(&["down", "up"]), 7);
+        let work = super::T2Work::Suffix;
+        let key = |place: &crate::effect::plan::T2Place| {
+            super::t2_key(
+                &memos, &xrays, place, &blur, &work, [0.0; 4], [0.0; 4], None,
+            )
+        };
+        let (here, there) = (t2_place(100), t2_place(101));
+        assert_eq!(here.padded, there.padded, "the premise: one xray pixel");
+        assert_ne!(key(&here), key(&there), "a one-pixel drag kept the key");
+    }
+
+    /// **A T2 key reads each memo by its prefix and its generation**: two
+    /// chains whose memos have the same generation (each ran once) but are
+    /// other memos key apart, so a place that reads another memo re-runs.
+    #[test]
+    fn a_t2_key_reads_each_memo_by_its_prefix_and_generation() {
+        use crate::effect::memo::tests::chain;
+        let (mut memos, mut xrays) = (
+            crate::effect::memo::Memos::default(),
+            crate::effect::xray::Xrays::default(),
+        );
+        xrays.drawn("DP-1", crate::effect::xray::Cut::Background, true);
+        let soft = crate::effect::plan::BoundChain::t2_for_test(chain(&["down", "up"]), 7);
+        let softer = crate::effect::plan::BoundChain::t2_for_test(chain(&["down2", "up2"]), 7);
+        for chain in [&soft, &softer] {
+            assert_eq!(chain.memo_keys().len(), 1, "the premise: one memo each");
+            memos.want(&mkey(chain.memo_keys()[0]), 1);
+            memos.ran(&mkey(chain.memo_keys()[0]), 1);
+        }
+        assert_ne!(
+            soft.memo_keys(),
+            softer.memo_keys(),
+            "the premise: two memos"
+        );
+        let place = t2_place(100);
+        let work = super::t2_work(soft.memo().expect("split"), true);
+        let key = |chain: &crate::effect::plan::BoundChain| {
+            super::t2_key(
+                &memos, &xrays, &place, chain, &work, [0.0; 4], [0.0; 4], None,
+            )
+        };
+        assert_ne!(
+            key(&soft).memo,
+            key(&softer).memo,
+            "two memos of one generation read alike"
         );
     }
 

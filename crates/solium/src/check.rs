@@ -573,7 +573,7 @@ pub(crate) fn wanted_by(rules: &[crate::effect::rules::Rule]) -> Vec<String> {
 /// fails, a tier this build cannot run included (Ruling 14), at the
 /// effect's own file and line where it has one; rules that did not parse
 /// are not bound, and not said to pass.
-/// `tests::a_rule_reading_xray_fails_the_check`,
+/// `tests::a_rule_reading_the_live_backdrop_fails_the_check`,
 /// `tests::rules_that_did_not_parse_are_not_called_ok`.
 pub(crate) fn rules(
     report: &mut Report,
@@ -1541,10 +1541,11 @@ mod tests {
         );
     }
 
-    /// **A rule reading xray fails the check** (Ruling 14), naming X2.1, as
-    /// it is refused at load; with `source = "self"` it passes.
+    /// **A rule reading the live backdrop fails the check** (Ruling 14),
+    /// naming X4.1, as it is refused at load; one reading xray (T2, from
+    /// X2.1 on) passes.
     #[test]
-    fn a_rule_reading_xray_fails_the_check() {
+    fn a_rule_reading_the_live_backdrop_fails_the_check() {
         let place = crate::effect::host::tests::scratch("check-xray");
         let effects = place.join("effects");
         crate::effect::host::tests::folder(
@@ -1561,13 +1562,13 @@ mod tests {
             let rules = rules_from(&place, rules);
             reported(|report| super::rules(report, &library, rules.as_deref(), CAPS, None))
         };
+        let (passed, out) = check(
+            r#"{ { match = "*", part = "client", slot = "behind", effect = { "soft", source = "live" } } }"#,
+        );
+        assert!(!passed, "{out}");
+        assert!(out.contains("rule 1") && out.contains("X4.1"), "{out}");
         let (passed, out) =
             check(r#"{ { match = "*", part = "client", slot = "behind", effect = "soft" } }"#);
-        assert!(!passed, "{out}");
-        assert!(out.contains("rule 1") && out.contains("X2.1"), "{out}");
-        let (passed, out) = check(
-            r#"{ { match = "*", part = "client", slot = "behind", effect = { "soft", source = "self" } } }"#,
-        );
         let _ = std::fs::remove_dir_all(place);
         assert!(passed, "{out}");
     }
