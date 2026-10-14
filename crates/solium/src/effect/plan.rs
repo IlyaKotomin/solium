@@ -86,6 +86,15 @@ impl BoundChain {
         &self.memo_keys
     }
 
+    /// Move the memo keys as a prefix uniform animated every pass would
+    /// (Task 59's `write_uniform` re-splits), for a test that needs them to
+    /// move with no folder that animates.
+    /// `state::tests::real_client::two_parts_under_a_one_memo_budget_do_not_trade_it_as_their_keys_move`.
+    #[cfg(test)]
+    pub(crate) fn set_memo_keys_for_test(&mut self, keys: Vec<u64>) {
+        self.memo_keys = keys;
+    }
+
     /// A T2 chain of `plan` with `params_hash`, split as the default
     /// configuration splits it, for a test that needs no folder.
     #[cfg(test)]
@@ -214,6 +223,13 @@ impl Chains {
     /// (Ruling 15). `state::tests::real_client::a_rule_whose_chain_is_not_bound_wants_no_slot`.
     pub(crate) fn get(&self, key: RuleKey) -> Option<&BoundChain> {
         self.by_key.get(&key)
+    }
+
+    /// One rule's chain, for a test to change.
+    /// `state::tests::real_client::two_parts_under_a_one_memo_budget_do_not_trade_it_as_their_keys_move`.
+    #[cfg(test)]
+    pub(crate) fn get_mut_for_test(&mut self, key: RuleKey) -> Option<&mut BoundChain> {
+        self.by_key.get_mut(&key)
     }
 
     /// Drop an origin's chains of an older generation (a set replaced whole).

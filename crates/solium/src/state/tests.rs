@@ -11838,6 +11838,230 @@ end)"#,
         assert_eq!(held(&fixture), memos, "a drag made another memo");
     }
 
+    /// **A drag finer than an xray pixel moves the T2 key** (Task 42's
+    /// review, carried into Task 44): at `effects.xray.scale = 0.5` a 1 px
+    /// drag that leaves the place's box in xray pixels where it was still
+    /// moves the key, which holds the box in the monitor's own pixels
+    /// (`T2Place.screen`), so the suffix re-runs (Ruling F37).
+    #[test]
+    fn a_drag_finer_than_an_xray_pixel_moves_the_t2_key_at_half_scale() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Slot;
+        fx2_fixture!(fixture, "t2-fine-drag");
+        let (pane, window) = translucent_window(&mut fixture);
+        apply_options(
+            &mut fixture,
+            r#"{ xray = { scale = 0.5 }, rules = { { match = "*", part = "client", slot = "behind", effect = "blur" } } }"#,
+        );
+        let owner = Owner::Pane(pane, PaneSlot::Client);
+        let in_xray = |fixture: &mut Fixture| {
+            resolved(fixture)
+                .places(&owner, Slot::Behind)
+                .first()
+                .map(|place| place.padded)
+                .expect("a place")
+        };
+        // Of two 1 px drags in a row at half scale, one crosses an xray
+        // pixel and the other does not, whichever column it starts at.
+        let mut finer = 0;
+        for _ in 0..2 {
+            let was = in_xray(&mut fixture);
+            let before = t2_key_of(&mut fixture, owner.clone(), Slot::Behind).expect("a key");
+            let at = fixture
+                .state
+                .space
+                .element_location(&window)
+                .expect("mapped");
+            fixture
+                .state
+                .space
+                .map_element(window.clone(), (at.x + 1, at.y), false);
+            fixture.state.space.refresh();
+            if in_xray(&mut fixture) != was {
+                continue;
+            }
+            finer += 1;
+            let after = t2_key_of(&mut fixture, owner.clone(), Slot::Behind).expect("a key");
+            assert_ne!(
+                after.padded, before.padded,
+                "a drag finer than an xray pixel left the key where it was"
+            );
+        }
+        assert_eq!(
+            finer, 1,
+            "the premise: one of two 1 px drags stays inside an xray pixel"
+        );
+    }
+
+    /// **Two parts that cannot both hold their memo do not trade it while
+    /// their keys move every pass** (Task 42's re-review, carried into Task
+    /// 44): a window's client and its pane, each with its own backdrop blur
+    /// on one monitor and cut, under a budget that holds one memo; their
+    /// memo keys move every pass, as an animated prefix uniform moves them,
+    /// the lesser of the two flipping between them; the part admitted first
+    /// keeps the memo, since `want_t2` says it read it last pass.
+    #[test]
+    fn two_parts_under_a_one_memo_budget_do_not_trade_it_as_their_keys_move() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Slot;
+        const MIB: u64 = 1024 * 1024;
+        fx2_fixture!(fixture, "memo-no-trade");
+        let (pane, _window) = translucent_window(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur" },
+                 { match = "*", part = "pane", slot = "behind", effect = "blur" } }"#,
+        );
+        let owners = [
+            Owner::Pane(pane, PaneSlot::Client),
+            Owner::Pane(pane, PaneSlot::Pane),
+        ];
+        let monitor = first_monitor(&fixture);
+        let slots = resolved(&mut fixture);
+        let rules: Vec<_> = owners
+            .iter()
+            .map(|owner| {
+                slots
+                    .key(owner, Slot::Behind)
+                    .expect("the premise: each part's slot is wanted")
+            })
+            .collect();
+        assert_ne!(rules[0], rules[1], "the premise: two rules");
+        for owner in &owners {
+            assert_eq!(
+                slots
+                    .places(owner, Slot::Behind)
+                    .iter()
+                    .map(|place| place.monitor.clone())
+                    .collect::<Vec<_>>(),
+                vec![monitor.clone()],
+                "the premise: one place, on the one monitor"
+            );
+        }
+        assert_eq!(
+            fixture.state.memos.len(),
+            1,
+            "the premise: one blur is one memo, with no budget"
+        );
+        let one = fixture.state.memos.held_bytes();
+        let budget = one.div_ceil(MIB);
+        assert!(
+            2 * one > budget * MIB,
+            "the premise: {budget} MiB holds one memo of {one} bytes, not two"
+        );
+        fixture.state.effect_settings.memo.budget_mib = budget;
+        let mut holder: Option<usize> = None;
+        for pass in 0..1000_u64 {
+            // The lesser key is the client's on even passes, the pane's on
+            // odd ones, and no key comes back.
+            let (low, high) = (2 * pass + 1, 2 * pass + 2);
+            let keys = if pass % 2 == 0 {
+                [low, high]
+            } else {
+                [high, low]
+            };
+            for (rule, key) in rules.iter().zip(keys) {
+                fixture
+                    .state
+                    .chains
+                    .get_mut_for_test(*rule)
+                    .expect("bound")
+                    .set_memo_keys_for_test(vec![key]);
+            }
+            let slots = resolved(&mut fixture);
+            let shared: Vec<usize> = owners
+                .iter()
+                .enumerate()
+                .filter(|(_, owner)| slots.shared_on(owner, Slot::Behind, &monitor))
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(shared.len(), 1, "pass {pass}: one memo is held");
+            match holder {
+                None => holder = Some(shared[0]),
+                Some(was) => assert_eq!(shared[0], was, "pass {pass}: the memo changed hands"),
+            }
+        }
+    }
+
+    /// **A part that left a monitor gives its T2 result there back** as
+    /// `run_slots` runs it (`effect::store::SlotState::keep_t2`): a window
+    /// across two monitors has a T2 state on each; moved onto one, a pass
+    /// keeps only that monitor's.
+    #[test]
+    fn a_part_that_left_a_monitor_gives_its_t2_result_there_back() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Slot;
+        fx2_fixture!(fixture, "t2-left");
+        two_monitors(&mut fixture);
+        let (pane, window) = translucent_window(&mut fixture);
+        straddle(&mut fixture, &window);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur" } }"#,
+        );
+        let owner = Owner::Pane(pane, PaneSlot::Client);
+        let held_on = |fixture: &Fixture| -> Vec<String> {
+            fixture
+                .state
+                .store
+                .get(&owner, Slot::Behind)
+                .map(|held| held.t2.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+        let _slots = resolved(&mut fixture);
+        assert_eq!(
+            held_on(&fixture).len(),
+            2,
+            "the premise: a T2 state on each monitor"
+        );
+        fixture
+            .state
+            .space
+            .map_element(window.clone(), (100, 100), false);
+        fixture.state.space.refresh();
+        pump_all(&mut fixture);
+        let mut slots = resolved(&mut fixture);
+        assert_eq!(
+            slots.places(&owner, Slot::Behind).len(),
+            1,
+            "the premise: the window is on one monitor"
+        );
+        let Solium {
+            store,
+            effects,
+            chains,
+            memos,
+            xrays,
+            ..
+        } = &mut fixture.state;
+        let mut cx = crate::render::RunCx {
+            store,
+            effects: &*effects,
+            chains,
+            masked: None,
+            now: 0.0,
+            pass: 2,
+            memos,
+            xrays: &*xrays,
+        };
+        let mut runner = crate::render::tests::NoGpu::default();
+        for nest in [crate::render::Nest::Inner, crate::render::Nest::Whole] {
+            crate::render::run_slots(
+                &mut cx,
+                &mut crate::pool::Pool::new(0),
+                &mut runner,
+                &mut slots,
+                &crate::effect::store::Drawn::default(),
+                nest,
+            );
+        }
+        assert_eq!(
+            held_on(&fixture),
+            vec![first_monitor(&fixture)],
+            "the monitor the window left kept its T2 result"
+        );
+    }
+
     /// **The self capture is padded by the effect's reach**: client pixels
     /// plus twice the reach, each way, the client's corner at the reach.
     #[test]

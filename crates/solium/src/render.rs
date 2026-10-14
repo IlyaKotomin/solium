@@ -2277,7 +2277,8 @@ fn run_t2(
     let state = cx.store.slot_mut(owner, slot, rule);
     state.seen = cx.pass;
     // A monitor the part left gives its result's targets back
-    // (`effect::store::tests::a_t2_result_on_a_monitor_left_is_given_back`).
+    // (`effect::store::tests::a_t2_result_on_a_monitor_left_is_given_back`,
+    // `state::tests::real_client::a_part_that_left_a_monitor_gives_its_t2_result_there_back`).
     let on: Vec<&str> = places.iter().map(|place| place.monitor.as_str()).collect();
     state.keep_t2(&on, pool);
     let mut failed = false;
@@ -2568,6 +2569,7 @@ pub(crate) fn t2_work(memo: &solium_effects::stage::Memo, shared: bool) -> T2Wor
 /// F37); the params; the shape; and the self capture's commit (Task 52).
 /// Pure. `tests::a_t2_key_reads_each_memo_by_its_prefix_and_generation`,
 /// `tests::a_t2_key_moves_with_a_drag_finer_than_an_xray_pixel`,
+/// `state::tests::real_client::a_drag_finer_than_an_xray_pixel_moves_the_t2_key_at_half_scale`,
 /// `state::tests::real_client::a_t2_slot_with_memo_false_reruns_when_its_xray_is_redrawn`,
 /// `state::tests::real_client::a_t2_slot_over_the_memo_budget_reruns_when_its_xray_is_redrawn`.
 #[expect(
@@ -2735,8 +2737,11 @@ fn own_monitor(
 
 /// A T2 slot's places: one per monitor its padded box (the part at rest
 /// grown by `pad` physical pixels at `scale`, its own monitor's) overlaps,
-/// or only its own monitor's under `effects.xray.straddle = "own"`.
-/// `state::tests::real_client::a_window_across_two_monitors_has_a_t2_place_on_each`.
+/// or only its own monitor's under `effects.xray.straddle = "own"`. Each
+/// holds its box in the xray's pixels and in the monitor's own, which the
+/// T2 key reads.
+/// `state::tests::real_client::a_window_across_two_monitors_has_a_t2_place_on_each`,
+/// `state::tests::real_client::a_drag_finer_than_an_xray_pixel_moves_the_t2_key_at_half_scale`.
 fn t2_places(
     state: &Solium,
     owner: &crate::effect::plan::Owner,
@@ -2801,7 +2806,8 @@ fn t2_places(
 /// `xray` phase.
 /// `state::tests::real_client::xray_is_wanted_only_on_a_monitor_a_t2_slot_reads`,
 /// `state::tests::real_client::two_windows_with_one_blur_want_one_memo`,
-/// `state::tests::real_client::over_the_memo_budget_a_slot_runs_its_whole_plan`.
+/// `state::tests::real_client::over_the_memo_budget_a_slot_runs_its_whole_plan`,
+/// `state::tests::real_client::two_parts_under_a_one_memo_budget_do_not_trade_it_as_their_keys_move`.
 pub(crate) fn want_t2(state: &mut Solium, slots: &mut Slots, pass: u64) {
     use crate::effect::memo::{Ask, MemoKey};
     state.xrays.clear_wants();
