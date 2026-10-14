@@ -19,9 +19,10 @@ use super::xray::Cut;
 /// key of the prefix steps up to the one it holds (`upto`, the prefix's
 /// `stage::Plan::keys()[export.step]`), so a prefix result two chains both
 /// read is one memo, and another monitor's or cut's is another.
-/// `tests::two_slots_with_one_prefix_share_one_memo`,
+/// Ordered, so the budget gives back the same memo of two equally old ones
+/// every time. `tests::two_slots_with_one_prefix_share_one_memo`,
 /// `tests::a_memo_is_one_per_monitor_and_cut`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct MemoKey {
     pub(crate) monitor: String,
     pub(crate) cut: Cut,
@@ -30,9 +31,9 @@ pub(crate) struct MemoKey {
 
 /// One memo's targets and its result, the xray generation it was made
 /// from, its own generation (moved on each run), whether a run made it,
-/// the last pass a slot wanted it, the plan its run is handed (the prefix
-/// up to the step it holds), and the bytes it is counted at against
-/// `effects.memo.budget_mib`. `tests::a_memos_generation_moves_on_each_run`,
+/// the last pass a slot admitted or wanted it, the plan its run is handed
+/// (the prefix up to the step it holds), and the bytes it is counted at
+/// against `effects.memo.budget_mib`. `tests::a_memos_generation_moves_on_each_run`,
 /// `tests::a_memo_keeps_the_plan_it_was_first_wanted_with`,
 /// `tests::a_memo_whose_run_made_nothing_runs_again`,
 /// `tests::a_held_memo_is_counted_at_its_latest_size`.
@@ -47,15 +48,20 @@ pub(crate) struct Memo {
     pub(crate) bytes: u64,
 }
 
-/// Every memo, by key, and whether a memo over the budget was logged.
+/// Every memo, by key, and the budget a refusal was last logged at.
 /// Outside the pool's free-list budget: a memo holds its targets while it
 /// is wanted, and [`Memos::sweep`] gives them back.
-/// `tests::a_memo_no_slot_wanted_this_pass_is_dropped`.
+/// `tests::a_memo_no_slot_wanted_this_pass_is_dropped`,
+/// `tests::a_refusal_is_logged_once_per_budget`.
 #[derive(Debug, Default)]
 pub(crate) struct Memos {
     by_key: HashMap<MemoKey, Memo>,
-    refused_logged: bool,
+    refused_logged: Option<u64>,
 }
+
+/// A MiB's bytes, what `effects.memo.budget_mib` counts in.
+/// `tests::a_memo_fits_at_exactly_its_budget`.
+const MIB: u64 = 1024 * 1024;
 
 impl Memos {
     /// A slot reads this memo this pass.
@@ -126,7 +132,9 @@ impl Memos {
 
     /// Give back every memo no slot wanted for `keep_passes` passes
     /// (`effects.memo.keep_passes`; 0 gives back what this pass did not
-    /// want). `tests::a_memo_no_slot_wanted_this_pass_is_dropped`,
+    /// want). [`Memos::admit`] gives one back sooner when a wanted memo
+    /// needs its room under the budget.
+    /// `tests::a_memo_no_slot_wanted_this_pass_is_dropped`,
     /// `tests::a_memo_is_kept_for_keep_passes`.
     pub(crate) fn sweep(&mut self, pass: u64, keep_passes: u64, pool: &mut crate::pool::Pool) {
         self.by_key.retain(|_, memo| {
@@ -143,38 +151,99 @@ impl Memos {
         self.by_key.len()
     }
 
-    /// Whether the memo `key` may be held: it already is, or the memos held
-    /// and its `bytes` fit `budget_mib` (`effects.memo.budget_mib`, 0: no
-    /// cap). An admitted memo is counted at the `bytes` it was last admitted
-    /// at, so a held memo whose xray grew is counted at its new size. Over
-    /// the budget nothing is held and the caller runs the whole plan per
-    /// part (Task 44); the first refusal is logged.
+    /// Whether the memo `key` may be held at `bytes` in `pass`: always with
+    /// `budget_mib` 0 (`effects.memo.budget_mib`, no cap); else while
+    /// `bytes` and every other memo admitted or wanted in `pass` fit the
+    /// budget. That judges a held memo too, whose xray may have grown or
+    /// whose budget a reload may have lowered. Memos no slot has admitted or
+    /// wanted in `pass`, kept only by `keep_passes`, are then given back,
+    /// the least recently wanted first, until what is held fits; a refused
+    /// memo held from an earlier pass is given back with them, so what is
+    /// held fits the budget whenever this returns. An admitted memo is
+    /// counted at `bytes` and marked wanted in `pass`. A refused one's
+    /// places run their whole plan (Task 44), and the first refusal at each
+    /// budget is logged.
     /// `tests::a_new_memo_over_the_budget_is_not_admitted`,
-    /// `tests::a_held_memo_is_counted_at_its_latest_size`.
-    pub(crate) fn admit(&mut self, key: &MemoKey, bytes: u64, budget_mib: u64) -> bool {
-        if let Some(memo) = self.by_key.get_mut(key) {
-            memo.bytes = bytes;
-            return true;
+    /// `tests::a_memo_fits_at_exactly_its_budget`,
+    /// `tests::a_held_memo_is_counted_at_its_latest_size`,
+    /// `tests::a_held_memo_grown_past_the_budget_is_refused`,
+    /// `tests::a_lowered_budget_refuses_a_held_memo_past_it`,
+    /// `tests::an_unwanted_kept_memo_gives_way_to_a_wanted_one`,
+    /// `tests::what_is_held_never_passes_the_budget`.
+    pub(crate) fn admit(
+        &mut self,
+        key: &MemoKey,
+        bytes: u64,
+        budget_mib: u64,
+        pass: u64,
+        pool: &mut crate::pool::Pool,
+    ) -> bool {
+        let cap = budget_mib.saturating_mul(MIB);
+        let (before, idle_key) = self
+            .by_key
+            .get(key)
+            .map_or((0, true), |memo| (memo.bytes, memo.seen < pass));
+        let pinned: u64 = self
+            .by_key
+            .iter()
+            .filter(|(each, memo)| *each != key && memo.seen >= pass)
+            .fold(0, |held, (_, memo)| held.saturating_add(memo.bytes));
+        let admitted = budget_mib == 0 || pinned.saturating_add(bytes) <= cap;
+        // What `key` holds once judged: `bytes` admitted; refused, what it
+        // held if a slot admitted it earlier in `pass`, else nothing
+        // (`tests::what_is_held_never_passes_the_budget`).
+        let kept = match (admitted, idle_key) {
+            (true, _) => bytes,
+            (false, true) => 0,
+            (false, false) => before,
+        };
+        while budget_mib != 0
+            && self
+                .held_bytes()
+                .saturating_sub(before)
+                .saturating_add(kept)
+                > cap
+        {
+            let idle = self
+                .by_key
+                .iter()
+                .filter(|(each, memo)| *each != key && memo.seen < pass)
+                .min_by_key(|(each, memo)| (memo.seen, *each))
+                .map(|(each, _)| each.clone());
+            let Some(idle) = idle else {
+                break;
+            };
+            if let Some(mut memo) = self.by_key.remove(&idle) {
+                memo.held.release(pool);
+            }
         }
-        let fits = budget_mib == 0
-            || self.held_bytes().saturating_add(bytes) <= budget_mib.saturating_mul(1024 * 1024);
-        if fits {
-            self.by_key.insert(
-                key.clone(),
-                Memo {
-                    bytes,
-                    ..Memo::default()
-                },
-            );
-        } else if !self.refused_logged {
-            self.refused_logged = true;
-            tracing::warn!(
-                budget_mib,
-                held = self.held_bytes(),
-                "effects.memo.budget_mib reached: a new memo is not held, its parts run their whole chain"
-            );
+        if !admitted {
+            if idle_key && let Some(mut memo) = self.by_key.remove(key) {
+                memo.held.release(pool);
+            }
+            self.note_refusal(budget_mib);
+            return false;
         }
-        fits
+        let memo = self.by_key.entry(key.clone()).or_default();
+        memo.bytes = bytes;
+        memo.seen = pass;
+        true
+    }
+
+    /// Log a refusal under `budget_mib` once per budget: again after a
+    /// reload sets another, never on every pass at one. Whether it logged.
+    /// `tests::a_refusal_is_logged_once_per_budget`.
+    fn note_refusal(&mut self, budget_mib: u64) -> bool {
+        if self.refused_logged == Some(budget_mib) {
+            return false;
+        }
+        self.refused_logged = Some(budget_mib);
+        tracing::warn!(
+            budget_mib,
+            held = self.held_bytes(),
+            "effects.memo.budget_mib reached: a memo is not held, its parts run their whole chain"
+        );
+        true
     }
 
     /// The bytes every held memo is counted at.
@@ -267,9 +336,10 @@ fn whole(name: &str, value: &Tree, max: u32) -> Result<u64, String> {
 
 /// What the memo of `plan` holds at the xray's `size`: each step's target
 /// at its size, rounded up as the run sizes it, 4 bytes a pixel and 8 for
-/// `rgba16f`. An upper bound of the run's ping-pong targets, which is what
-/// a budget should count.
-/// `tests::a_memos_bytes_are_each_steps_target_at_its_size`.
+/// `rgba16f`, saturating at `u64::MAX` for a size no GPU makes. An upper
+/// bound of the run's ping-pong targets, which is what a budget should
+/// count. `tests::a_memos_bytes_are_each_steps_target_at_its_size`,
+/// `tests::a_memo_too_big_to_count_saturates`.
 pub(crate) fn plan_bytes(plan: &solium_effects::stage::Plan, size: (u32, u32)) -> u64 {
     use solium_effects::stage::Format;
     let (sizes, _) = plan.sizes(size);
@@ -281,7 +351,9 @@ pub(crate) fn plan_bytes(plan: &solium_effects::stage::Plan, size: (u32, u32)) -
                 Format::Rgba8 => 4,
                 Format::Rgba16f => 8,
             };
-            u64::from(w) * u64::from(h) * pixel
+            u64::from(w)
+                .saturating_mul(u64::from(h))
+                .saturating_mul(pixel)
         })
         .fold(0, u64::saturating_add)
 }
@@ -512,21 +584,45 @@ mod tests {
     }
 
     /// **`effects.memo.budget_mib` caps what memos hold** (amended
-    /// 2026-10-08, configurable): a memo already held is always admitted,
-    /// a new one only while the held bytes and its own fit; 0 is no cap.
+    /// 2026-10-08, configurable): a memo already held is admitted again at
+    /// its size, a new one only while the held bytes and its own fit; 0 is
+    /// no cap.
     #[test]
     fn a_new_memo_over_the_budget_is_not_admitted() {
         let mib = 1024 * 1024;
-        let mut memos = Memos::default();
-        assert!(memos.admit(&key(7), 3 * mib / 4, 1));
+        let (mut memos, mut pool) = (Memos::default(), crate::pool::Pool::new(0));
+        assert!(memos.admit(&key(7), 3 * mib / 4, 1, 1, &mut pool));
         memos.want(&key(7), 1);
-        assert!(!memos.admit(&key(9), mib / 2, 1), "over a 1 MiB budget");
         assert!(
-            memos.admit(&key(7), 3 * mib / 4, 1),
+            !memos.admit(&key(9), mib / 2, 1, 1, &mut pool),
+            "over a 1 MiB budget"
+        );
+        assert!(
+            memos.admit(&key(7), 3 * mib / 4, 1, 1, &mut pool),
             "a held memo was refused"
         );
-        assert!(memos.admit(&key(9), mib / 2, 0), "0 is no cap");
+        assert!(
+            memos.admit(&key(9), mib / 2, 0, 1, &mut pool),
+            "0 is no cap"
+        );
         assert_eq!(memos.held_bytes(), 3 * mib / 4 + mib / 2);
+    }
+
+    /// **A memo fits at exactly its budget, counted in MiB**: 1 MiB of
+    /// memos is held under `budget_mib = 1`, and one byte more is not.
+    #[test]
+    fn a_memo_fits_at_exactly_its_budget() {
+        let mib = 1024 * 1024;
+        let (mut memos, mut pool) = (Memos::default(), crate::pool::Pool::new(0));
+        assert!(memos.admit(&key(7), mib / 2, 1, 1, &mut pool));
+        assert!(
+            memos.admit(&key(9), mib / 2, 1, 1, &mut pool),
+            "1 MiB refused under a 1 MiB budget"
+        );
+        assert!(
+            !memos.admit(&key(11), 1, 1, 1, &mut pool),
+            "a byte over the budget held"
+        );
     }
 
     /// **A held memo is counted at its latest size**: admitted again at
@@ -535,14 +631,123 @@ mod tests {
     #[test]
     fn a_held_memo_is_counted_at_its_latest_size() {
         let mib = 1024 * 1024;
-        let mut memos = Memos::default();
-        assert!(memos.admit(&key(7), mib / 4, 1));
-        assert!(memos.admit(&key(7), 3 * mib / 4, 1));
+        let (mut memos, mut pool) = (Memos::default(), crate::pool::Pool::new(0));
+        assert!(memos.admit(&key(7), mib / 4, 1, 1, &mut pool));
+        assert!(memos.admit(&key(7), 3 * mib / 4, 1, 1, &mut pool));
         assert_eq!(memos.held_bytes(), 3 * mib / 4);
         assert!(
-            !memos.admit(&key(9), mib / 2, 1),
+            !memos.admit(&key(9), mib / 2, 1, 1, &mut pool),
             "judged against the memo's first size"
         );
+    }
+
+    /// **A held memo grown past the budget is refused**: a new mode or a
+    /// larger `effects.xray.scale` keeps its key and grows its bytes. Its
+    /// places run their whole plan, and what it held is given back at once.
+    #[test]
+    fn a_held_memo_grown_past_the_budget_is_refused() {
+        let mib = 1024 * 1024;
+        let (mut memos, mut pool) = (Memos::default(), crate::pool::Pool::new(0));
+        assert!(memos.admit(&key(7), mib / 2, 1, 1, &mut pool));
+        memos.want(&key(7), 1);
+        assert!(
+            !memos.admit(&key(7), 4 * mib, 1, 2, &mut pool),
+            "4 MiB held under a 1 MiB budget"
+        );
+        assert_eq!((memos.len(), memos.held_bytes()), (0, 0));
+    }
+
+    /// **A budget lowered by a reload reaches the memos already held**: one
+    /// held at 3 MiB under a 4 MiB budget is refused once it is 1, and given
+    /// back at once.
+    #[test]
+    fn a_lowered_budget_refuses_a_held_memo_past_it() {
+        let mib = 1024 * 1024;
+        let (mut memos, mut pool) = (Memos::default(), crate::pool::Pool::new(0));
+        assert!(memos.admit(&key(7), 3 * mib, 4, 1, &mut pool));
+        memos.want(&key(7), 1);
+        assert!(
+            !memos.admit(&key(7), 3 * mib, 1, 2, &mut pool),
+            "3 MiB held under a 1 MiB budget"
+        );
+        assert_eq!(memos.held_bytes(), 0, "3 MiB still held under 1 MiB");
+    }
+
+    /// **What is held never passes the budget**: over 4000 passes that admit
+    /// and want memos of changing sizes, under a budget a reload changes
+    /// about every fourth pass (so held memos meet a lowered one), swept with
+    /// a changing `keep_passes`, the bytes held after every admission fit
+    /// the budget it was judged under.
+    #[test]
+    fn what_is_held_never_passes_the_budget() {
+        let mib = 1024 * 1024;
+        let (mut memos, mut pool) = (Memos::default(), crate::pool::Pool::new(0));
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = |below: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % below
+        };
+        let mut budget = 2;
+        for pass in 1..=4000 {
+            if next(4) == 0 {
+                budget = 1 + next(4);
+            }
+            for _ in 0..next(6) {
+                let (wanted, bytes) = (key(next(8)), (1 + next(8)) * mib / 4);
+                if memos.admit(&wanted, bytes, budget, pass, &mut pool) {
+                    memos.want(&wanted, pass);
+                }
+                assert!(
+                    memos.held_bytes() <= budget * mib,
+                    "pass {pass}: {} bytes held under {budget} MiB",
+                    memos.held_bytes()
+                );
+            }
+            memos.sweep(pass, next(3), &mut pool);
+        }
+    }
+
+    /// **A memo kept only by `keep_passes` gives way to a wanted one**: the
+    /// budget caps what is held, so a memo no slot has admitted or wanted
+    /// this pass is given back to make room, the least recently wanted
+    /// first. One admitted this pass is not, though no slot wanted it yet.
+    #[test]
+    fn an_unwanted_kept_memo_gives_way_to_a_wanted_one() {
+        let mib = 1024 * 1024;
+        let (mut memos, mut pool) = (Memos::default(), crate::pool::Pool::new(0));
+        assert!(memos.admit(&key(5), mib / 2, 1, 1, &mut pool));
+        memos.want(&key(5), 1);
+        assert!(memos.admit(&key(7), mib / 2, 1, 2, &mut pool));
+        assert!(
+            memos.admit(&key(9), mib / 2, 1, 2, &mut pool),
+            "a memo kept by keep_passes refused a wanted one"
+        );
+        assert_eq!(memos.generation(&key(5)), None);
+        assert!(
+            !memos.admit(&key(11), mib / 2, 1, 2, &mut pool),
+            "a memo admitted this pass was given back"
+        );
+        assert_eq!(memos.held_bytes(), mib);
+    }
+
+    /// **A refusal is logged once per budget**: again after a reload sets
+    /// another `effects.memo.budget_mib`, never on every pass at one.
+    #[test]
+    fn a_refusal_is_logged_once_per_budget() {
+        let mib = 1024 * 1024;
+        let (mut memos, mut pool) = (Memos::default(), crate::pool::Pool::new(0));
+        assert!(!memos.admit(&key(7), 2 * mib, 1, 1, &mut pool));
+        assert!(
+            !memos.note_refusal(1),
+            "admit's refusal at 1 MiB was not logged"
+        );
+        assert!(
+            memos.note_refusal(2),
+            "a reload's new budget was not logged"
+        );
+        assert!(!memos.note_refusal(2), "logged twice at one budget");
     }
 
     /// **What a memo holds is each step's target at its size**, rounded up
@@ -564,6 +769,23 @@ mod tests {
         );
     }
 
+    /// **A memo too big to count is counted as the most there is**: a stage
+    /// scaled past what a `u32` side holds (`scale = 1e9`, or `math.huge`)
+    /// saturates `Plan::sizes`, and its bytes saturate rather than overflow,
+    /// so any budget refuses it.
+    #[test]
+    fn a_memo_too_big_to_count_saturates() {
+        use solium_effects::stage::{Feed, Size};
+        let mut plan = chain(&["down1"]);
+        if let Some(step) = plan.steps.get_mut(0) {
+            step.size = Size::Scaled {
+                of: Feed::Input("backdrop".to_owned()),
+                scale: 1e9,
+            };
+        }
+        assert_eq!(super::plan_bytes(&plan, (101, 61)), u64::MAX);
+    }
+
     fn tree(lua: &str) -> crate::effect::tree::Tree {
         crate::effect::tree::tests::tree(lua).expect("a table")
     }
@@ -583,6 +805,15 @@ mod tests {
             })
         );
         assert_eq!(super::parse(&tree("{}")), Ok(super::MemoConfig::default()));
+        assert_eq!(
+            super::MemoConfig::default(),
+            super::MemoConfig {
+                split: Split::Resize,
+                keep_passes: 0,
+                budget_mib: 0
+            },
+            "the shipped defaults"
+        );
         assert!(
             super::parse(&tree(r#"{ split = "short" }"#))
                 .expect_err("refused")

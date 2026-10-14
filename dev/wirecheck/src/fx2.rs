@@ -31,11 +31,12 @@ mod gl;
 mod run;
 
 /// The compositor's effect element (Smithay and `solium_effects` only): case
-/// 12h draws it.
+/// 12h draws it, a crop included, which the compositor places from Task 44.
 #[path = "../../../crates/solium/src/effect/element.rs"]
 #[allow(
     dead_code,
-    reason = "the compositor's effect element, of which case 12h draws the element"
+    unfulfilled_lint_expectations,
+    reason = "the compositor's effect element, of which case 12h draws the element and a crop the compositor does not place yet"
 )]
 mod element;
 
@@ -1395,13 +1396,20 @@ const CLEAR: [u8; 4] = [0, 0, 0, 0];
 /// (30, 49), and transparent at (10, 10) and at (25, 25), inside the rect past
 /// a corner's arc. The same from a 74×49 result drawn over the 148×98 box,
 /// because the mask is measured in the placement's pixels; and with no mask,
-/// the result whole.
+/// the result whole. **A crop under an off-centre mask** (a memo cropped to
+/// one part, Task 42): the top-right quarter of a result whose other three
+/// quarters are red, cropped and then placed, drawn 1:1 and at twice its
+/// size under the mask `(10, 40, 90, 50)` at radius 10, is green at (75, 60)
+/// and (95, 85), and transparent at (5, 94), where a mask not mapped through
+/// the crop draws, at (11, 41), past the top-left arc, and at (120, 20).
+/// Never red, so the crop is what is drawn. Its pixels are printed.
 fn a_result_is_cut_by_its_mask(renderer: &mut GlesRenderer) -> Result<()> {
     use smithay::backend::renderer::Frame as _;
     use smithay::backend::renderer::element::Id;
     use smithay::backend::renderer::utils::CommitCounter;
-    use smithay::utils::Physical;
+    use smithay::utils::{Buffer, Physical};
     use solium_effects::fragment::{Corners, MASKED_TEXTURE};
+    type Pixel = fn(usize, usize) -> [u8; 4];
     println!("\n=== FX2: a result drawn through its mask: outside cut, inside exact ===");
     let program = renderer
         .compile_custom_texture_shader(
@@ -1421,17 +1429,62 @@ fn a_result_is_cut_by_its_mask(renderer: &mut GlesRenderer) -> Result<()> {
         ((30, 49), GREEN),
     ];
     let whole = [((0, 0), GREEN), ((10, 10), GREEN), ((147, 97), GREEN)];
+    let off_centre = (
+        Rectangle::<f64, Physical>::new((10.0, 40.0).into(), (90.0, 50.0).into()),
+        Corners::all(10.0),
+    );
+    let cropped = [
+        ((75, 60), GREEN),
+        ((95, 85), GREEN),
+        ((5, 94), CLEAR),
+        ((11, 41), CLEAR),
+        ((120, 20), CLEAR),
+    ];
+    let green: Pixel = |_, _| GREEN;
+    let quarter: Pixel = |x, y| if x >= 148 && y < 98 { GREEN } else { RED };
+    let small_quarter: Pixel = |x, y| if x >= 74 && y < 49 { GREEN } else { RED };
+    let top_right = |x: f64, w: f64, h: f64| {
+        Some(Rectangle::<f64, Buffer>::new((x, 0.0).into(), (w, h).into()))
+    };
     let mut pool = pool::Pool::new(0);
     let mut carrier = pool.carrier(renderer).ok_or_else(|| anyhow!("no carrier"))?;
-    for (what, result, mask, points) in [
-        ("a 148×98 result", (148, 98), Some(mask), &cut[..]),
-        ("a 74×49 result over the 148×98 box", (74, 49), Some(mask), &cut[..]),
-        ("a result with no mask", (148, 98), None, &whole[..]),
+    for (what, result, pixel, crop, mask, points) in [
+        ("a 148×98 result", (148, 98), green, None, Some(mask), &cut[..]),
+        (
+            "a 74×49 result over the 148×98 box",
+            (74, 49),
+            green,
+            None,
+            Some(mask),
+            &cut[..],
+        ),
+        ("a result with no mask", (148, 98), green, None, None, &whole[..]),
+        (
+            "a 296×196 result's top-right quarter, 1:1",
+            (296, 196),
+            quarter,
+            top_right(148.0, 148.0, 98.0),
+            Some(off_centre),
+            &cropped[..],
+        ),
+        (
+            "a 148×98 result's top-right quarter at twice its size",
+            (148, 98),
+            small_quarter,
+            top_right(74.0, 74.0, 49.0),
+            Some(off_centre),
+            &cropped[..],
+        ),
     ] {
-        let (texture, _) = upload(renderer, result, |_, _| GREEN)?;
-        let placed =
-            element::EffectElement::new(Id::new(), CommitCounter::default(), texture, program.clone())
-                .at(Rectangle::from_size(side.into()), mask, 1.0);
+        let (texture, _) = upload(renderer, result, pixel)?;
+        let made =
+            element::EffectElement::new(Id::new(), CommitCounter::default(), texture, program.clone());
+        // Cropped, then placed, as the walk places a slot's result.
+        let made = match crop {
+            Some(crop) => made.cropped(crop),
+            None => made,
+        };
+        let placed = made.at(Rectangle::from_size(side.into()), mask, 1.0);
         let target = pool
             .target(&mut pool::Gl(renderer), side.into(), pool::Format::Rgba8)
             .ok_or_else(|| anyhow!("no pooled target"))?;
@@ -1449,18 +1502,24 @@ fn a_result_is_cut_by_its_mask(renderer: &mut GlesRenderer) -> Result<()> {
         }
         let drawn = read_rgba(renderer, target.texture())?;
         drop(target);
+        let mut read = Vec::with_capacity(points.len());
         for &((x, y), want) in points {
             let at = (y * usize::try_from(side.0)? + x) * 4;
             let got = drawn.get(at..at + 4).unwrap_or_default();
             if got != want {
                 return Err(anyhow!("{what}: ({x}, {y}) is {got:?}, not {want:?}"));
             }
+            read.push(format!("({x}, {y}) {got:?}"));
+        }
+        if crop.is_some() {
+            println!("  {what}: {}", read.join(", "));
         }
     }
     pool.sweep(renderer);
     println!(
         "  inside exact, outside and past a corner's arc transparent, drawn 1:1 and at twice \
-         its size; with no mask, whole"
+         its size; with no mask, whole; a crop under an off-centre mask, cut where the \
+         placement says"
     );
     Ok(())
 }

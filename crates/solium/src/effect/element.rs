@@ -60,6 +60,23 @@ impl Placement {
             ..self
         }
     }
+
+    /// The same result, its crop kept, at `dst`, cut by `mask`, at `alpha`:
+    /// which part of the texture is the result is the result's own.
+    /// `tests::a_cropped_result_placed_again_keeps_its_crop`.
+    pub(crate) fn at(
+        self,
+        dst: Rectangle<i32, Physical>,
+        mask: Option<(Rectangle<f64, Physical>, Corners)>,
+        alpha: f32,
+    ) -> Self {
+        Self {
+            dst,
+            mask,
+            alpha,
+            ..self
+        }
+    }
 }
 
 /// What of a `size` texture a placement draws: its crop, or the whole
@@ -100,22 +117,46 @@ pub(crate) struct MaskUniforms {
     pub(crate) size: [f32; 2],
 }
 
-/// The masked program's uniforms for a placement, measured in the
-/// placement's box and not in the result's own pixels, so a result drawn
-/// over a box of another size is cut where the placement says; `None` with
-/// no mask, drawn by smithay's own texture program.
+/// The masked program's uniforms for a placement of a `texture`-sized
+/// result, measured in the placement's box and not in the result's own
+/// pixels, so a result drawn over a box of another size is cut where the
+/// placement says; `None` with no mask, drawn by smithay's own texture
+/// program. The program finds a pixel at `v_coords * mask_size -
+/// mask_rect.xy`, and smithay gives the box's pixel `p` the coordinate
+/// `(src.loc + p * src.size / dst) / texture`: with the whole texture as
+/// `src`, `mask_size` is the box's size; through a crop, the texture's size
+/// and the mask's corner are scaled by `dst / crop.size` and the corner
+/// moved by the crop's, so `p` still lands at `p - mask.loc`.
 /// `tests::the_mask_is_measured_in_the_placements_own_pixels`,
+/// `tests::through_a_crop_the_mask_stays_in_the_placements_own_pixels`,
 /// `tests::with_no_mask_the_result_is_drawn_whole` and wirecheck's case 12h.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "a mask in a box's pixels, as the f32 the uniforms take"
 )]
-pub(crate) fn mask_uniforms(placement: Placement) -> Option<MaskUniforms> {
+pub(crate) fn mask_uniforms(placement: Placement, texture: (i32, i32)) -> Option<MaskUniforms> {
     let (rect, radii) = placement.mask?;
+    let dst = (
+        f64::from(placement.dst.size.w),
+        f64::from(placement.dst.size.h),
+    );
+    let (size, shift) = match placement.crop {
+        None => (dst, (0.0, 0.0)),
+        Some(crop) => (
+            (
+                f64::from(texture.0) * dst.0 / crop.size.w,
+                f64::from(texture.1) * dst.1 / crop.size.h,
+            ),
+            (
+                crop.loc.x * dst.0 / crop.size.w,
+                crop.loc.y * dst.1 / crop.size.h,
+            ),
+        ),
+    };
     Some(MaskUniforms {
         rect: [
-            rect.loc.x as f32,
-            rect.loc.y as f32,
+            (rect.loc.x + shift.0) as f32,
+            (rect.loc.y + shift.1) as f32,
             rect.size.w as f32,
             rect.size.h as f32,
         ],
@@ -125,7 +166,7 @@ pub(crate) fn mask_uniforms(placement: Placement) -> Option<MaskUniforms> {
             radii.bottom_left as f32,
             radii.bottom_right as f32,
         ],
-        size: [placement.dst.size.w as f32, placement.dst.size.h as f32],
+        size: [size.0 as f32, size.1 as f32],
     })
 }
 
@@ -156,8 +197,9 @@ impl EffectElement {
     }
 
     /// The same result at `dst`, cut by `mask` (in `dst`'s physical pixels
-    /// from its corner; `None` draws the texture whole), at `alpha`.
-    /// Wirecheck's case 12h.
+    /// from its corner; `None` draws the texture whole), at `alpha`, its
+    /// crop kept. `tests::a_cropped_result_placed_again_keeps_its_crop` and
+    /// wirecheck's case 12h.
     pub(crate) fn at(
         &self,
         dst: Rectangle<i32, Physical>,
@@ -165,7 +207,20 @@ impl EffectElement {
         alpha: f32,
     ) -> Self {
         Self {
-            placement: Placement::of(dst, mask, alpha),
+            placement: self.placement.at(dst, mask, alpha),
+            ..self.clone()
+        }
+    }
+
+    /// The same result drawing only `crop` of its texture: a memo, cropped
+    /// to one part's padded box. Wirecheck's case 12h.
+    #[expect(
+        dead_code,
+        reason = "Task 44 places a memo cropped to each part; wirecheck's case 12h draws one"
+    )]
+    pub(crate) fn cropped(&self, crop: Rectangle<f64, Buffer>) -> Self {
+        Self {
+            placement: self.placement.cropped(crop),
             ..self.clone()
         }
     }
@@ -212,7 +267,8 @@ impl RenderElement<GlesRenderer> for EffectElement {
         opaque_regions: &[Rectangle<i32, Physical>],
     ) -> Result<(), GlesError> {
         let alpha = self.placement.alpha;
-        let Some(mask) = mask_uniforms(self.placement) else {
+        let size = self.texture.size();
+        let Some(mask) = mask_uniforms(self.placement, (size.w, size.h)) else {
             return frame.render_texture_from_to(
                 &self.texture,
                 src,
@@ -310,7 +366,7 @@ mod tests {
             1.0,
         );
         assert_eq!(
-            super::mask_uniforms(placement),
+            super::mask_uniforms(placement, (100, 50)),
             Some(MaskUniforms {
                 rect: [8.0, 8.0, 184.0, 84.0],
                 radii: [1.0, 2.0, 3.0, 4.0],
@@ -319,13 +375,89 @@ mod tests {
         );
     }
 
+    /// **Through a crop, the mask stays in the placement's own pixels**:
+    /// `MASKED_TEXTURE` finds a pixel at `v_coords * mask_size -
+    /// mask_rect.xy`, and smithay's texture matrix gives the box's pixel `p`
+    /// the coordinate `(crop.loc + p * crop.size / dst) / texture`, so the
+    /// uniforms map the crop back out. For an off-centre mask, with a crop
+    /// drawn 1:1 and one drawn at twice its size, `p` lands at `p - mask.loc`.
+    #[test]
+    fn through_a_crop_the_mask_stays_in_the_placements_own_pixels() {
+        let mask = (
+            Rectangle::new((10.0, 40.0).into(), (90.0, 50.0).into()),
+            Corners::all(10.0),
+        );
+        for (texture, crop) in [
+            (
+                (296, 196),
+                Rectangle::new((148.0, 0.0).into(), (148.0, 98.0).into()),
+            ),
+            (
+                (148, 98),
+                Rectangle::new((74.0, 0.0).into(), (74.0, 49.0).into()),
+            ),
+        ] {
+            let placement = Placement::of(
+                Rectangle::new((7, 9).into(), (148, 98).into()),
+                Some(mask),
+                1.0,
+            )
+            .cropped(crop);
+            let uniforms = super::mask_uniforms(placement, texture).expect("a mask");
+            assert_eq!(
+                uniforms,
+                MaskUniforms {
+                    rect: [158.0, 40.0, 90.0, 50.0],
+                    radii: [10.0; 4],
+                    size: [296.0, 196.0],
+                }
+            );
+            for (x, y) in [(0.5, 0.5), (75.5, 60.5), (5.5, 94.5), (147.5, 97.5)] {
+                let v = (
+                    (crop.loc.x + x * crop.size.w / 148.0) / f64::from(texture.0),
+                    (crop.loc.y + y * crop.size.h / 98.0) / f64::from(texture.1),
+                );
+                let at = (
+                    v.0 * f64::from(uniforms.size[0]) - f64::from(uniforms.rect[0]),
+                    v.1 * f64::from(uniforms.size[1]) - f64::from(uniforms.rect[1]),
+                );
+                assert!(
+                    (at.0 - (x - 10.0)).abs() < 1e-3 && (at.1 - (y - 40.0)).abs() < 1e-3,
+                    "{texture:?} {crop:?}: ({x}, {y}) lands at {at:?}"
+                );
+            }
+        }
+    }
+
     /// **With no mask the result is drawn whole**, by smithay's own texture
     /// program: an effect that reads `shape` owns its edges, and nothing
     /// stands in for "no mask" with a rectangle too big for `mediump`.
     #[test]
     fn with_no_mask_the_result_is_drawn_whole() {
         let placement = Placement::of(Rectangle::from_size((64, 32).into()), None, 0.5);
-        assert_eq!(super::mask_uniforms(placement), None);
+        assert_eq!(super::mask_uniforms(placement, (64, 32)), None);
+    }
+
+    /// **A cropped result placed again keeps its crop**: the walk places a
+    /// slot's result at its part on every pass (`EffectElement::at`), and
+    /// which part of the texture is the result is the result's own, not
+    /// the place's.
+    #[test]
+    fn a_cropped_result_placed_again_keeps_its_crop() {
+        let crop = Rectangle::new((200.0, 120.0).into(), (100.0, 40.0).into());
+        let dst = Rectangle::new((5, 6).into(), (100, 40).into());
+        let placed = Placement::of(Rectangle::from_size((100, 40).into()), None, 1.0)
+            .cropped(crop)
+            .at(dst, None, 0.5);
+        assert_eq!(
+            placed,
+            Placement {
+                dst,
+                mask: None,
+                alpha: 0.5,
+                crop: Some(crop),
+            }
+        );
     }
 
     /// **A cropped placement draws only its crop**: `src` is the crop, and
