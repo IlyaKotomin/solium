@@ -19867,7 +19867,7 @@ end)
         mod after_close {
             use super::*;
 
-            use smithay::backend::input::KeyState;
+            use smithay::backend::input::{ButtonState, KeyState};
             use smithay::input::keyboard::Keycode;
 
             /// `init.lua`'s `super+q`: close the focused window.
@@ -19937,6 +19937,13 @@ end)
             /// `super+q` on the focused window, with Russian active.
             fn super_q(desk: &mut Desk) {
                 press(desk, &[SUPER, Q]);
+            }
+
+            fn centre(rect: Rectangle<i32, Logical>) -> (f64, f64) {
+                (
+                    f64::from(rect.loc.x) + f64::from(rect.size.w) / 2.0,
+                    f64::from(rect.loc.y) + f64::from(rect.size.h) / 2.0,
+                )
             }
 
             /// **`reflow_on_close` decides when the others close up**, in
@@ -20085,6 +20092,110 @@ end)
                         }
                     }
                 }
+            }
+
+            /// **Hovering a window focuses it in tiling and scrolling, and
+            /// not in floating; a click on empty desktop still clears it**
+            /// (#219). The shipped `focus.modes`, as a session starts them:
+            /// floating's click-only is in force first, and switching to the
+            /// layout takes its own answer at once. On a machine whose own
+            /// answer is not to follow -- a tablet's profile -- so that it is
+            /// the configuration's `"follow"` that does it.
+            /// Against `0ce2ab8` it fails at the first hover: tiling named
+            /// nothing, and kept floating's click-only.
+            #[test]
+            fn the_shipped_focus_follows_the_pointer_in_tiling_and_scrolling_and_not_in_floating() {
+                use crate::input::profile::{FormFactor, Profile};
+                for layout in LAYOUTS {
+                    let mut desk = Desk::new();
+                    desk.state.profile = Profile::for_form_factor(FormFactor::Tablet);
+                    assert!(
+                        !desk.state.profile.focus_follows_mouse,
+                        "the premise: this machine's own answer is not to follow"
+                    );
+                    let (_, _, first) = desk.open();
+                    let (_, _, second) = desk.open();
+                    start(&mut desk, layout, "");
+                    russian(&mut desk.state);
+                    let focused = desk.focused();
+                    let other = if focused == first { second } else { first };
+
+                    // Over the window itself: this client never answers a
+                    // configure, so it is the size it opened at, at the
+                    // corner of its tile.
+                    let over = centre(
+                        desk.state
+                            .pane_outer_of(other)
+                            .expect("a mapped pane has a rectangle"),
+                    );
+                    move_pointer(&mut desk.state, over, 10);
+                    assert_eq!(
+                        desk.focused(),
+                        other,
+                        "{layout}: the window under the pointer did not take the keyboard"
+                    );
+
+                    // The gap at the corner of the screen, which is empty
+                    // desktop in both layouts.
+                    move_pointer(&mut desk.state, (3.0, 3.0), 20);
+                    let region = crate::monitor::union(&desk.state.space).expect("a monitor");
+                    crate::synth::send_button(
+                        &mut desk.state,
+                        region,
+                        0x110,
+                        ButtonState::Pressed,
+                        21,
+                    );
+                    crate::synth::send_button(
+                        &mut desk.state,
+                        region,
+                        0x110,
+                        ButtonState::Released,
+                        22,
+                    );
+                    assert!(
+                        desk.state.focused_window().is_none(),
+                        "{layout}: a click on empty desktop left a window focused"
+                    );
+
+                    // Back to floating, which follows nothing.
+                    assert!(
+                        desk.state.trigger(key_of(layout)),
+                        "{layout}: the key back to floating was not handled"
+                    );
+                    let stood = desk
+                        .state
+                        .pane_outer_of(focused)
+                        .expect("a mapped pane has a rectangle");
+                    let over = centre(stood);
+                    move_pointer(&mut desk.state, over, 30);
+                    assert!(
+                        desk.state.focused_window().is_none(),
+                        "{layout}: back in floating, hovering a window focused it"
+                    );
+                }
+            }
+
+            /// **A mode the configuration names nowhere gets the machine's
+            /// own answer, not the mode before it.** A `user.lua` written
+            /// for the shipped file before #128 named only floating's
+            /// click-only; switching to tiling then kept it, because the
+            /// compositor read "not named" as "leave it as it is". On this
+            /// (desktop) profile the machine's answer is to follow.
+            /// Against `0ce2ab8` it fails: the pointer was not followed.
+            #[test]
+            fn a_mode_that_names_nothing_gets_the_machines_own_focus_not_the_last_modes() {
+                let mut desk = Desk::new();
+                start(
+                    &mut desk,
+                    "tiling",
+                    "require(\"config\").focus.modes = { floating = \"click\" }",
+                );
+                let machine = crate::input::profile::Profile::default();
+                assert_eq!(
+                    desk.state.profile.focus_follows_mouse, machine.focus_follows_mouse,
+                    "a mode named nowhere kept the last mode's focus model"
+                );
             }
         }
 

@@ -1385,10 +1385,12 @@ Whether moving the pointer over a window focuses it is a per-mode question,
 not a single on/off switch: floating -- the desktop, with no layout in charge
 and windows free to overlap -- focuses on click only by default, because a
 window you are not using sits under the pointer on the way to the one you
-want. Every other mode keeps this machine's own answer (`SOLIUM_FORM_FACTOR`,
-[#159](https://github.com/Lilium-Linux/solium/issues/159)), which on a
-desktop or a laptop is focus-follows-mouse, the same as every tiling
-compositor people arrive from. Name a mode to change its own answer:
+want. Tiling and scrolling follow the pointer, the same as every tiling
+compositor people arrive from: their windows never overlap, so pointing at one
+is choosing it. A mode you name nowhere gets this machine's own answer
+(`SOLIUM_FORM_FACTOR`, [#159](https://github.com/Lilium-Linux/solium/issues/159)),
+never the answer of the mode you switched from. Name a mode to change its own
+answer:
 
 ```lua
 return {
@@ -1397,8 +1399,8 @@ return {
 ```
 
 `lua/modes.lua` is what turns this into `sol.focus_mode`, on every mode
-change as well as at load, so a reload keeps whichever model the session was
-already in.
+change as well as at load, so a mode switch applies at once and a reload
+keeps whichever model the session was already in.
 
 ### Your own mode
 

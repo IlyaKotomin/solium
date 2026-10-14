@@ -554,12 +554,16 @@ pub(crate) enum Command {
     /// load, both from `config.focus` (#219).
     ///
     /// Every field is `Option`, and unlike [`Command::Idle`] a missing one is
-    /// not "the default" -- there is no fixed default a mode-aware call could
-    /// fall back to that would still know the machine's own form factor
-    /// (#159, `crate::input::profile::Profile::for_form_factor`). `None`
-    /// here means "leave the input profile's current answer alone", so a
-    /// mode that only has an opinion about `follow` cannot reset `click` out
-    /// from under whatever named it last.
+    /// not a fixed default -- there is none a mode-aware call could fall back
+    /// to that would still know the machine's own form factor (#159,
+    /// `crate::input::profile::Profile::for_form_factor`). **`None` is the
+    /// machine's own answer**, the form factor's, and never what the call
+    /// before it said. It used to mean "leave the current answer alone",
+    /// which made a mode that names nothing inherit the mode before it: the
+    /// shipped floating's click-only, so tiling never followed the pointer
+    /// (#128).
+    /// `a_mode_that_names_nothing_gets_the_machines_own_focus_not_the_last_modes`
+    /// in `state/tests.rs`.
     FocusMode {
         click: Option<bool>,
         follow: Option<bool>,
@@ -3407,12 +3411,12 @@ fn build_api(lua: &Lua) -> mlua::Result<Table> {
     // The input profile's focus policy, overridden from Lua (#219):
     // `config.focus`, which `lua/modes.lua` hands over on every mode change
     // as well as at load, same as `sol.idle` above. Unlike `sol.idle`, a key
-    // left out -- or the whole table left out -- changes nothing rather than
-    // resetting to a fixed default: the profile already answered `click` and
-    // `follow` from the machine's own form factor before any script ran
-    // (`SOLIUM_FORM_FACTOR`, #159), and a mode that only has an opinion about
-    // one of the three must not clobber the other two.
-    // `sol_focus_mode_leaves_out_keys_unchanged`.
+    // left out -- or the whole table left out -- is not a fixed default but
+    // the machine's own answer, from its form factor (`SOLIUM_FORM_FACTOR`,
+    // #159), which the compositor works out when it applies the command. And
+    // never the answer the call before left, which is what a mode naming
+    // nothing used to inherit (#128): see `Command::FocusMode`.
+    // `sol_focus_mode_leaves_a_key_out_to_the_machine`.
     sol.set(
         "focus_mode",
         lua.create_function(|lua, options: Option<mlua::Table>| {
@@ -6950,12 +6954,39 @@ mod tests {
             .collect()
     }
 
-    /// **A key `sol.focus_mode` is not given leaves the profile's answer for
-    /// it alone** (#219): unlike `sol.idle`, there is no fixed default to
-    /// fall back to, because a mode calling it knows nothing about the
-    /// machine's own form factor.
+    /// **Each shipped mode hands over its own focus model** (#128): floating
+    /// click-only at load, tiling and scrolling following the pointer as
+    /// each is switched to.
     #[test]
-    fn sol_focus_mode_leaves_out_keys_unchanged() {
+    fn the_shipped_modes_each_hand_over_their_own_focus_model() {
+        let Some((directory, mut scripts)) =
+            shipped_init_with_user("solium-script-test-after-close-shipped", "return {}")
+        else {
+            return;
+        };
+        let commands = [
+            scripts.startup().commands,
+            scripts.key("super+t", empty_snapshot()).commands,
+            scripts.key("super+s", empty_snapshot()).commands,
+        ];
+        let _ = std::fs::remove_dir_all(&directory);
+        let [loaded, tiling, scrolling] = commands.map(focus_modes);
+        assert_eq!(
+            loaded,
+            [(None, Some(false), Some(true))],
+            "floating, at load"
+        );
+        assert_eq!(tiling, [(None, Some(true), Some(true))], "tiling");
+        assert_eq!(scrolling, [(None, Some(true), Some(true))], "scrolling");
+    }
+
+    /// **A key `sol.focus_mode` is not given is left to the machine** (#219):
+    /// unlike `sol.idle`, there is no fixed default for the script to fill
+    /// in, because a mode calling it knows nothing about the machine's own
+    /// form factor. So the command says `None`, and the compositor reads
+    /// that as the form factor's answer (`Command::FocusMode`).
+    #[test]
+    fn sol_focus_mode_leaves_a_key_out_to_the_machine() {
         let directory = std::env::temp_dir().join("solium-script-test-focus-mode");
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).expect("a temporary directory");
@@ -6974,7 +7005,7 @@ mod tests {
             modes,
             [(None, Some(false), None)],
             "a table naming only `follow` must leave `click` and \
-             `clear_on_empty_click` as `None`, not reset them"
+             `clear_on_empty_click` as `None`, to the machine"
         );
     }
 
@@ -7026,13 +7057,9 @@ mod tests {
     /// for the mode itself: `modes.lua` runs fresh on every load, so without
     /// `sol.keep` this file could not tell a reload from a fresh start, and
     /// `super+shift+r` after switching to tiling would answer `follow =
-    /// false` -- floating's click-only override -- instead of `None`, every
-    /// time. `None` and not tiling's own `Some(true)` is the right answer
-    /// here on purpose: `config.focus.modes` names no entry for `"tiling"`,
-    /// so it defers to the input profile's own `follow` -- which is `true`
-    /// on this (Desktop) profile, but the command must say "ask the
-    /// profile", not bake today's machine's answer in, or a tablet's
-    /// `false` would be overridden back to `true` the moment it tiled.
+    /// false` -- floating's click-only override -- instead of tiling's own
+    /// `follow`, every time. Since #128 `config.focus.modes` names tiling's
+    /// `"follow"`, so that is `Some(true)`.
     #[test]
     fn a_reload_keeps_the_focus_model_tiling_was_switched_to() {
         let Some((directory, mut scripts)) =
@@ -7048,9 +7075,8 @@ mod tests {
         );
         assert_eq!(
             focus_modes(switched.commands),
-            [(None, None, Some(true))],
-            "switching to tiling, which `config.focus.modes` does not name, did not defer to \
-             the input profile's own `follow`"
+            [(None, Some(true), Some(true))],
+            "switching to tiling did not hand over its own `follow`"
         );
 
         let config = directory.join("init.lua");
@@ -7060,9 +7086,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
         assert_eq!(
             modes,
-            [(None, None, Some(true))],
+            [(None, Some(true), Some(true))],
             "a reload forgot tiling was in charge and fell back to floating's click-only \
-             override (`follow = false`) instead of leaving `follow` alone"
+             override (`follow = false`)"
         );
     }
 

@@ -59,10 +59,9 @@ impl DragModifier {
 /// Per-form-factor input behaviour.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Profile {
-    #[expect(
-        dead_code,
-        reason = "E7 selects default modes per form factor; the field is the seam"
-    )]
+    /// What the machine is. Read back when a configuration leaves a focus
+    /// setting out: `Command::FocusMode`'s `None` is this form factor's own
+    /// answer.
     pub(crate) form_factor: FormFactor,
 
     /// Pressing a pointer button on a window focuses it.

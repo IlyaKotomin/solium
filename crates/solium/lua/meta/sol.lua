@@ -291,10 +291,10 @@
 ---@class sol.X11Options
 ---@field hidden? string[] WM_CLASS names to hide, matched case-insensitively against either field a client sets (`class` or `instance` on `sol.Window`). Replaces the whole default list rather than adding to it; default `{ "xwaylandvideobridge" }`.
 
----The input profile's focus policy (#219). A key left out keeps whatever it
----already answered -- there is no fixed default here the way `sol.idle` has
----one, since that would have to know the machine's own form factor
----(#159) and a mode calling this does not.
+---The input profile's focus policy (#219). A key left out is the machine's
+---own answer for it, the form factor's (#159) -- never what the call before
+---this one said, so a mode that names nothing does not inherit the mode before
+---it (#128).
 ---@class sol.FocusModeOptions
 ---@field click? boolean Whether a press focuses the window it lands on.
 ---@field follow? boolean Whether moving the pointer over a window focuses it.

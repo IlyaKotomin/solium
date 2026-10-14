@@ -754,22 +754,28 @@ local defaults = {
 
         -- Per mode (the names `modes.register` uses): `"click"` focuses a
         -- window only on a press; `"follow"` also focuses it when the
-        -- pointer moves over it, which is what every tiling compositor
-        -- people arrive from does, and the compositor's own default for the
-        -- machine ([#159](https://github.com/Lilium-Linux/solium/issues/159),
-        -- `SOLIUM_FORM_FACTOR`) when a mode says neither.
+        -- pointer moves over it. A mode named neither here gets `follow`
+        -- below, and with that unset the machine's own default
+        -- ([#159](https://github.com/Lilium-Linux/solium/issues/159),
+        -- `SOLIUM_FORM_FACTOR`) -- never the mode you switched from. Applied
+        -- the moment the mode changes.
         --
-        -- Floating -- the desktop, with no layout in charge and windows free
-        -- to overlap -- defaults to click-only here: a window you are not
-        -- using sits under the pointer on the way to the one you want, and
-        -- hovering it should not steal the keyboard from what you were
-        -- typing into. Every other mode keeps the machine's own default
-        -- unless you name it too:
+        -- Tiling and scrolling follow the pointer (#128), which is what every
+        -- tiling compositor people arrive from does: their windows never
+        -- overlap, so pointing at one is choosing it. Floating -- the
+        -- desktop, with no layout in charge and windows free to overlap --
+        -- is click-only: a window you are not using sits under the pointer
+        -- on the way to the one you want, and hovering it should not steal
+        -- the keyboard from what you were typing into.
         --
         --     focus = { modes = { floating = "follow", scrolling = "click" } },
         --
+        -- `the_shipped_focus_follows_the_pointer_in_tiling_and_scrolling_and_not_in_floating`
+        -- and `the_shipped_modes_each_hand_over_their_own_focus_model`.
         modes = {
             floating = "click",
+            tiling = "follow",
+            scrolling = "follow",
         },
 
         -- `click` and `follow` above, for every mode at once rather than one
