@@ -2506,12 +2506,19 @@ pub(crate) fn fit(
 /// it covers the rectangle, which is every stretched picture and every picture
 /// at rest.
 ///
-/// **The rectangle is rounded as [`fitted`] rounds a cut, and the picture
-/// inward**, so the strips end exactly where a cut picture would and reach
-/// under the picture's own edge by up to a pixel rather than stopping a pixel
-/// short of it: the background is drawn behind the client, so an overlap is
-/// hidden by it, and a gap would be a line of whatever is behind the window.
+/// **The rectangle is rounded as [`fitted`] rounds a cut, and the picture as
+/// smithay rounds a surface** -- its corner and its size each to the nearest
+/// pixel -- to decide which sides it reaches, so a picture that covers its
+/// rectangle leaves no strip at any output scale, nor does one a rounding
+/// short of it: a window at rest draws nothing extra.
 /// `tests::the_background_fills_what_the_picture_leaves_uncovered`.
+///
+/// **On a side it does not reach, the strip ends under the picture's edge,
+/// rounded inward**, by up to a pixel, rather than stopping a pixel short of
+/// it: the background is drawn behind the client, so an overlap is hidden by
+/// it, and a gap would be a line of whatever is behind the window. Each
+/// strip is clamped to the rectangle, so a picture less than a pixel tall
+/// makes no strip of negative size (#125's `524x1`, zoomed).
 pub(crate) fn uncovered(
     client: Rectangle<f64, Logical>,
     origin: Point<f64, Logical>,
@@ -2522,17 +2529,43 @@ pub(crate) fn uncovered(
         client.loc.to_physical_precise_round(scale),
         client.size.to_physical_precise_round(scale),
     );
-    let drawn: Rectangle<i32, Physical> = Rectangle::new(origin, picture)
-        .to_physical(scale)
-        .to_i32_down();
+    let drawn: Rectangle<i32, Physical> = Rectangle::new(
+        origin.to_physical_precise_round(scale),
+        picture.to_physical_precise_round(scale),
+    );
     let nothing = Rectangle::new(room.loc, Size::default());
     let Some(covered) = room.intersection(drawn) else {
         return [room, nothing, nothing, nothing];
     };
     let (left, top) = (room.loc.x, room.loc.y);
     let (right, bottom) = (left + room.size.w, top + room.size.h);
-    let (inner_left, inner_top) = (covered.loc.x, covered.loc.y);
-    let (inner_right, inner_bottom) = (inner_left + covered.size.w, inner_top + covered.size.h);
+    let exact = Rectangle::new(origin, picture).to_physical(scale);
+    let near = exact.loc.to_i32_ceil::<i32>();
+    let far = (exact.loc + exact.size).to_i32_floor::<i32>();
+    let (inner_left, inner_top) = (
+        if covered.loc.x > left {
+            near.x.clamp(left, right)
+        } else {
+            left
+        },
+        if covered.loc.y > top {
+            near.y.clamp(top, bottom)
+        } else {
+            top
+        },
+    );
+    let (inner_right, inner_bottom) = (
+        if covered.loc.x + covered.size.w < right {
+            far.x.clamp(inner_left, right)
+        } else {
+            right
+        },
+        if covered.loc.y + covered.size.h < bottom {
+            far.y.clamp(inner_top, bottom)
+        } else {
+            bottom
+        },
+    );
     [
         Rectangle::from_extremities((left, top), (right, inner_top)),
         Rectangle::from_extremities((left, inner_bottom), (right, bottom)),
@@ -3936,11 +3969,20 @@ mod tests {
                 ],
                 "anchored right and top: the left strip and the band below"
             );
-            assert!(
-                uncovered(client, client.loc, client.size, 1.0)
-                    .iter()
-                    .all(|strip| strip.size.w == 0 || strip.size.h == 0),
-                "a picture that covers its rectangle leaves nothing"
+            for scale in [1.0, 1.25, 1.5, 2.0] {
+                assert!(
+                    uncovered(client, client.loc, client.size, scale)
+                        .iter()
+                        .all(|strip| strip.size.w == 0 || strip.size.h == 0),
+                    "a picture that covers its rectangle leaves nothing, at {scale}x"
+                );
+            }
+            assert_eq!(
+                uncovered(client, client.loc, (599.7, 400.0).into(), 1.25)[3]
+                    .size
+                    .w,
+                0,
+                "nor one a rounding short of it"
             );
             assert_eq!(
                 uncovered(client, (900.0, 50.0).into(), (100.0, 100.0).into(), 1.0)[0],
@@ -3951,6 +3993,17 @@ mod tests {
                 uncovered(client, (300.25, 50.0).into(), (399.5, 400.0).into(), 2.0)[2],
                 physical(200, 100, 401, 800),
                 "at 2x, a fractional picture: the strip reaches its first whole pixel"
+            );
+            assert_eq!(
+                uncovered(client, (100.0, 50.2).into(), (600.0, 0.5).into(), 1.0),
+                [
+                    physical(100, 50, 600, 0),
+                    physical(100, 50, 600, 400),
+                    physical(100, 50, 0, 0),
+                    physical(700, 50, 0, 0),
+                ],
+                "a picture less than a pixel tall: the band below is all of it, and \
+                 no strip has a negative size"
             );
         }
 
