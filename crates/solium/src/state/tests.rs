@@ -20740,24 +20740,52 @@ end)
             }
 
             /// **A mode the configuration names nowhere gets the machine's
-            /// own answer, not the mode before it.** A `user.lua` written
-            /// for the shipped file before #128 named only floating's
-            /// click-only; switching to tiling then kept it, because the
-            /// compositor read "not named" as "leave it as it is". On this
-            /// (desktop) profile the machine's answer is to follow.
-            /// Against `0ce2ab8` it fails: the pointer was not followed.
+            /// own answer, not the mode before it** -- for hover, and for
+            /// `after_close`, which goes back to the compositor's own rule,
+            /// the window under the pointer and then the topmost. A
+            /// `user.lua` written for the shipped file before #128 named only
+            /// floating's click-only; switching to tiling then kept it,
+            /// because the compositor read "not named" as "leave it as it
+            /// is". On this (desktop) profile the machine's answer is to
+            /// follow.
+            /// Against `0ce2ab8` it fails: the pointer was not followed. With
+            /// `after_close` kept when a mode names none (`if let Some(list) =
+            /// after_close { self.after_close = list }`) it fails at the last
+            /// assertion.
             #[test]
             fn a_mode_that_names_nothing_gets_the_machines_own_focus_not_the_last_modes() {
+                use crate::successor::Successor;
                 let mut desk = Desk::new();
                 start(
                     &mut desk,
-                    "tiling",
-                    "require(\"config\").focus.modes = { floating = \"click\" }",
+                    "floating",
+                    "local focus = require(\"config\").focus\n\
+                     focus.modes = { floating = \"click\" }\n\
+                     focus.after_close = { floating = { \"recent\" } }\n\
+                     require(\"tiling\")",
+                );
+                assert_eq!(
+                    (
+                        desk.state.profile.focus_follows_mouse,
+                        desk.state.after_close.clone()
+                    ),
+                    (false, vec![Successor::Recent]),
+                    "the premise: floating's own answers, at load"
+                );
+
+                assert!(
+                    desk.state.trigger("super+t"),
+                    "the layout key was not handled"
                 );
                 let machine = crate::input::profile::Profile::default();
                 assert_eq!(
                     desk.state.profile.focus_follows_mouse, machine.focus_follows_mouse,
                     "a mode named nowhere kept the last mode's focus model"
+                );
+                assert_eq!(
+                    desk.state.after_close,
+                    Successor::UNCONFIGURED.to_vec(),
+                    "a mode with no `after_close` kept the last mode's"
                 );
             }
         }
