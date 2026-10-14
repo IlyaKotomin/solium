@@ -1093,13 +1093,18 @@ local defaults = {
             -- Where a new diagonal starts once the next step would take a
             -- window past the edge of the work area, rather than clamping it
             -- back onto the last spot that fit. "corner", the default: the
-            -- work area's top-left plus one `cascade` step, and one
-            -- `cascade.x` further right each time that diagonal fills too.
-            -- "center": back at the middle, one `cascade.x` further right for
-            -- each time it has wrapped, so it never lands on the first
-            -- window. Anything else is read as "corner". Only when every spot
-            -- either way is taken -- a window as large as the work area has
-            -- only the one -- does a window land on another.
+            -- work area's top-left plus one `cascade` step -- down only as
+            -- far as a window nearly the work area's height leaves room
+            -- for -- and one `cascade.x` further right each time that
+            -- diagonal fills too. "center": back at the middle, one
+            -- `cascade.x` further right for each time it has wrapped, so it
+            -- never lands on the first window. Anything else is read as
+            -- "corner". Once those diagonals reach the right edge, or have no
+            -- room at all (a window nearly the work area's width), a new
+            -- window takes the first free spot of a `cascade` grid over the
+            -- work area, a row at a time from its top-left. Only when every
+            -- spot of that grid is taken -- a window as large as the work
+            -- area has only the one -- does a window land on another.
             wrap = "corner",
             -- A new window's share of its monitor's work area on each axis,
             -- when its application asked for no size of its own -- one that

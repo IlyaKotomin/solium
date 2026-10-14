@@ -385,25 +385,31 @@ end
 
 -- Where the `n`th new diagonal starts, once the one before would leave the
 -- work area (`placement.wrap`). "corner": the work area's top-left plus one
--- step, and one `step.x` further right for each diagonal after that.
+-- step, and one `step.x` further right for each diagonal after that; down by
+-- no more than the room the window leaves below it, so a window nearly as
+-- tall as the work area still gets these diagonals rather than none
+-- (`desktop_mode_windows_nearly_the_work_area_tall_get_spots_of_their_own`).
 -- "center": the centre, one `step.x` further right for each diagonal, so the
 -- first never starts on the first window. Either way each starts on a column
--- of its own, so no diagonal ever retraces another.
+-- of its own, so no two restarts retrace each other. One may still cross the
+-- diagonal the walk began on -- on a square work area the corner's first
+-- lies along the centre's -- and there the spots already held are `taken`
+-- and stepped past like any other.
 -- `desktop-placement-wrap-corner.lua`, `desktop-placement-wrap-center.lua`.
 local function restart(n, area, w, h, step, wrap)
     if wrap == "center" then
         local centre = centred(area, w, h)
         return { x = centre.x + step.x * n, y = centre.y }
     end
-    return { x = area.x + step.x * n, y = area.y + step.y }
+    return { x = area.x + step.x * n, y = area.y + math.min(step.y, math.floor(area.h - h)) }
 end
 
 -- The first spot from `start` that no window in `others` has taken: one
 -- `step` down and right at a time, and a new diagonal (`restart`) whenever
 -- the next step would take the window out of `area`, rather than clamping it
 -- back onto the last spot that fit (#240). Nil when even the next diagonal's
--- first spot does not fit: every spot this walk can reach is taken, which
--- for a window as large as the work area is every spot after the first.
+-- first spot does not fit: every spot this walk can reach is taken, and
+-- `grid_spot` looks further.
 --
 -- Finite without a cap: a step is a pixel or more on both axes
 -- (`placement_settings`), so every diagonal leaves the area, and each
@@ -425,6 +431,48 @@ local function free_spot(start, w, h, area, others, step, wrap)
         end
         spot = { x = spot.x + step.x, y = spot.y + step.y }
     end
+end
+
+-- The offsets along one axis of `grid_spot`'s grid, with `room` pixels to
+-- spare on it: 0, then one `stride` at a time while there is room, and
+-- `room` itself, the far edge, where the strides fall short of it.
+-- `desktop_mode_windows_nearly_the_work_area_wide_get_spots_of_their_own`.
+local function offsets(room, stride)
+    local out = {}
+    local at = 0
+    while at < room do
+        out[#out + 1] = at
+        at = at + stride
+    end
+    out[#out + 1] = room
+    return out
+end
+
+-- The first spot no window in `others` has taken on a grid of `step` laid
+-- over every spot where a `w` by `h` window fits in `area`, a row at a time
+-- from the top-left. The last resort once every diagonal `free_spot` starts
+-- is spent: a window nearly as wide as the work area leaves no room for a
+-- diagonal at all, and one nearly as tall leaves room for a single spot on
+-- each, so without it every window after the first few would land on
+-- another. Nil only when every spot of the grid is taken.
+--
+-- Finite and short: the grid is bounded by the work area, and a window takes
+-- at most two of its offsets on each axis (`taken` reaches half a step
+-- either way; the far edge may sit nearer than a step to the one before), so
+-- a free spot turns up within four checks a window.
+-- `desktop_mode_once_every_diagonal_is_spent_a_window_takes_a_free_spot_of_the_grid`,
+-- `desktop-placement-tall-and-wide.lua`.
+local function grid_spot(w, h, area, others, step)
+    local columns = offsets(math.floor(area.w - w), step.x)
+    for _, dy in ipairs(offsets(math.floor(area.h - h), step.y)) do
+        for _, dx in ipairs(columns) do
+            local spot = { x = area.x + dx, y = area.y + dy }
+            if not taken(spot, others, step) then
+                return spot
+            end
+        end
+    end
+    return nil
 end
 
 -- The window of `others` opened last: ids are handed out in order and never
@@ -476,12 +524,13 @@ end
 -- The policy only says where the walk starts: the centre ("center", and
 -- anything unknown), one step from the last window opened ("cascade"), or
 -- centred on the pointer ("pointer"). Every policy then steps past the spots
--- already taken, so no two new windows share one (#240). Until #240 the
+-- already taken (`free_spot`, then `grid_spot`), so no two new windows share
+-- one while the work area has a spot free (#240). Until #240 the
 -- "center" search stepped away from any window the new one *overlapped* --
 -- and at 60% of the work area a step of 32 pixels overlaps every time, so
 -- the search ran out at the bottom-right corner it was clamped into, and
 -- every window after the first landed there.
--- `desktop_mode_four_spawned_windows_step_down_by_cascade` and the
+-- `desktop_mode_ten_spawned_windows_step_by_cascade_and_wrap_at_the_edge` and the
 -- `desktop-placement-*.lua` scenarios.
 function floating.placement_for(window, area, others)
     local settings = placement_settings()
@@ -504,8 +553,11 @@ function floating.placement_for(window, area, others)
         start = centred(area, w, h)
     end
     local spot = free_spot(start, w, h, area, others, step, settings.wrap)
+        or grid_spot(w, h, area, others, step)
     if not spot then
-        -- Nowhere free: the start, kept inside the work area.
+        -- Nowhere free, which for a window as large as the work area is
+        -- every spot after the first: the start, kept inside the work area.
+        -- `desktop_mode_with_no_free_spot_a_window_lands_where_its_policy_starts`.
         return dialogs.within({ x = start.x, y = start.y, w = w, h = h }, area)
     end
     return { x = spot.x, y = spot.y, w = w, h = h }
