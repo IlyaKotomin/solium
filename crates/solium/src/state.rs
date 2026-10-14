@@ -1003,6 +1003,16 @@ struct Gesture {
     released: Option<Duration>,
 }
 
+/// What `Solium::memory_report` counts that the compositor holds itself.
+/// `tests::real_client::a_held_memo_is_in_the_memory_report`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Memory {
+    pub(crate) windows: usize,
+    pub(crate) lua_kb: usize,
+    /// Every held memo's bytes (`effect::memo::Memos::held_bytes`).
+    pub(crate) memos_kb: u64,
+}
+
 /// An edge drag in progress.
 ///
 /// Carries *positions* rather than deltas, on both of its paths. A layout sets
@@ -2109,7 +2119,21 @@ impl Solium {
         self.effects_ready()
     }
 
-    /// Raise a window and give it the keyboard.
+    /// What `memory_report` counts that the compositor holds itself: the
+    /// windows, the Lua heap and the held memos (Ruling F30: outside the
+    /// pool's free-list budget, so counted here, as `memos_kb`).
+    /// `tests::real_client::a_held_memo_is_in_the_memory_report`.
+    pub(crate) fn memory(&self) -> Memory {
+        Memory {
+            windows: self.panes.len(),
+            lua_kb: self
+                .scripts
+                .as_ref()
+                .map_or(0, |scripts| scripts.used_memory() / 1024),
+            memos_kb: self.memos.held_bytes() / 1024,
+        }
+    }
+
     /// Report what the compositor is holding, once a second, when asked.
     ///
     /// Enabled with `SOLIUM_MEMDIAG=1`. A leak hunt needs to know *which*
@@ -2153,14 +2177,13 @@ impl Solium {
         let focused_inside = self
             .focused_window()
             .map(|window| self.pointer_inside(&window));
+        let memory = self.memory();
         tracing::info!(
             pointer = format!("{pointer_at:?}"),
             focused_inside = format!("{focused_inside:?}"),
-            windows = self.panes.len(),
-            lua_kb = self
-                .scripts
-                .as_ref()
-                .map_or(0, |scripts| scripts.used_memory() / 1024),
+            windows = memory.windows,
+            lua_kb = memory.lua_kb,
+            memos_kb = memory.memos_kb,
             rss_kb,
             "MEMDIAG"
         );

@@ -11628,6 +11628,23 @@ end)"#,
         assert!(!fixture.state.redraw);
     }
 
+    /// **A held memo is in the memory report** (Ruling F30): memos are held
+    /// outside the pool's free-list budget, so `memory_report` counts them
+    /// itself, as `memos_kb`.
+    #[test]
+    fn a_held_memo_is_in_the_memory_report() {
+        fx2_fixture!(fixture, "memo-memory");
+        assert_eq!(fixture.state.memory().memos_kb, 0, "no memo held");
+        translucent_window(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur" } }"#,
+        );
+        let _slots = resolved(&mut fixture);
+        let held = fixture.state.memos.held_bytes();
+        assert!(held > 1024, "the premise: a monitor's memo is held");
+        assert_eq!(fixture.state.memory().memos_kb, held / 1024);
+    }
 
     /// **Two windows with one blur want one memo.**
     #[test]
