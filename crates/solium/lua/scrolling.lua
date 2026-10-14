@@ -22,6 +22,7 @@ local monitors = require("monitors")
 local dialogs = require("dialogs")
 local sizes = require("sizes")
 local direction = require("direction")
+local follow = require("follow")
 
 -- `views` is the arrangement, one strip per desk (see `view_for`), and
 -- `sol.keep` holds it so that it outlives `super+shift+r`: a reload is a change
@@ -531,14 +532,25 @@ sol.on("scroll", function(_, dy)
     settle(config.scrolling.snap)
 end)
 
-local function bind(combo, action)
+-- A key the strip handles, on the active monitor's strip. One that `moves`
+-- the focused window -- a column moved, a window pushed out of its column --
+-- keeps the keyboard on it, so no `focus` takes the pointer along: it goes
+-- after the window here instead, as a move by direction does in
+-- `direction.lua`, by `focus.cursor.follows.move` (#220). A key that only
+-- resizes, such as `super+r`, takes it nowhere.
+-- `in_scrolling_a_key_takes_the_pointer_along_only_if_it_moves_the_keyboard_or_its_window`.
+local function bind(combo, action, moves)
     sol.bind(combo, function()
         if not scrolling.active then
             return
         end
         local active = monitors.active()
-        action(view_for(active and active.name), active and active.name)
+        local view = view_for(active and active.name)
+        action(view, active and active.name)
         settle(config.scrolling.snap)
+        if moves then
+            follow.window(view:focused(), "move")
+        end
     end)
 end
 
@@ -547,14 +559,14 @@ sol.bind("super+s", scrolling.toggle)
 -- Move between columns, and within one.
 bind("super+bracketleft", function(view, on) view:focus_sideways(-1, options(on)) end)
 bind("super+bracketright", function(view, on) view:focus_sideways(1, options(on)) end)
-bind("super+ctrl+bracketleft", function(view, on) view:move_column(-1, options(on)) end)
-bind("super+ctrl+bracketright", function(view, on) view:move_column(1, options(on)) end)
+bind("super+ctrl+bracketleft", function(view, on) view:move_column(-1, options(on)) end, true)
+bind("super+ctrl+bracketright", function(view, on) view:move_column(1, options(on)) end, true)
 bind("super+shift+bracketleft", function(view) view:focus_vertically(-1) end)
 bind("super+shift+bracketright", function(view) view:focus_vertically(1) end)
 
 -- Stack a window into this column, or push it back out into its own.
 bind("super+comma", function(view) view:consume() end)
-bind("super+period", function(view, on) view:expel(options(on)) end)
+bind("super+period", function(view, on) view:expel(options(on)) end, true)
 
 -- Cycle the column through the preset widths.
 bind("super+r", function(view, on) view:cycle_width(options(on)) end)

@@ -855,7 +855,11 @@ impl Solium {
             )
         });
         match offer {
-            FirstFocus::Focus => self.focus_window(window, SERIAL_COUNTER.next_serial()),
+            FirstFocus::Focus => self.focus_window(
+                window,
+                SERIAL_COUNTER.next_serial(),
+                crate::script::FocusSource::Open,
+            ),
             FirstFocus::Stay => tracing::debug!(
                 pane = pane.get(),
                 "a window opened where nobody can see it, and the keyboard stayed put"

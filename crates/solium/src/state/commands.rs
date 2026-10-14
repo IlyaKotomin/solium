@@ -277,12 +277,25 @@ impl Solium {
                     // why `clear` reports at all.
                     let _ = present::clear(pane, outer, now, animation.duration, animation.easing);
                 }
-                Command::Focus { id } => {
+                Command::Focus { id, source, warp } => {
                     if let Some(window) = self.window_by_id(id) {
                         tracing::debug!(id, title = self.window_title(&window), "script focused");
-                        self.focus_window(&window, SERIAL_COUNTER.next_serial());
+                        self.focus_window(&window, SERIAL_COUNTER.next_serial(), source);
+                        // Carried out with the dispatch's other warps, below:
+                        // behind the lock, where the focus was refused, the
+                        // warp is refused too.
+                        // `real_client::follow::sol_focus_with_a_warp_takes_the_pointer_to_the_window_it_focuses`,
+                        // `real_client::lock_focus::no_warp_moves_the_pointer_behind_the_lock`.
+                        if warp.is_some() {
+                            self.warp_asked = warp;
+                        }
                     }
                 }
+                // Carried out once the whole dispatch is applied, below, so a
+                // window placed after it in the same batch is warped to where
+                // it was placed.
+                // `real_client::follow::a_warp_goes_where_the_window_was_moved_in_the_same_handler`.
+                Command::Warp(warp) => self.warp_asked = Some(warp),
                 // The client's own requests, made for it, so a key sends a
                 // window fullscreen exactly as the window asking would. See
                 // `a_script_toggles_fullscreen_and_maximised_as_the_client_would`.
@@ -356,7 +369,8 @@ impl Solium {
                     attempt,
                     action,
                     data,
-                } => match self.act(&action, &data) {
+                    source,
+                } => match self.act(&action, &data, source) {
                     Ok(command) => {
                         self.apply(Outcome {
                             commands: vec![command],
@@ -657,6 +671,15 @@ impl Solium {
         // `real_client::reflow_on_close::hosted::a_property_a_layout_handler_writes_reflows_the_windows_against_the_reserve_it_moved`.
         if self.dispatching == 0 && self.scenes_to_settle {
             self.settle_scenes();
+        }
+        // A warp, once every command of the outermost dispatch is applied
+        // and every handler it ran has run: the window it names is where
+        // the layout has just put it (#220).
+        // `real_client::follow::a_warp_goes_where_the_window_was_moved_in_the_same_handler`.
+        if self.dispatching == 0
+            && let Some(warp) = self.warp_asked.take()
+        {
+            crate::input::warp::warp(self, warp);
         }
         self.tell_settled_attempts();
     }

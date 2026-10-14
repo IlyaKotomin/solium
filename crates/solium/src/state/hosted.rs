@@ -368,7 +368,12 @@ impl Solium {
     /// `state::tests::real_client::reflow_on_close::hosted::sol_act_on_a_window_still_loading_answers_unknown_window_but_closes_it`,
     /// `state::tests::real_client::reflow_on_close::hosted::windows_focus_from_a_scene_focuses_the_window`,
     /// `state::tests::real_client::lock_focus::sol_act_focus_behind_the_lock_is_answered_locked`.
-    pub(crate) fn act(&mut self, action: &str, data: &Json) -> Result<Command, &'static str> {
+    pub(crate) fn act(
+        &mut self,
+        action: &str,
+        data: &Json,
+        source: crate::script::FocusSource,
+    ) -> Result<Command, &'static str> {
         // Not a window action: `apps.launch { id }` names a desktop id, not a
         // window, and what it starts is `Command::Spawn` -- Solium's existing
         // spawn path (`launch.rs`, `state/open.rs::spawn`), so a launch from
@@ -460,18 +465,28 @@ impl Solium {
                 args: argv.collect(),
             });
         }
-        let make: fn(u64) -> Command = match action {
-            "windows.focus" => |id| Command::Focus { id },
-            "windows.close" => |id| Command::Close { id },
-            "windows.fullscreen" => |id| Command::ToggleFullscreen { id },
-            "windows.maximize" => |id| Command::ToggleMaximize { id },
+        // A window chip's focus is told with what the handler that acted was
+        // answering, `"surface"` for a scene's action (#220).
+        // `state::tests::real_client::follow::a_bar_chip_and_a_click_say_what_they_are_and_take_no_pointer_along`.
+        let make = |id| match action {
+            "windows.focus" => Command::Focus {
+                id,
+                source,
+                warp: None,
+            },
+            "windows.close" => Command::Close { id },
+            "windows.fullscreen" => Command::ToggleFullscreen { id },
+            _ => Command::ToggleMaximize { id },
+        };
+        match action {
+            "windows.focus" | "windows.close" | "windows.fullscreen" | "windows.maximize" => {}
             _ => {
                 if self.unknown_actions.insert(action.to_owned()) {
                     tracing::warn!(action, "sol.act: no such action");
                 }
                 return Err("unknown-action");
             }
-        };
+        }
         let id = data.get("id").and_then(Json::as_u64).ok_or("bad-data")?;
         let window = self.window_by_id(id);
         let there = if action == "windows.close" {

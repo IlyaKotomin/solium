@@ -825,6 +825,66 @@ local defaults = {
         --     focus = { follow = false },   -- never follow the pointer, in any mode
         --     focus = { click = false },    -- a mode must `sol.focus` its own clicks
         --
+
+        -- Where the pointer goes when the keyboard moves (#220).
+        --
+        -- Moving focus with the keys -- `super+arrows`, a workspace key, a
+        -- move -- would leave the pointer over the window you left. With this
+        -- it goes to the window that took the keyboard, and its picture
+        -- glides there along `motion`. The pointer itself is there at once,
+        -- so what it is over -- a hover, a click, the cursor's shape -- is
+        -- the new window's from the first instant. Moving the mouse while it
+        -- glides carries on as `interrupt` says, and a click that takes the
+        -- pointer along waits for the button to come up, so the click lands
+        -- where it was aimed. `lua/follow.lua` is the whole of the policy,
+        -- and `sol.warp` the compositor's part.
+        cursor = {
+            -- Which focus changes take the pointer along, by what moved the
+            -- keyboard: the `source` the `focus` event is told
+            -- (docs/modes.md). The keys do and the mouse does not: a click
+            -- or a bar's window chip is a hand already on the pointer, and a
+            -- window that opens is not somewhere you went.
+            follows = {
+                binding = true, -- any key binding: a workspace key, the overview's keys
+                direction = true, -- super+arrows and super+h/j/k/l
+                move = true, -- super+shift+arrows, scrolling's column moves: to where the window was moved
+                click = false, -- a press on a window, or on one in the overview
+                scroll = false, -- the wheel with super held
+                drop = false, -- a dragged window let go
+                touch = false, -- a touch on a window
+                hover = false, -- focus following the mouse
+                surface = false, -- a bar's window chip, the dock, a shell's search
+                open = false, -- a window opening
+                activate = false, -- an application bringing its window forward
+                settle = false, -- the window you were in went, and another took over
+                script = false, -- `sol.focus` from anything else
+            },
+            -- Where on the window: "center", or a share of its width and
+            -- height, as `{ x = 0.5, y = 0.25 }`.
+            to = "center",
+            -- How the picture travels there: milliseconds and an easing, as
+            -- every `motion` here, or `easing = "spring"`, which takes as
+            -- long as it takes. `false` puts it there at once.
+            motion = { duration = 260, easing = "outCubic" },
+            -- Where the mouse carries on from if it moves before the picture
+            -- lands: "pointer", from where the pointer already is -- the
+            -- picture jumps there, and with focus following the mouse the
+            -- window the key chose keeps the keyboard -- or "picture", from
+            -- where you see the picture, which may be over the window you
+            -- left.
+            interrupt = "pointer",
+            -- A key that focuses again the window that already has the
+            -- keyboard -- scrolling does after every key it binds, `super+r`
+            -- that only widens the column included -- takes the pointer to
+            -- it too when true. The keys that move the focused window take
+            -- it along by `follows.move` either way.
+            refocus = false,
+            -- A workspace switch that leaves no window to take the keyboard,
+            -- from a source above that takes the pointer along: "center" puts
+            -- the pointer in the middle of the monitor that switched, "stay"
+            -- leaves it where it is.
+            empty_workspace = "center",
+        },
     },
 
     -- Telling the rest of the session that Solium is its desktop.
@@ -1120,21 +1180,44 @@ local defaults = {
         -- `lua/floating.lua`; a dialog is never placed by this, since a modal
         -- is lifted out of any arrangement already (`dialogs.lua`).
         placement = {
-            -- "center", the default: the middle of the focused monitor's
-            -- work area, offset by `cascade` for every window already there
-            -- it would otherwise sit on top of -- so a second and third
-            -- window land in a row rather than in a stack nobody can
-            -- separate. "cascade": always offset from the last window
-            -- opened, centred or not. "pointer": centred on the pointer
-            -- instead of the monitor. Anything else is read as "center".
+            -- Where a new window goes. "center", the default: the middle
+            -- of the focused monitor's work area. "cascade": one `cascade`
+            -- step from the last window opened, wherever it is now; the
+            -- middle when there is none. "pointer": centred on the pointer,
+            -- kept inside the work area. Anything else is read as "center".
+            --
+            -- Whichever it is, a new window never lands on a spot another
+            -- window already holds -- its top-left corner nearer than half a
+            -- `cascade` step on both axes -- but steps on by `cascade` until
+            -- it finds a free one: a row of new windows steps down and right
+            -- rather than piling up (#240).
             policy = "center",
+            -- How far each step goes, right and down, in logical pixels: a
+            -- number of 1 or more on each axis; anything else is read as 32.
             cascade = { x = 32, y = 32 },
+            -- Where a new diagonal starts once the next step would take a
+            -- window past the edge of the work area, rather than clamping it
+            -- back onto the last spot that fit. "corner", the default: the
+            -- work area's top-left plus one `cascade` step -- down only as
+            -- far as a window nearly the work area's height leaves room
+            -- for -- and one `cascade.x` further right each time that
+            -- diagonal fills too. "center": back at the middle, one
+            -- `cascade.x` further right for each time it has wrapped, so it
+            -- never lands on the first window. Anything else is read as
+            -- "corner". Once those diagonals reach the right edge, or have no
+            -- room at all (a window nearly the work area's width), a new
+            -- window takes the first free spot of a `cascade` grid over the
+            -- work area, a row at a time from its top-left. Only when every
+            -- spot of that grid is taken -- a window as large as the work
+            -- area has only the one -- does a window land on another.
+            wrap = "corner",
             -- A new window's share of its monitor's work area on each axis,
             -- when its application asked for no size of its own -- one that
             -- has not shown its first frame yet, which is every window
             -- `sol.spawn` opens (see `open` in docs/modes.md). Capped by the
             -- work area either way, and by the application's own minimum and
-            -- maximum once it has one (#115, `sizes.lua`).
+            -- maximum once it has one (#115, `sizes.lua`). A number above 0
+            -- and at most 1; anything else is read as 0.6.
             size = 0.6,
         },
     },
