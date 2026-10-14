@@ -9400,6 +9400,91 @@ end)"#,
         );
     }
 
+    /// **#233: a press on what an anchored picture cuts away is not the
+    /// client's.**
+    ///
+    /// A window under a titlebar has its top edge dragged down by 100. Its
+    /// client has not answered, so under the default fill its 300-tall
+    /// picture stays against the bottom edge, which is standing still, and
+    /// the top 100 of it is cut away -- under the titlebar that came down
+    /// with the edge. The hit test inverted the fit without its cut, so a
+    /// point on the titlebar landed in that hidden band and the client was
+    /// handed the pointer over pixels it is not showing. Below the cut the
+    /// press still lands on the pixel the picture has there.
+    #[test]
+    fn a_press_on_what_an_anchored_picture_cuts_away_is_not_the_clients() {
+        tiled_fixture!(display, state, conn, queue, client, qh);
+        let (window, _toplevel, surface) =
+            open_surface(&mut display, &mut state, &conn, &client, &qh);
+        state.map_stacked(window.clone(), (400, 300), false);
+        state.sync_panes();
+        let pane = state.panes.id_of(&window).expect("the pane is here");
+        state
+            .panes
+            .get_mut(pane)
+            .expect("the pane is here")
+            .set_frame(crate::pane::Frame::Pending);
+        commit_buffer(&client, &qh, &surface, 400, 300);
+        pump(
+            &mut display,
+            &mut state,
+            &conn,
+            &qh,
+            &mut queue,
+            &mut client,
+        );
+        state.clock.advance(Duration::from_secs(1));
+        a_frame(&mut state);
+        let toplevel = window
+            .toplevel()
+            .map(|toplevel| toplevel.wl_surface().clone());
+
+        let outer = at(400, 400 - TITLEBAR_HEIGHT, 400, 200 + TITLEBAR_HEIGHT);
+        let request = ResizeRequest {
+            window: window.clone(),
+            wanted: outer,
+            edge_at: (500.0, f64::from(400 - TITLEBAR_HEIGHT)),
+            edges: ResizeEdge::Top,
+        };
+        state.begin_resize(&window);
+        let now = state.clock.now();
+        tiled_frame(&mut state, &request, pane, outer, now);
+        assert_eq!(
+            state.resize_fill(pane),
+            crate::resizing::Fill::Anchor,
+            "the default fill"
+        );
+        assert_eq!(
+            state.resize_pins(pane),
+            (false, true),
+            "the top edge moves and the bottom stands still"
+        );
+
+        let titlebar: Point<f64, Logical> = (450.0, f64::from(400 - TITLEBAR_HEIGHT / 2)).into();
+        assert!(
+            state.drawn(pane, outer).covers(titlebar),
+            "the point is on the window's titlebar"
+        );
+        assert_ne!(
+            state.surface_under(titlebar).map(|(surface, _)| surface),
+            toplevel,
+            "the band of the picture under the titlebar is cut away, and a \
+             press there is not the client's"
+        );
+
+        let point: Point<f64, Logical> = (450.0, 450.0).into();
+        let (under, origin) = state
+            .surface_under(point)
+            .expect("the window is under the point");
+        assert_eq!(Some(under), toplevel);
+        let within = point - origin;
+        assert!(
+            (within.x - 50.0).abs() < 0.5 && (within.y - 150.0).abs() < 0.5,
+            "50 below the cut is buffer row 150 of the picture held against \
+             the bottom edge, and the client was told {within:?}"
+        );
+    }
+
     /// The work area every tiled-tree fixture in this module lays out over.
     fn tiled_area() -> solium_layout::Rect {
         solium_layout::Rect::new(0.0, 0.0, 1000.0, 600.0)
