@@ -225,9 +225,11 @@ const OWN_TABLES: [&str; 2] = ["xray", "memo"];
 
 /// `sol.effects`' options as a [`Tree`], a number that is not finite kept
 /// where [`Tree::from_lua`] drops it (directly under `effects`, in
-/// [`TABLES`] and in [`OWN_TABLES`]), so `load_ms = 1/0` is refused for its
-/// bounds rather than read as the default, and `memo = { budget_mib = 1/0 }`
-/// is refused rather than read as no cap.
+/// [`TABLES`], and in [`OWN_TABLES`] and their lists), so `load_ms = 1/0`
+/// is refused for its bounds rather than read as the default,
+/// `memo = { budget_mib = 1/0 }` is refused rather than read as no cap, and
+/// `xray = { layers = { "background", 0/0 } }` is refused rather than read
+/// as the wallpaper alone.
 /// `tests::the_engines_keys_read_with_their_defaults_and_bounds`,
 /// `script::tests::sol_effects_reads_xray_and_memo`.
 pub(crate) fn tree_of(options: &mlua::Table) -> mlua::Result<Tree> {
@@ -243,10 +245,40 @@ pub(crate) fn tree_of(options: &mlua::Table) -> mlua::Result<Tree> {
                 && let Some(Tree::Table { fields, .. }) = fields.get_mut(table)
             {
                 keep_non_finite(&inner, fields)?;
+                if OWN_TABLES.contains(&table) {
+                    keep_non_finite_items(&inner, fields)?;
+                }
             }
         }
     }
     Ok(tree)
+}
+
+/// Every list under a named key of `table` read again with its numbers
+/// that are not finite kept in their places, where [`Tree::from_lua`]
+/// drops them.
+/// `script::tests::sol_effects_reads_xray_and_memo`.
+fn keep_non_finite_items(
+    table: &mlua::Table,
+    fields: &mut std::collections::BTreeMap<String, Tree>,
+) -> mlua::Result<()> {
+    for (key, value) in fields.iter_mut() {
+        if let Tree::Table { list, .. } = value
+            && let Ok(mlua::Value::Table(items)) = table.raw_get::<mlua::Value>(key.as_str())
+        {
+            let mut kept = Vec::new();
+            for item in items.sequence_values::<mlua::Value>() {
+                match item? {
+                    mlua::Value::Number(number) if !number.is_finite() => {
+                        kept.push(Tree::Number(number));
+                    }
+                    item => kept.extend(Tree::from_lua(&item)?),
+                }
+            }
+            *list = kept;
+        }
+    }
+    Ok(())
 }
 
 /// Every named number of `table` that is not finite, into `fields`.

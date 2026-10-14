@@ -178,14 +178,19 @@ pub(crate) fn parse(tree: &Tree) -> Result<XrayConfig, String> {
 }
 
 /// `effects.xray.layers`: a list of words, nothing named beside them, so a
-/// table of names is refused rather than read as no layers.
+/// table of names is refused rather than read as no layers; and
+/// `"background"` among them, since every cut holds the wallpaper: no
+/// layers would turn every T2 effect off unsaid (a rule's `effect = false`
+/// says it), and `"bottom"` alone would hand a window the wallpaper anyway
+/// and a part on `bottom` nothing.
 /// `tests::effects_xray_refuses_what_is_not_its_shape`.
 fn layers(value: &Tree) -> Result<Vec<XrayLayer>, String> {
     let list = match value {
         Tree::Table { list, fields } if fields.is_empty() => list,
         _ => return Err("`effects.xray.layers` is a list of words".to_owned()),
     };
-    list.iter()
+    let layers: Vec<XrayLayer> = list
+        .iter()
         .map(|word| match word {
             Tree::Text(word) if word == "background" => Ok(XrayLayer::Background),
             Tree::Text(word) if word == "bottom" => Ok(XrayLayer::Bottom),
@@ -194,12 +199,22 @@ fn layers(value: &Tree) -> Result<Vec<XrayLayer>, String> {
             )),
             _ => Err("`effects.xray.layers` is a list of words".to_owned()),
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+    if !layers.contains(&XrayLayer::Background) {
+        return Err(
+            "`effects.xray.layers` holds \"background\", alone or with \"bottom\"".to_owned(),
+        );
+    }
+    Ok(layers)
 }
 
 impl XrayConfig {
     /// The cut a part on `band` reads: the configured layers strictly below
     /// it, or none. `tests::a_part_reads_the_xray_layers_strictly_below_its_band`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Task 44's build_slots gives each T2 slot its cut")
+    )]
     pub(crate) fn cut_below(&self, band: Band) -> Option<Cut> {
         let has = |layer| self.layers.contains(&layer);
         match band {
@@ -489,7 +504,10 @@ mod tests {
     /// whole `keep_ms` Lua holds as a float (`1e4`) is read; anything else
     /// is refused naming the key, a number that is not finite included (as
     /// `settings::tree_of` keeps it), a `layers` table with names in it
-    /// rather than read as no layers, and a misspelt key with the nearest.
+    /// rather than read as no layers, a `layers` without `"background"`
+    /// (none at all would turn every T2 effect off unsaid, and `bottom`
+    /// alone would hand windows the wallpaper anyway and a part on `bottom`
+    /// nothing), and a misspelt key with the nearest.
     #[test]
     fn effects_xray_refuses_what_is_not_its_shape() {
         use crate::effect::tree::Tree;
@@ -532,6 +550,14 @@ mod tests {
             (
                 "{ layers = { 1 } }",
                 "`effects.xray.layers` is a list of words",
+            ),
+            (
+                "{ layers = {} }",
+                "`effects.xray.layers` holds \"background\"",
+            ),
+            (
+                "{ layers = { 'bottom' } }",
+                "`effects.xray.layers` holds \"background\"",
             ),
             ("{ scale = 'half' }", "`effects.xray.scale` is a number"),
             (

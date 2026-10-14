@@ -1392,8 +1392,9 @@ local defaults = {
         -- that changes `sandbox`. A deform may say either for itself.
         present = { failed = "flat", on_reload = "flat" },
         -- What T2 effects read as the backdrop: a sharp picture of these
-        -- layers, per monitor, rebuilt only when it changes. "bottom" adds
-        -- desktop widgets, at the cost of a rebuild each time one repaints.
+        -- layers, per monitor, rebuilt only when it changes. It always holds
+        -- "background"; "bottom" beside it adds desktop widgets, at the cost
+        -- of a rebuild each time one repaints.
         -- `scale = 0.5` builds it at half resolution for good (0.25 to 1). A
         -- picture nothing reads is kept `keep_ms` (0 to 60000) before it is
         -- given back. A window across two monitors reads each monitor's
