@@ -1,13 +1,16 @@
 //! What a slot keeps from one pass to the next: its part's capture, its
 //! chain's targets, the id and commit its result is drawn with, and the
-//! params it last ran at (Ruling 16). Kept on `Solium`, swept once a pass, so
-//! a slot no rule wants any more gives its targets back.
-//! `tests::a_slot_no_rule_wanted_this_pass_is_dropped`.
+//! params it last ran at (Ruling 16), and for a T2 slot one result per
+//! monitor (Ruling F30). Kept on `Solium`, swept once a pass, so a slot no
+//! rule wants any more gives its targets back.
+//! `tests::a_slot_no_rule_wanted_this_pass_is_dropped`,
+//! `tests::a_t2_suffix_reruns_only_when_its_key_moves`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use smithay::backend::renderer::{element::Id, gles::GlesTexture, utils::CommitCounter};
 
+use super::memo::T2Key;
 use super::plan::Owner;
 use super::rules::{RuleKey, Slot};
 
@@ -38,6 +41,10 @@ pub(crate) struct SlotState {
     size: Option<(u32, u32)>,
     /// The pass this slot was last wanted in.
     pub(crate) seen: u64,
+    /// A T2 slot's result on each monitor its part's padded box overlaps, by
+    /// the monitor's name (Ruling F30).
+    /// `tests::a_t2_suffix_reruns_only_when_its_key_moves`.
+    pub(crate) t2: BTreeMap<String, T2State>,
 }
 
 impl SlotState {
@@ -54,7 +61,18 @@ impl SlotState {
             params: 0,
             size: None,
             seen: 0,
+            t2: BTreeMap::new(),
         }
+    }
+
+    /// The T2 result on `monitor`, made on first use.
+    /// `tests::a_t2_suffix_reruns_only_when_its_key_moves`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Task 44 runs each monitor's T2 suffix")
+    )]
+    pub(crate) fn t2_mut(&mut self, monitor: &str) -> &mut T2State {
+        self.t2.entry(monitor.to_owned()).or_default()
     }
 
     /// Whether the chain must run this pass: it never has, its self input
@@ -88,11 +106,58 @@ impl SlotState {
         commit
     }
 
-    /// Give the capture's target and the chain's back.
+    /// Give the capture's target, the chain's and each monitor's T2
+    /// result's back: what a sweep and a new rule in the slot do.
     /// `tests::a_slot_no_rule_wanted_this_pass_is_dropped`.
     fn release(mut self, pool: &mut crate::pool::Pool) {
         self.input.release(pool);
         self.held.release(pool);
+        for t2 in self.t2.values_mut() {
+            t2.held.release(pool);
+        }
+    }
+}
+
+/// One monitor's T2 result for a slot (Ruling F30): the key its suffix last
+/// ran at, its targets, and the id, commit and placement its result is
+/// drawn with there. `tests::a_t2_suffix_reruns_only_when_its_key_moves`.
+#[expect(
+    dead_code,
+    reason = "Task 44 places each monitor's T2 result with its id, commit and placement"
+)]
+#[derive(Debug)]
+pub(crate) struct T2State {
+    pub(crate) key: Option<T2Key>,
+    pub(crate) held: super::run::Held,
+    pub(crate) id: Id,
+    pub(crate) commit: CommitCounter,
+    pub(crate) placed: Option<super::element::Placement>,
+}
+
+/// Never run, with an id of its own.
+/// `tests::a_t2_suffix_reruns_only_when_its_key_moves`.
+impl Default for T2State {
+    fn default() -> Self {
+        Self {
+            key: None,
+            held: super::run::Held::default(),
+            id: Id::new(),
+            commit: CommitCounter::default(),
+            placed: None,
+        }
+    }
+}
+
+impl T2State {
+    /// Whether the suffix must run: it never has (or its last run left no
+    /// result, Task 44), or its key moved.
+    /// `tests::a_t2_suffix_reruns_only_when_its_key_moves`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Task 44 runs each monitor's T2 suffix")
+    )]
+    pub(crate) fn needs_run(&self, key: T2Key) -> bool {
+        self.key != Some(key)
     }
 }
 
@@ -352,6 +417,39 @@ mod tests {
             assert!(slot.needs_run(true, 7, (100, 80)));
             slot.ran(7, (100, 80));
         }
+    }
+
+    /// **A T2 suffix re-runs only when its key moves**, per monitor; never
+    /// run, it runs.
+    #[test]
+    fn a_t2_suffix_reruns_only_when_its_key_moves() {
+        let mut state = slot();
+        let key = crate::effect::memo::T2Key {
+            memo: 1,
+            xray: 1,
+            padded: smithay::utils::Rectangle::new((0, 0).into(), (10, 10).into()),
+            params: 0,
+            shape: 0,
+            own: None,
+        };
+        assert!(state.t2_mut("DP-1").needs_run(key));
+        state.t2_mut("DP-1").key = Some(key);
+        assert!(!state.t2_mut("DP-1").needs_run(key));
+        assert!(
+            state
+                .t2_mut("DP-1")
+                .needs_run(crate::effect::memo::T2Key { memo: 2, ..key })
+        );
+        assert!(
+            state
+                .t2_mut("DP-1")
+                .needs_run(crate::effect::memo::T2Key { xray: 2, ..key }),
+            "a redrawn xray with no memo read"
+        );
+        assert!(
+            state.t2_mut("DP-2").needs_run(key),
+            "another monitor's result is its own"
+        );
     }
 
     /// **Drawn tells an input redrawn this pass from one kept**, and gives

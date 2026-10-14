@@ -20,23 +20,54 @@ use smithay::utils::{Buffer, Physical, Rectangle, Scale, Transform};
 use solium_effects::fragment::{Corners, MASK_RADII_UNIFORM, MASK_RECT_UNIFORM, MASK_SIZE_UNIFORM};
 
 /// Where and how a result is placed: its padded box on the output, the
-/// part's mask in that box's physical pixels from its corner, and the part's
-/// alpha. `tests::the_mask_is_measured_in_the_placements_own_pixels`.
+/// part's mask in that box's physical pixels from its corner, the part's
+/// alpha, and the part of the texture drawn (`crop`, in its pixels; `None`
+/// draws it whole). `tests::the_mask_is_measured_in_the_placements_own_pixels`,
+/// `tests::a_cropped_placement_draws_only_its_crop`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Placement {
     pub(crate) dst: Rectangle<i32, Physical>,
     pub(crate) mask: Option<(Rectangle<f64, Physical>, Corners)>,
     pub(crate) alpha: f32,
+    pub(crate) crop: Option<Rectangle<f64, Buffer>>,
 }
 
 impl Placement {
+    /// The whole texture at `dst`, cut by `mask`, at `alpha`.
+    /// `tests::a_cropped_placement_draws_only_its_crop`.
     pub(crate) fn of(
         dst: Rectangle<i32, Physical>,
         mask: Option<(Rectangle<f64, Physical>, Corners)>,
         alpha: f32,
     ) -> Self {
-        Self { dst, mask, alpha }
+        Self {
+            dst,
+            mask,
+            alpha,
+            crop: None,
+        }
     }
+
+    /// The same placement drawing only `crop` of its texture: a memo,
+    /// cropped to one part's padded box. `tests::a_cropped_placement_draws_only_its_crop`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Task 44 places a memo cropped to each part")
+    )]
+    pub(crate) fn cropped(self, crop: Rectangle<f64, Buffer>) -> Self {
+        Self {
+            crop: Some(crop),
+            ..self
+        }
+    }
+}
+
+/// What of a `size` texture a placement draws: its crop, or the whole
+/// texture. `tests::a_cropped_placement_draws_only_its_crop`.
+fn src_of(placement: Placement, size: (i32, i32)) -> Rectangle<f64, Buffer> {
+    placement
+        .crop
+        .unwrap_or_else(|| Rectangle::from_size((f64::from(size.0), f64::from(size.1)).into()))
 }
 
 /// The commit after this placement: moved when the chain re-ran or the
@@ -151,7 +182,7 @@ impl Element for EffectElement {
 
     fn src(&self) -> Rectangle<f64, Buffer> {
         let size = self.texture.size();
-        Rectangle::from_size((f64::from(size.w), f64::from(size.h)).into())
+        src_of(self.placement, (size.w, size.h))
     }
 
     fn geometry(&self, _scale: Scale<f64>) -> Rectangle<i32, Physical> {
@@ -295,5 +326,35 @@ mod tests {
     fn with_no_mask_the_result_is_drawn_whole() {
         let placement = Placement::of(Rectangle::from_size((64, 32).into()), None, 0.5);
         assert_eq!(super::mask_uniforms(placement), None);
+    }
+
+    /// **A cropped placement draws only its crop**: `src` is the crop, and
+    /// with none it is the whole texture, as before.
+    #[test]
+    fn a_cropped_placement_draws_only_its_crop() {
+        let dst = Rectangle::new((0, 0).into(), (100, 40).into());
+        let plain = Placement::of(dst, None, 1.0);
+        assert_eq!(plain.crop, None);
+        let crop = Rectangle::new((200.0, 120.0).into(), (100.0, 40.0).into());
+        let cropped = plain.cropped(crop);
+        assert_eq!(super::src_of(cropped, (2560, 1440)), crop);
+        assert_eq!(
+            super::src_of(plain, (2560, 1440)),
+            Rectangle::from_size((2560.0, 1440.0).into())
+        );
+    }
+
+    /// **A moved crop moves the commit**, so the damage under a window that
+    /// moves over a memo is redrawn; an unmoved one keeps it.
+    #[test]
+    fn a_moved_crop_moves_the_commit() {
+        let dst = Rectangle::new((0, 0).into(), (100, 40).into());
+        let a = Placement::of(dst, None, 1.0)
+            .cropped(Rectangle::new((0.0, 0.0).into(), (100.0, 40.0).into()));
+        let b = a.cropped(Rectangle::new((4.0, 0.0).into(), (100.0, 40.0).into()));
+        let mut commit = CommitCounter::default();
+        let first = super::commit_for(&mut commit, None, a, false);
+        assert_eq!(super::commit_for(&mut commit, Some(a), a, false), first);
+        assert_ne!(super::commit_for(&mut commit, Some(a), b, false), first);
     }
 }

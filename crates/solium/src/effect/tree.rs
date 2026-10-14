@@ -102,12 +102,14 @@ impl Tree {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use solium_effects::spec::Value;
 
     use super::Tree;
 
-    fn tree(lua: &str) -> Option<Tree> {
+    /// `lua`, evaluated, as a [`Tree`]: what a test of a key's `parse`
+    /// reads (`effect::memo::tests::effects_memo_is_read_and_checked`).
+    pub(crate) fn tree(lua: &str) -> Option<Tree> {
         let state = mlua::Lua::new();
         let value: mlua::Value = state.load(lua).eval().expect("the test's Lua");
         Tree::from_lua(&value).expect("readable")

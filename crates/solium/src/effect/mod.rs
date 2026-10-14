@@ -11,6 +11,7 @@ pub(crate) mod geometry;
 pub(crate) mod gl;
 pub(crate) mod host;
 pub(crate) mod mask;
+pub(crate) mod memo;
 pub(crate) mod plan;
 pub(crate) mod rules;
 pub(crate) mod run;
@@ -19,6 +20,7 @@ pub(crate) mod settings;
 pub(crate) mod store;
 pub(crate) mod tree;
 pub(crate) mod watch;
+pub(crate) mod xray;
 
 /// So `super::pool` resolves the same in `effect/run.rs` here and in
 /// `dev/wirecheck`, which includes `pool.rs` beside it (Ruling 2).
