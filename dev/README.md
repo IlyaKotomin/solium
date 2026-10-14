@@ -417,7 +417,7 @@ that should not be.
 | `dev/present-check.sh` | a `pivot` is the point the matrix leaves alone, a raised window is drawn in front, clicks follow the rect a window is drawn at without following the `z` it is drawn above, a genie on a second monitor lands on its target, and a tilted window's menu is drawn whole and in front of it |
 | `dev/fence-check.sh` | skipping a capture's CPU fence wait (`SOLIUM_FENCE_WAIT=off`) changes no pixel |
 | `dev/pulse-control.sh [env…]` | the renderer is not frozen: a focused window in the `pulse` style moves in 150 ms |
-| `dev/effects-check.sh [section]…` | effects on screen, nested, one compositor per section, each judged beside `dev/pulse-control.sh`; `overlay` breaks the configuration and reloads it, and the problems overlay appears in the top-right corner while nothing else changes; `t0` draws a generated ring behind a window; `blur` blurs a video player's own pixels through a rule; `none` shows nothing captured and nothing run with no rules; `fail` shows every part drawn when every effect fails; `tilt` shows a blurred player still blurred while it tilts and while it genies; `genie` shows the `genie` folder drawing what the Rust genie draws, on one debug build |
+| `dev/effects-check.sh [section]…` | effects on screen, nested, one compositor per section, each judged beside `dev/pulse-control.sh`; `overlay` breaks the configuration and reloads it, and the problems overlay appears in the top-right corner while nothing else changes; `t0` draws a generated ring behind a window; `blur` blurs a video player's own pixels through a rule; `none` shows nothing captured and nothing run with no rules; `fail` shows every part drawn when every effect fails; `tilt` shows a blurred player still blurred while it tilts and while it genies; `genie` shows the `genie` folder drawing what the Rust genie draws, on one debug build; `xray` shows a terminal with the wallpaper blurred behind it, the xray built once at rest, and a plate's backdrop blurred in the first frame drawn |
 | `dev/install-check.sh [--no-build]` | `dev/install.sh` installs into a `DESTDIR` under `/tmp`: every file (the systemd units and the portal configuration included), the absolute `Exec`, the printed `sudo` lines, `--check` from the installed copy using its own `share/solium`, refusing while it runs (a session started during the build included), refusing to delete through a link, refusing `/` and a `DESTDIR` with a space, saying so when the check fails after the files are in place, keeping a unit or portal configuration of the user's own through an install and an uninstall, `solium-session` cleaning up after a stand-in Solium that crashed (and only then, and only once it has gone, and unsetting the variables after one that crashed before starting its target while no other desktop holds `graphical-session.target`) and refusing a second session while one runs, a reinstall saying when the login screen's session file is stale, and an uninstall that leaves nothing. `--no-check` skipping the installed binary's check. A system prefix (`--prefix /usr` and `/usr/local`): everything under the prefix and nothing in `XDG_CONFIG_HOME`, no `config.sha256` and no `sudo` line, `--session-dir` refused, and `--check` passing from the staged `/usr/share/solium` with a broken user configuration. The Fedora package: `dev/rpm/solium.spec`'s `%files` against that install both ways; its `License` naming every installed `.license`; each `Requires` and `Recommends` naming the package that has the file (the Qt QML modules the shipped QML imports with the Qt version clause, Xwayland, flock, xdg-desktop-portal and the backends `lilium-portals.conf` names, and foot); and the spec refusing to parse without `commit` and `commitdate`. See *Installing it* and *A Fedora package* |
 | `dev/rpm.sh [--jobs N] [--image IMAGE]` | the package built from the commit checked out, unpacked without installing, passes `solium --check` with an empty configuration and takes its QML and Lua from its own `usr/share/solium`. See *A Fedora package* |
 
@@ -581,6 +581,32 @@ window moved at all (below its rest, the 6 s frame differs from the 4 s
 one). It needs the `target/debug` binary: a release build has no oracle.
 Its fail-first is `GENIE_FAIL=1`, which gives the folder's run alone a
 spread of 1.5 against the oracle's 1.4: the frames differ.
+
+`xray` is FX3's first section, and its scene is the one later FX3 sections
+start from: `dev/effects-check/checker.qml`, a 64 px black and white checker
+declared on `background` (copied, with `veil.qml`, into the scene's
+configuration directory through `SECTION_QML`, where `sol.surface` finds a
+scene by its file name), a translucent kitty at (80, 80) 560x360 and the
+player beside it. With `BLUR` set, `xray.lua` puts the shipped blur behind
+the terminal (`slot = "behind"`, a T2 slot reading the wallpaper through the
+memo). The terminal's gradient energy below its line of text must fall to
+under half of the plain run's, the checker outside it must stay byte-equal,
+and the trace must show the xray built once and its memo run once while the
+player keeps the passes coming, and on every pass with
+`SOLIUM_XRAY_REBUILD=always`, the control. With `SOLIUM_CHECKER_PHASE=1` the
+checker moves 8 px a second, and the wallpaper must render once a pass on
+nine passes in ten of the last 3 s and never twice (`judge.py most`), with
+the rule as without it: the `scenes` phase renders it at the size `elements`
+asks for. `XRAY_SCALE=0.5` sets `effects.xray.scale`: there too a moving
+wallpaper renders once a pass and a still one is built once, since a cut
+draws a scene from the picture the frame draws, scaled down. Last, a dark
+plate on `top` (`VEIL=1`) from the start with the blur behind it: the first
+frame drawn that is not only the clear colour (`judge.py first_lit`) must
+already have the plate's backdrop blurred, as nothing may pop in after it.
+Its fail-firsts: the plain run judged against itself (nothing blurred), and
+a build whose xray asked a scene for the cut's own size, which renders a
+moving wallpaper up to three times a pass and builds a still one's cut on
+every pass.
 
 `clipboard-check.sh` runs its X11 half in a container, so the host needs no
 `xclip`. **Run it more than once.** The bug it was

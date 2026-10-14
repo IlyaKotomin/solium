@@ -28,12 +28,23 @@
   judge.py quiet FILE FIELD MS            exit 0 if no pass record within MS ms of
                                           the trace's last one (by t_ns) has FIELD
                                           non-zero
+  judge.py most FILE FIELD MS             print the number of pass records within MS
+                                          ms of the trace's last one (by t_ns), the
+                                          largest FIELD among them, and how many of
+                                          them have FIELD non-zero
+  judge.py first_lit DIR                  print the first capture in DIR (f-*, in
+                                          order) with any channel above 31, so not
+                                          only the clear colour (13, 13, 15) a held
+                                          first frame draws; nothing when none is
+  judge.py size A                         print the frame's width and height
 
 A region number is a fraction of the frame (0..1), so a check does not depend
 on the nested window's size, or pixels when it ends in `px` (`408px`), for a
 check against a window placed at a known rectangle.
 """
+import glob
 import json
+import os
 import sys
 
 
@@ -145,6 +156,22 @@ def main(argv):
         loud = [record for record in records if record["t_ns"] >= since and record.get(argv[3], 0)]
         print(f"{len(loud)} pass(es) with {argv[3]} in the last {argv[4]} ms")
         return 1 if loud else 0
+    if what == "most":
+        records = passes(argv[2])
+        since = records[-1]["t_ns"] - int(argv[4]) * 1_000_000 if records else 0
+        late = [record.get(argv[3], 0) for record in records if record["t_ns"] >= since]
+        print(len(late), max(late, default=0), sum(1 for value in late if value))
+        return 0
+    if what == "first_lit":
+        for path in sorted(glob.glob(os.path.join(argv[2], "f-*"))):
+            if max(read(path)[2]) > 31:
+                print(path)
+                return 0
+        return 1
+    if what == "size":
+        width, height, _data = read(argv[2])
+        print(width, height)
+        return 0
     print(__doc__)
     return 2
 

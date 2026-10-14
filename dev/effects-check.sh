@@ -36,6 +36,12 @@
 #             drawn through the `genie` folder's grid and, on the same debug
 #             build, through the Rust genie's (SOLIUM_GEOMETRY_ORACLE=genie):
 #             every channel of the two frames within 1
+#   xray      a translucent terminal with the wallpaper (a checker) blurred
+#             behind it, sharp outside; the xray built once and its memo run
+#             once at rest, and on every pass with SOLIUM_XRAY_REBUILD=always;
+#             a moving wallpaper rendered once a pass with the rule as
+#             without it, at effects.xray.scale 0.5 too; and a plate there
+#             from the start, its backdrop blurred in the first frame drawn
 #
 # The player is ffplay's testsrc2, or a kitty printing the time when ffplay is
 # missing.
@@ -74,17 +80,22 @@ trap stop EXIT
 # $here/<lua> copied to $out/<name>/init.lua as its whole configuration and
 # $out/<name>/config as its XDG_CONFIG_HOME, holding a copy of every effect
 # folder named in $SECTION_EFFECTS (space-separated paths) under
-# solium/effects/, as a user's would be. Sets $dir and $socket. The capture
-# knobs come in the extra environment.
+# solium/effects/, as a user's would be, and of every QML file named in
+# $SECTION_QML under solium/qml/, where `sol.surface` finds a scene by its
+# file name (the FX3 sections' checker.qml). Sets $dir and $socket. The
+# capture knobs come in the extra environment.
 run_scene() {
     local name="$1" lua="$2"
     shift 2
     dir="$out/$name"
-    mkdir -p "$dir/config/solium/effects"
+    mkdir -p "$dir/config/solium/effects" "$dir/config/solium/qml"
     cp "$here/$lua" "$dir/init.lua"
     local folder
     for folder in ${SECTION_EFFECTS:-}; do
         cp -R "$folder" "$dir/config/solium/effects/"
+    done
+    for folder in ${SECTION_QML:-}; do
+        cp "$folder" "$dir/config/solium/qml/"
     done
     rm -f "$dir"/f-*
     env SOLIUM_QML=software SOLIUM_LUA_INIT="$dir/init.lua" XDG_CONFIG_HOME="$dir/config" \
@@ -217,6 +228,16 @@ static_window() {
     WAYLAND_DISPLAY="$socket" kitty --config NONE --title effects-check-static -o "background=#3a6ea5" \
         -o cursor_blink_interval=0 -o confirm_os_window_close=0 -o font_size=14 \
         sh -c "printf '\033[?25leffects-check: sharp text\n'; exec sleep 600" >/dev/null 2>&1 &
+    echo "$!" >>"$pids"
+}
+
+# translucent_kitty <title>: a terminal with a dark, half-transparent
+# background, so what is behind it shows through, and no opaque region;
+# printing its title. The section's .lua places it.
+translucent_kitty() {
+    WAYLAND_DISPLAY="$socket" kitty --config NONE --title "$1" -o "background=#202028" \
+        -o background_opacity=0.5 -o cursor_blink_interval=0 -o confirm_os_window_close=0 \
+        -o font_size=14 sh -c "printf '\033[?25l$1\n'; exec sleep 600" >/dev/null 2>&1 &
     echo "$!" >>"$pids"
 }
 
@@ -400,7 +421,131 @@ section_genie() {
     fi
 }
 
-all=(overlay t0 blur none fail tilt genie)
+# xray  a translucent terminal with the wallpaper blurred behind it, the
+#       first FX3 effect (a T2 slot reading xray through the memo), and the
+#       wallpaper outside it untouched; the xray built once and its memo run
+#       once while a player keeps the passes coming, and on every pass with
+#       SOLIUM_XRAY_REBUILD=always. A moving wallpaper rendered once a pass
+#       with the rule, as without it, and at effects.xray.scale 0.5 too,
+#       where a still one is still built once. And a plate there from the
+#       start, its backdrop already blurred in the first frame drawn (spec
+#       C14: nothing pops in after it).
+section_xray() {
+    local name
+    for name in xray-off xray-on xray-always xray-anim-off xray-anim-on xray-half xray-half-anim; do
+        local extra=()
+        case "$name" in
+            xray-on) extra=(BLUR=1) ;;
+            xray-always) extra=(BLUR=1 SOLIUM_XRAY_REBUILD=always) ;;
+            xray-anim-off) extra=(SOLIUM_CHECKER_PHASE=1) ;;
+            xray-anim-on) extra=(BLUR=1 SOLIUM_CHECKER_PHASE=1) ;;
+            xray-half) extra=(BLUR=1 XRAY_SCALE=0.5) ;;
+            xray-half-anim) extra=(BLUR=1 XRAY_SCALE=0.5 SOLIUM_CHECKER_PHASE=1) ;;
+        esac
+        # A burst of two, because a single frame is written to the bare path
+        # and not beside it, where `wait_frames` counts; the first is judged.
+        SECTION_EFFECTS="$root/crates/solium/effects/blur" SECTION_QML="$here/checker.qml $here/veil.qml" \
+            run_scene "$name" xray.lua "${extra[@]}" SOLIUM_TRACE="$out/$name/trace.jsonl" \
+            SOLIUM_CAPTURE_AT=6000 SOLIUM_CAPTURE_FRAMES=2 SOLIUM_CAPTURE_INTERVAL=100 || return
+        translucent_kitty effects-check-xray
+        sleep 1.5
+        player effects-check-player
+        wait_frames 2 || return
+        stop
+    done
+    local off on half each
+    off="$(ls "$out/xray-off"/f-* | head -1)"
+    on="$(ls "$out/xray-on"/f-* | head -1)"
+    half="$(ls "$out/xray-half"/f-* | head -1)"
+    for each in "$off" "$on" "$half"; do
+        [[ "$(judge size "$each")" = "1600 900" ]] \
+            || { fail "xray: $each is $(judge size "$each"), not 1600x900, so nothing here can be judged"; return; }
+    done
+    # Gradient energy (`judge sharpness`), not `edges`: the checker's 64 px
+    # cells keep their plateaus through the blur, and `edges` sums each
+    # widened step to its height. Inside the terminal below its line of text,
+    # which is drawn sharp over the blur.
+    local sharp soft
+    sharp="$(judge sharpness "$off" 80px 130px 560px 310px)"
+    soft="$(judge sharpness "$on" 80px 130px 560px 310px)"
+    if (( soft * 2 < sharp )); then
+        pass "xray: the wallpaper behind the terminal fell from $sharp to $soft in gradient energy"
+    else
+        fail "xray: nothing blurred behind the terminal ($sharp -> $soft)"
+    fi
+    judge same "$off" "$on" 700px 500px 400px 200px >/dev/null \
+        && pass "xray: the wallpaper outside the terminal is untouched" \
+        || fail "xray: the blur reached past the terminal"
+    # A still wallpaper is captured into the xray once and kept: the
+    # capture is keyed on the scripted surface's element, so a wallpaper
+    # scene that were re-made each pass would be built every pass.
+    local passes builds runs forced
+    read -r passes builds < <(judge after "$out/xray-on/trace.jsonl" xray_builds)
+    read -r _ runs < <(judge after "$out/xray-on/trace.jsonl" memo_runs)
+    passes="${passes:-0}" builds="${builds:-0}" runs="${runs:-0}"
+    (( builds == 1 && runs == 1 && passes >= 100 )) \
+        && pass "xray: built once and blurred once in $passes passes" \
+        || fail "xray: built $builds times and blurred $runs times in $passes passes"
+    read -r passes forced < <(judge after "$out/xray-always/trace.jsonl" xray_builds)
+    passes="${passes:-0}" forced="${forced:-0}"
+    (( passes >= 100 && forced >= passes - 2 )) \
+        && pass "xray: SOLIUM_XRAY_REBUILD=always built it on $forced of $passes passes" \
+        || fail "xray: the control built it on $forced of $passes passes, so the count above proves nothing"
+    # The scenes phase renders a hosted scene at the size and scale
+    # `elements` asks for, and the xray draws it from that same picture,
+    # scaled down at effects.xray.scale 0.5: so a moving wallpaper is
+    # rendered once a pass with the rule as without it, and on nearly every
+    # pass, or "at most once" would prove nothing.
+    local most moved
+    for each in xray-anim-off xray-anim-on xray-half-anim; do
+        read -r passes most moved < <(judge most "$out/$each/trace.jsonl" rendered 3000)
+        passes="${passes:-0}" most="${most:-0}" moved="${moved:-0}"
+        (( passes >= 60 && most == 1 && moved * 10 >= passes * 9 )) \
+            && pass "$each: the moving wallpaper rendered once a pass, on $moved of the last $passes" \
+            || fail "$each: the wallpaper rendered up to $most times a pass, on $moved of the last $passes"
+    done
+    read -r passes builds < <(judge after "$out/xray-half/trace.jsonl" xray_builds)
+    passes="${passes:-0}" builds="${builds:-0}"
+    (( builds == 1 && passes >= 100 )) \
+        && pass "xray: at effects.xray.scale 0.5 a still wallpaper built once in $passes passes" \
+        || fail "xray: at effects.xray.scale 0.5 a still wallpaper built $builds times in $passes passes"
+    soft="$(judge sharpness "$half" 80px 130px 560px 310px)"
+    if (( soft * 2 < sharp )); then
+        pass "xray: at effects.xray.scale 0.5 the wallpaper behind the terminal fell from $sharp to $soft"
+    else
+        fail "xray: at effects.xray.scale 0.5 nothing blurred behind the terminal ($sharp -> $soft)"
+    fi
+
+    # The first frame drawn: a plate on `top` from the start, and the first
+    # four frames drawn captured; the first that is not only the clear colour
+    # (one the warm-up gate held) has the plate's backdrop blurred already.
+    for name in xray-first-off xray-first-on; do
+        local extra=(VEIL=1)
+        [[ "$name" = xray-first-on ]] && extra+=(BLUR=1)
+        SECTION_EFFECTS="$root/crates/solium/effects/blur" SECTION_QML="$here/checker.qml $here/veil.qml" \
+            run_scene "$name" xray.lua "${extra[@]}" \
+            SOLIUM_CAPTURE_AT=0 SOLIUM_CAPTURE_FRAMES=4 SOLIUM_CAPTURE_INTERVAL=1 || return
+        player effects-check-player
+        wait_frames 4 || return
+        stop
+    done
+    local first_off first_on
+    first_off="$(judge first_lit "$out/xray-first-off")"
+    first_on="$(judge first_lit "$out/xray-first-on")"
+    if [[ -z "$first_off" || -z "$first_on" ]]; then
+        fail "xray: no frame of the first four drawn showed anything (off: '$first_off', on: '$first_on')"
+        return
+    fi
+    sharp="$(judge sharpness "$first_off" 100px 460px 700px 340px)"
+    soft="$(judge sharpness "$first_on" 100px 460px 700px 340px)"
+    if (( soft * 2 < sharp )); then
+        pass "xray: the first frame drawn ($(basename "$first_on")) has the plate's backdrop blurred, $sharp -> $soft"
+    else
+        fail "xray: the first frame drawn ($(basename "$first_on")) has the plate's backdrop sharp, $sharp -> $soft"
+    fi
+}
+
+all=(overlay t0 blur none fail tilt genie xray)
 sections=("$@")
 [[ ${#sections[@]} -gt 0 ]] || sections=("${all[@]}")
 
