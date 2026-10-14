@@ -313,21 +313,21 @@ application with unsaved work puts up a dialog and stays. So:
 | event | sent | means |
 |---|---|---|
 | `closing(id)` | the moment a close is asked for -- the frame's button, `sol.close`, `super+q` -- as the window starts fading | reflow now, if you want to |
-| `close_landed(id)` | when the animation has played and the application is asked to go | reflow now, if you waited for the animation |
+| `close_landed(id)` | when the animation has played, the window has faded out, and the application has just been asked to go | reflow now, if you waited for the animation |
 | `refused(id)` | when the application declines -- it said nothing for a second, or answered with a dialog -- and the window is back on screen | put it back, if you took it out |
 | `close(id)` | when the window is gone | forget it |
 
-In that order. `close_landed` follows `closing` unless the application went
-during the animation, and then exactly one of the other two follows, and
-**`refused` never follows `close`**: once a window has gone, nothing brings it
-back. A refused window is an ordinary window again, and closing it a second
-time starts over with a second `closing`. A window whose application quit on
-its own -- `exit`, its own Quit, a crash -- was never asked, so it gets `close`
-and nothing before it; it still fades out where it stood, from what the
-application last showed -- in front of the windows it was in front of and
-behind the rest -- while a layout that reflows at `close` grows its
-neighbours into the space, behind it. Its row is in `close`'s own snapshot, leaving, and
-in no snapshot after.
+In that order. `close_landed` follows `closing` unless the application went,
+or answered with a dialog, during the animation, and then exactly one of the
+other two follows, and **`refused` never follows `close`**: once a window has
+gone, nothing brings it back. A refused window is an ordinary window again,
+and closing it a second time starts over with a second `closing`. A window
+whose application quit on its own -- `exit`, its own Quit, a crash -- was
+never asked, so it gets `close` and nothing before it; it still fades out
+where it stood, from what the application last showed -- in front of the
+windows it was in front of and behind the rest -- while a layout that reflows
+at `close` grows its neighbours into the space, behind it. Its row is in
+`close`'s own snapshot, leaving, and in no snapshot after.
 
 `close` still means *gone*, and nothing else. Anything a script keeps about a
 window -- `dialogs.forget`, `tiling.exiled` -- is dropped there and not at

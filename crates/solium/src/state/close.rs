@@ -998,7 +998,7 @@ impl Solium {
     }
 
     /// Tell scripts a close has landed: its animation has played, and its
-    /// client is being asked to go.
+    /// client has just been asked to go.
     ///
     /// See [`Scripts::close_landed`]. Fired from [`Self::settle_closing`]
     /// alone, and only for a window with a client to ask: one whose

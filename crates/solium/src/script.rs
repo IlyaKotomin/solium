@@ -1834,10 +1834,12 @@ impl Scripts {
         self.dispatch(snapshot, move |lua, _| call_listeners(lua, "closing", id))
     }
 
-    /// A close has landed: its animation has played, the window is no longer
-    /// drawn, and its client is being asked to go. Between `closing` and
-    /// `close` or `refused`, once per close the compositor asked for, and
-    /// never for a window that went on its own.
+    /// A close has landed: its animation has played, the window has faded
+    /// out of sight, and its client has just been asked to go (an X11 one
+    /// that let the last request go unanswered, ended). Between `closing` and
+    /// `close` or `refused`, once per close the compositor asked for; never
+    /// for a window that went, or answered with a dialog, before its close
+    /// landed, nor for one whose client never came.
     ///
     /// The moment a layout set to wait for the animation reflows
     /// (`reflow_on_close = "when_landed"`, #128): later than `closing`, so the
