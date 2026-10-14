@@ -21,7 +21,8 @@ use super::xray::Cut;
 /// read is one memo, and another monitor's or cut's is another.
 /// Ordered, so the budget gives back the same memo of two equally old ones
 /// every time. `tests::two_slots_with_one_prefix_share_one_memo`,
-/// `tests::a_memo_is_one_per_monitor_and_cut`.
+/// `tests::a_memo_is_one_per_monitor_and_cut`,
+/// `tests::of_two_equally_old_memos_the_lesser_key_gives_way`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct MemoKey {
     pub(crate) monitor: String,
@@ -153,22 +154,26 @@ impl Memos {
 
     /// Whether the memo `key` may be held at `bytes` in `pass`: always with
     /// `budget_mib` 0 (`effects.memo.budget_mib`, no cap); else while
-    /// `bytes` and every other memo admitted or wanted in `pass` fit the
-    /// budget. That judges a held memo too, whose xray may have grown or
-    /// whose budget a reload may have lowered. Memos no slot has admitted or
-    /// wanted in `pass`, kept only by `keep_passes`, are then given back,
-    /// the least recently wanted first, until what is held fits; a refused
-    /// memo held from an earlier pass is given back with them, so what is
-    /// held fits the budget whenever this returns. An admitted memo is
-    /// counted at `bytes` and marked wanted in `pass`. A refused one's
-    /// places run their whole plan (Task 44), and the first refusal at each
-    /// budget is logged.
+    /// `bytes` and every other memo admitted or wanted in `pass` or the
+    /// pass before fit the budget, so a memo still in use keeps its place
+    /// whatever order this pass's slots ask in. That judges a held memo
+    /// too, whose xray may have grown or whose budget a reload may have
+    /// lowered. Memos idle for longer, kept only by `keep_passes`, are then
+    /// given back, the least recently wanted first, until what is held
+    /// fits; a memo wanted only in the pass before is given back only while
+    /// what is held passes the budget without this one. A refused memo held
+    /// from an earlier pass is given back too, so what is held fits the
+    /// budget whenever this returns. An admitted memo is counted at `bytes`
+    /// and marked wanted in `pass`. A refused one's places run their whole
+    /// plan (Task 44), and the first refusal at each budget is logged.
     /// `tests::a_new_memo_over_the_budget_is_not_admitted`,
     /// `tests::a_memo_fits_at_exactly_its_budget`,
     /// `tests::a_held_memo_is_counted_at_its_latest_size`,
     /// `tests::a_held_memo_grown_past_the_budget_is_refused`,
     /// `tests::a_lowered_budget_refuses_a_held_memo_past_it`,
     /// `tests::an_unwanted_kept_memo_gives_way_to_a_wanted_one`,
+    /// `tests::two_memos_that_cannot_share_the_budget_do_not_trade_places`,
+    /// `tests::of_two_equally_old_memos_the_lesser_key_gives_way`,
     /// `tests::what_is_held_never_passes_the_budget`.
     pub(crate) fn admit(
         &mut self,
@@ -186,7 +191,7 @@ impl Memos {
         let pinned: u64 = self
             .by_key
             .iter()
-            .filter(|(each, memo)| *each != key && memo.seen >= pass)
+            .filter(|(each, memo)| *each != key && memo.seen.saturating_add(1) >= pass)
             .fold(0, |held, (_, memo)| held.saturating_add(memo.bytes));
         let admitted = budget_mib == 0 || pinned.saturating_add(bytes) <= cap;
         // What `key` holds once judged: `bytes` admitted; refused, what it
@@ -710,8 +715,8 @@ mod tests {
     }
 
     /// **A memo kept only by `keep_passes` gives way to a wanted one**: the
-    /// budget caps what is held, so a memo no slot has admitted or wanted
-    /// this pass is given back to make room, the least recently wanted
+    /// budget caps what is held, so a memo no slot has wanted this pass or
+    /// the last is given back to make room, the least recently wanted
     /// first. One admitted this pass is not, though no slot wanted it yet.
     #[test]
     fn an_unwanted_kept_memo_gives_way_to_a_wanted_one() {
@@ -719,17 +724,70 @@ mod tests {
         let (mut memos, mut pool) = (Memos::default(), crate::pool::Pool::new(0));
         assert!(memos.admit(&key(5), mib / 2, 1, 1, &mut pool));
         memos.want(&key(5), 1);
-        assert!(memos.admit(&key(7), mib / 2, 1, 2, &mut pool));
+        assert!(memos.admit(&key(7), mib / 2, 1, 3, &mut pool));
         assert!(
-            memos.admit(&key(9), mib / 2, 1, 2, &mut pool),
+            memos.admit(&key(9), mib / 2, 1, 3, &mut pool),
             "a memo kept by keep_passes refused a wanted one"
         );
         assert_eq!(memos.generation(&key(5)), None);
         assert!(
-            !memos.admit(&key(11), mib / 2, 1, 2, &mut pool),
+            !memos.admit(&key(11), mib / 2, 1, 3, &mut pool),
             "a memo admitted this pass was given back"
         );
         assert_eq!(memos.held_bytes(), mib);
+    }
+
+    /// **Two memos that cannot share the budget do not trade places**: both
+    /// wanted on every pass, in an order that alternates (Task 44 walks
+    /// slots kept in hash maps), the one held first stays held and the
+    /// other's places run their whole plan. Neither gives the other back on
+    /// every other pass, its prefix run again over the monitor and its
+    /// parts' edges changing with it.
+    #[test]
+    fn two_memos_that_cannot_share_the_budget_do_not_trade_places() {
+        let mib = 1024 * 1024;
+        let (mut memos, mut pool) = (Memos::default(), crate::pool::Pool::new(0));
+        for pass in 1..=1000 {
+            let order = if pass % 2 == 0 { [7, 9] } else { [9, 7] };
+            for upto in order {
+                if memos.admit(&key(upto), 3 * mib / 4, 1, pass, &mut pool) {
+                    memos.want(&key(upto), pass);
+                }
+            }
+            assert_eq!(
+                (
+                    memos.generation(&key(9)).is_some(),
+                    memos.generation(&key(7)).is_some()
+                ),
+                (true, false),
+                "pass {pass}: the memo held changed"
+            );
+            memos.sweep(pass, 0, &mut pool);
+        }
+    }
+
+    /// **Of two equally old memos, the lesser key gives way**: `MemoKey`'s
+    /// order breaks the tie, so the budget gives back the same memo whatever
+    /// order a hash map keeps them in (64 maps, each seeded afresh).
+    #[test]
+    fn of_two_equally_old_memos_the_lesser_key_gives_way() {
+        let mib = 1024 * 1024;
+        for _ in 0..64 {
+            let (mut memos, mut pool) = (Memos::default(), crate::pool::Pool::new(0));
+            for upto in [5, 7] {
+                assert!(memos.admit(&key(upto), mib / 2, 1, 1, &mut pool));
+                memos.want(&key(upto), 1);
+            }
+            assert!(memos.admit(&key(9), mib / 2, 1, 3, &mut pool));
+            assert_eq!(
+                (
+                    memos.generation(&key(5)).is_some(),
+                    memos.generation(&key(7)).is_some()
+                ),
+                (false, true),
+                "the greater key gave way"
+            );
+        }
     }
 
     /// **A refusal is logged once per budget**: again after a reload sets
