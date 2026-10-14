@@ -29991,7 +29991,7 @@ end)"#,
 
             /// Where it is drawn.
             fn drawn(&self) -> Point<f64, Logical> {
-                self.state.drawn_pointer()
+                self.state.drawn_pointer_at(self.state.clock.now())
             }
 
             /// The surface the pointer is on, as the seat says it.

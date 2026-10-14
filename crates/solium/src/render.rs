@@ -1108,6 +1108,7 @@ pub(crate) fn elements(
             scale,
             shift,
             screen.size,
+            now,
         ));
     }
 
@@ -2013,6 +2014,7 @@ fn cursor(
     scale: f64,
     shift: smithay::utils::Point<f64, smithay::utils::Logical>,
     screen: smithay::utils::Size<i32, smithay::utils::Logical>,
+    now: std::time::Duration,
 ) -> Vec<Element> {
     if state.seat.get_pointer().is_none() {
         return Vec::new();
@@ -2030,9 +2032,10 @@ fn cursor(
     // frame (`cursor::scene::tests::a_picture_is_drawn_only_on_the_outputs_it_touches`).
     //
     // Where the pointer is *drawn*, which is where it is unless a warp's
-    // flight is carrying its picture there (#220).
+    // flight is carrying its picture there (#220), at the instant this
+    // screen's frame sampled, so the picture and the windows under it agree.
     // `tests::the_pointer_is_drawn_where_its_flight_has_got_to`.
-    let location = state.drawn_pointer() + shift;
+    let location = state.drawn_pointer_at(now) + shift;
 
     // `showing` rather than the field, which is now private. It is the one
     // reader, and it is where a cursor surface destroyed under a stationary
@@ -3574,6 +3577,31 @@ mod tests {
         );
     }
 
+    /// **The pointer is drawn where its flight has got to, at the instant
+    /// the screen is drawn at** (#220): its picture is placed at
+    /// `Solium::drawn_pointer_at` the `now` [`super::elements`] sampled for
+    /// everything else on the screen, which is where a warp's flight has
+    /// carried it then, and not at the pointer's own location, which a warp
+    /// moves at once.
+    ///
+    /// A source check, as the drag icon's test below is, and for its reason:
+    /// `cursor` needs a renderer this binary cannot make. It proves only that
+    /// `cursor` reads the drawn place at the frame's instant;
+    /// `drawn_pointer_at` itself is `state::tests::real_client::follow`'s.
+    #[test]
+    fn the_pointer_is_drawn_where_its_flight_has_got_to() {
+        let source = include_str!("render.rs");
+        let start = source
+            .find("\nfn cursor(")
+            .expect("render.rs still draws the pointer in `cursor`");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+        assert!(
+            body.contains("state.drawn_pointer_at(now)") && !body.contains("current_location()"),
+            "`cursor` does not place the pointer where its flight has got to at the frame's instant"
+        );
+    }
+
     /// **A drag icon must not be drawn over a locked screen, and what stops it
     /// is where its call sits in [`super::elements`].**
     ///
@@ -3592,27 +3620,6 @@ mod tests {
     /// is below it is pinned here instead of being left to a reader. What this
     /// proves is only the ordering of two statements; it would not notice a
     /// third path that drew the icon from somewhere else entirely.
-    #[test]
-    fn the_pointer_is_drawn_where_its_flight_has_got_to() {
-        // **The pointer is drawn where its flight has got to** (#220): its
-        // picture is placed at `Solium::drawn_pointer`, which is where a
-        // warp's flight has carried it, and not at the pointer's own
-        // location, which a warp moves at once. Read off the source, as the
-        // test below reads the drag icon's place, because `cursor` needs a
-        // renderer this binary cannot make; `drawn_pointer` itself is
-        // `state::tests::real_client::follow`'s.
-        let source = include_str!("render.rs");
-        let start = source
-            .find("\nfn cursor(")
-            .expect("render.rs still draws the pointer in `cursor`");
-        let body = &source[start..];
-        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
-        assert!(
-            body.contains("state.drawn_pointer()") && !body.contains("current_location()"),
-            "`cursor` does not place the pointer where its flight has got to"
-        );
-    }
-
     #[test]
     fn the_drag_icon_is_emitted_below_the_lock_screens_early_return() {
         let source = include_str!("render.rs");

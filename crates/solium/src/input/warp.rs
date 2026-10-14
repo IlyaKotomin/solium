@@ -187,14 +187,10 @@ fn place(state: &mut Solium, pointer: &PointerHandle<Solium>, location: Point<f6
 }
 
 impl Solium {
-    /// Where the pointer is drawn now: where it is, or where its picture has
-    /// got to on a flight there.
-    /// `tests::real_client::follow::a_warp_moves_the_pointer_at_once_and_flies_its_picture`.
-    pub(crate) fn drawn_pointer(&self) -> Point<f64, Logical> {
-        self.drawn_pointer_at(self.clock.now())
-    }
-
-    /// [`Self::drawn_pointer`] at `now`.
+    /// Where the pointer is drawn at `now`: where it is, or where its picture
+    /// has got to on a flight there. A frame asks at the instant it sampled,
+    /// as it places everything else it draws.
+    /// `tests::real_client::follow::a_key_takes_the_pointer_to_the_window_it_focuses_at_once_and_flies_its_picture`.
     pub(crate) fn drawn_pointer_at(&self, now: Duration) -> Point<f64, Logical> {
         let at = self
             .seat
