@@ -11391,6 +11391,38 @@ end)"#,
         );
     }
 
+    /// **The xray rasterises its scenes at the monitor's scale**: what
+    /// `offscreen::xray_job` hands `render::stacked_elements` asks a hosted
+    /// scene for the picture the frame draws, at the monitor's own scale,
+    /// and places it at the cut's, at `effects.xray.scale` 0.5 as at 1.
+    #[test]
+    fn the_xray_rasterises_its_scenes_at_the_monitors_scale() {
+        fx2_fixture!(fixture, "xray-raster");
+        let output = fixture
+            .state
+            .space
+            .outputs()
+            .next()
+            .cloned()
+            .expect("an output");
+        let scale = output.current_scale().fractional_scale();
+        assert_eq!(
+            crate::offscreen::xray_raster(&fixture.state, &output),
+            crate::surface::Raster::at(scale)
+        );
+        fixture.state.effect_settings.xray.scale = 0.5;
+        let raster = crate::offscreen::xray_raster(&fixture.state, &output);
+        assert_eq!(
+            raster.scale, scale,
+            "rasterised at the cut's scale, not the monitor's"
+        );
+        assert!(
+            (raster.place - scale * 0.5).abs() < f64::EPSILON,
+            "placed at {}, not the cut's scale",
+            raster.place
+        );
+    }
+
     /// A window whose root surface declares no opaque region: what a T2
     /// slot behind it is for. `one_window`'s, which sets none.
     fn translucent_window(fixture: &mut Fixture) -> (crate::pane::PaneId, Window) {

@@ -990,10 +990,19 @@ impl Phases for Gpu<'_> {
                 continue;
             };
             // As `elements` will draw it: through the same call, at the
-            // output's own scale, so its `Gpu::sample` is a hit there.
+            // output's own scale, so its `Gpu::sample` is a hit there, and
+            // the xray's, which asks for the same picture (`surface::Raster`).
             let scale = output.current_scale().fractional_scale();
             let _ = scripted(
-                state, renderer, &output, id, area, alpha, screen, now, scale,
+                state,
+                renderer,
+                &output,
+                id,
+                area,
+                alpha,
+                screen,
+                now,
+                crate::surface::Raster::at(scale),
             );
         }
     }
@@ -2534,8 +2543,8 @@ pub(crate) fn scenes_needed(state: &Solium) -> Vec<SceneRef> {
 /// at what alpha: its declared area carried by its selection, as
 /// [`stacked`] lists it (`wanted`'s two calls). `None` with no instance
 /// there. What the `scenes` phase renders it at, so `elements`' sample is a
-/// hit; a nested run's `qml_us` shows it, as Task 45's `effects-check xray`
-/// measures.
+/// hit: `dev/effects-check.sh xray` finds a moving wallpaper's `rendered`
+/// once a pass with a T2 rule, as without one.
 fn surface_drawn_at(
     state: &Solium,
     id: crate::scripted::SurfaceId,
@@ -3842,7 +3851,16 @@ fn scene(
     // Already an `Element`: a shell surface is a memory buffer on the software
     // path and a texture on the GPU one, and which of the two it is is its own
     // business rather than this function's.
-    elements.extend(held.element(renderer, area, now, alpha, scale).element);
+    elements.extend(
+        held.element(
+            renderer,
+            area,
+            now,
+            alpha,
+            crate::surface::Raster::at(scale),
+        )
+        .element,
+    );
     // A scene animates on its own clock and damages nothing, so the next frame
     // has to be asked for or it stops where it stands -- mid-fade, most of all.
     //
@@ -4142,7 +4160,7 @@ pub(crate) fn elements(
             each,
             screen,
             now,
-            scale,
+            crate::surface::Raster::at(scale),
             &mut elements,
         ),
         Walked::Slot(owner, slot, rect, alpha) => {
@@ -4189,9 +4207,12 @@ pub(crate) fn elements(
 /// instance (none with no output, as before); panes through [`panes`], which
 /// reads the pass's `prepared`. Pushed onto the caller's list, as [`panes`]
 /// does, so the frame of an unstyled desktop allocates nothing it did not
-/// before.
+/// before. Everything is placed at `raster.place`, the target's scale; a
+/// script's surface is rasterised at `raster.scale`, its monitor's own
+/// even inside an xray cut (`surface::Raster`).
 /// `state::tests::real_client::reflow_on_close::stacking`'s tests show
-/// `elements` unchanged; `offscreen::xray_job` draws a cut through it.
+/// `elements` unchanged; `offscreen::xray_job` draws a cut through it
+/// (`state::tests::real_client::the_xray_rasterises_its_scenes_at_the_monitors_scale`).
 #[expect(
     clippy::too_many_arguments,
     reason = "the frame's own state, handed down from `elements` or an xray's job"
@@ -4204,9 +4225,10 @@ pub(crate) fn stacked_elements(
     each: Stacked,
     screen: Rectangle<i32, Logical>,
     now: std::time::Duration,
-    scale: f64,
+    raster: crate::surface::Raster,
     elements: &mut Vec<Element>,
 ) {
+    let scale = raster.place;
     match each {
         Stacked::Layer(surface, geometry) => {
             // A layer map's geometry is already in its own output's
@@ -4226,7 +4248,7 @@ pub(crate) fn stacked_elements(
         Stacked::Surface(id, area, alpha) => {
             if let Some(output) = output {
                 elements.extend(scripted(
-                    state, renderer, output, id, area, alpha, screen, now, scale,
+                    state, renderer, output, id, area, alpha, screen, now, raster,
                 ));
             }
         }
@@ -5073,7 +5095,7 @@ fn scripted(
     alpha: f32,
     screen: smithay::utils::Rectangle<i32, smithay::utils::Logical>,
     now: std::time::Duration,
-    scale: f64,
+    raster: crate::surface::Raster,
 ) -> Vec<Element> {
     let Some(surface) = state.surfaces.get_mut(id) else {
         return Vec::new();
@@ -5086,7 +5108,7 @@ fn scripted(
         smithay::utils::Rectangle::new(area.loc - screen.loc, area.size),
         now,
         alpha,
-        scale,
+        raster,
     );
     // Ask for another frame while it is still moving, exactly as `chrome`
     // does for a window frame.
@@ -5140,7 +5162,7 @@ pub(crate) fn scripted_instance(
         Rectangle::new(corner, area.size),
         now,
         1.0,
-        scale,
+        crate::surface::Raster::at(scale),
     );
     // Still moving: the next frame is asked for, as `scripted` asks.
     if painted.animating {

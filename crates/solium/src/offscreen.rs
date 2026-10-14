@@ -418,7 +418,8 @@ pub(crate) fn xray_job(
     source: &dyn crate::effect::xray::XraySource,
 ) -> Option<Job> {
     let screen = state.space.output_geometry(output)?;
-    let scale = output.current_scale().fractional_scale() * state.effect_settings.xray.scale;
+    let raster = xray_raster(state, output);
+    let scale = raster.place;
     let size = xray_size(state, output);
     let now = state.clock.now();
     let none = crate::render::Prepared::default();
@@ -432,7 +433,7 @@ pub(crate) fn xray_job(
             each,
             screen,
             now,
-            scale,
+            raster,
             &mut elements,
         );
     }
@@ -444,6 +445,21 @@ pub(crate) fn xray_job(
         elements,
         inputs,
     })
+}
+
+/// How an xray cut is drawn: at its monitor's scale times `xray.scale`, a
+/// hosted scene in it rasterised at the monitor's own scale, the picture the
+/// `scenes` phase rendered for the frame this pass, and only its element
+/// placed at the cut's (`surface::Raster`).
+/// `state::tests::real_client::the_xray_rasterises_its_scenes_at_the_monitors_scale`.
+pub(crate) fn xray_raster(
+    state: &Solium,
+    output: &smithay::output::Output,
+) -> crate::surface::Raster {
+    crate::surface::Raster::xray(
+        output.current_scale().fractional_scale(),
+        state.effect_settings.xray.scale,
+    )
 }
 
 /// The xray target's size: the monitor's mode, transformed as its elements
