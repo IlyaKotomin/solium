@@ -856,7 +856,7 @@ local defaults = {
                 surface = false, -- a bar's window chip, the dock, a shell's search
                 open = false, -- a window opening
                 activate = false, -- an application bringing its window forward
-                settle = false, -- the window you were in went, and another took over
+                settle = false, -- the window you were in went, and another took over (focus.after_close)
                 script = false, -- `sol.focus` from anything else
             },
             -- Where on the window: "center", or a share of its width and

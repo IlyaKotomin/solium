@@ -365,7 +365,10 @@ closed one's place (or the one nearest to where it stood), the one used before
 it on that monitor, or the topmost -- in the order the mode lists them. A
 window that goes on its own while it has the keyboard hands it on the same
 way. A layout that wants a say focuses a window in its own handler; the
-compositor then leaves the keyboard where that put it.
+compositor then leaves the keyboard where that put it. `focus` hears the
+hand-off with the source `"settle"`, which `focus.cursor.follows.settle`,
+`false` as shipped, keeps from taking the pointer along: a close never moves
+the pointer out from under your hand.
 
 A layout that listens for neither event hears exactly what it always heard --
 `close`, once the window is gone -- so a mode written before these two existed

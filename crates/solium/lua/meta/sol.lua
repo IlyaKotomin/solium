@@ -186,7 +186,7 @@
 ---| "surface" # A hosted scene's action: a bar's window chip, the dock, a search.
 ---| "open" # A window opening, or an `"open"` listener.
 ---| "activate" # An application bringing its window forward, or an `"activate"` listener.
----| "settle" # The window the keyboard was on went, and another took over.
+---| "settle" # The window the keyboard was on went, and another took over: as a close lands, the one `config.focus.after_close` chose.
 ---| "script" # `sol.focus` from anything else.
 
 ---A warp: where on a window the pointer goes, and how its picture flies

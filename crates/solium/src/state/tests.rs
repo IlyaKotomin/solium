@@ -20582,6 +20582,81 @@ end)
                 );
             }
 
+            /// **A close hands the keyboard on as `"settle"`, and the pointer
+            /// stays where it is** (#128 with #220). The window that takes
+            /// the keyboard when a close lands is chosen by
+            /// `config.focus.after_close` and given it by the compositor's
+            /// own settle, so `focus` is told `source = "settle"` and
+            /// `changed = true`, and `lua/follow.lua` takes the pointer there
+            /// only if `focus.cursor.follows.settle` says so: `false` as
+            /// shipped, so a close never moves the pointer out from under the
+            /// hand. With it `true` the pointer goes to the window that took
+            /// the space, which shows it is the shipped `false` that keeps it
+            /// still.
+            /// With `settle_focus` telling `"binding"` instead, it fails at
+            /// the source, and the pointer flies.
+            #[test]
+            fn a_close_hands_the_keyboard_on_as_settle_and_leaves_the_pointer_alone() {
+                for follows in [false, true] {
+                    let mut desk = Desk::new();
+                    let before = format!(
+                        "require(\"follow\")\n\
+                         require(\"config\").focus.cursor.follows.settle = {follows}\n\
+                         heard = {{}}\n\
+                         sol.on(\"focus\", function(id, source, changed)\n\
+                             heard[#heard + 1] = id .. \" \" .. source .. \" \" .. tostring(changed)\n\
+                         end)"
+                    );
+                    let (_, closed, grows) = three_tiles(&mut desk, &before);
+                    russian(&mut desk.state);
+                    point_at(&mut desk.state, (1.0, 1.0).into());
+                    give_keyboard(&mut desk, closed);
+                    let evaluate = |desk: &Desk, lua: &str| {
+                        desk.state
+                            .scripts
+                            .as_ref()
+                            .map(|scripts| scripts.evaluate(lua))
+                            .unwrap_or_default()
+                    };
+                    let _ = evaluate(&desk, "heard = {} return \"\"");
+
+                    super_q(&mut desk);
+                    desk.ask();
+                    assert_eq!(
+                        desk.focused(),
+                        grows,
+                        "follows.settle = {follows}: the premise: the window that took the \
+                         space took the keyboard"
+                    );
+                    assert_eq!(
+                        evaluate(&desk, "return table.concat(heard, \",\")"),
+                        format!("{} settle true", grows.get()),
+                        "follows.settle = {follows}: the hand-off was not told as the \
+                         compositor's own settle"
+                    );
+                    let at = desk
+                        .state
+                        .seat
+                        .get_pointer()
+                        .map(|pointer| pointer.current_location())
+                        .expect("the seat has a pointer");
+                    if follows {
+                        let took = desk.placed(grows).to_f64();
+                        assert!(
+                            took.contains(at),
+                            "follows.settle = true: the pointer did not go to the window \
+                             that took the space: {at:?}, {took:?}"
+                        );
+                    } else {
+                        assert_eq!(
+                            (at.x, at.y),
+                            (1.0, 1.0),
+                            "follows.settle = false: a close moved the pointer"
+                        );
+                    }
+                }
+            }
+
             /// **Hovering a window focuses it in tiling and scrolling, and
             /// not in floating; a click on empty desktop still clears it**
             /// (#219). The shipped `focus.modes`, as a session starts them:
