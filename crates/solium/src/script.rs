@@ -974,7 +974,6 @@ impl Kept {
     }
 }
 
-/// A Lua value as a log line should name it.
 /// `sol.focus_mode`'s `after_close`: one word of
 /// [`crate::successor::Successor`], or a list of them in order (#128).
 ///
@@ -1021,6 +1020,7 @@ fn after_close_words(value: &Value) -> Option<Vec<crate::successor::Successor>> 
     }
 }
 
+/// A Lua value as a log line should name it.
 fn describe(value: &Value) -> String {
     match value {
         Value::Integer(number) => number.to_string(),
