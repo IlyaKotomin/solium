@@ -1224,12 +1224,18 @@ local defaults = {
         -- is put back and then goes, so its neighbours grow, shrink back and
         -- grow again. "when_gone" moves them once.
         --
+        -- "when_landed": once the fade has played, as the application is
+        -- asked to quit -- the window goes out where it stood, and then the
+        -- others close up. A refusal puts it back as "immediate" does.
+        --
         -- "when_gone": once the application has actually quit. Its tile stays
         -- reserved for the length of the fade and for however long the
         -- application then takes, and a refusal has nothing to put back. This
         -- is how every close behaved before #128.
         --
-        -- Either way, only while tiling is the layout in charge.
+        -- Whichever, only while tiling is the layout in charge.
+        -- `with_reflow_on_close_when_landed_the_grid_waits_for_the_close_to_land`
+        -- and `a_window_that_asks_inside_itself_gets_its_tile_back`.
         --
         -- Anything else is read as "immediate".
         reflow_on_close = "immediate",
@@ -1281,8 +1287,9 @@ local defaults = {
         -- The shorter feel for bringing a column into view.
         snap = { duration = 200, easing = "outCubic" },
         -- When the strip closes the gap a window you close leaves: the moment
-        -- you close it ("immediate", the default), or once the application has
-        -- actually quit ("when_gone", how it was before #128).
+        -- you close it ("immediate", the default), once its fade has played
+        -- ("when_landed"), or once the application has actually quit
+        -- ("when_gone", how it was before #128).
         -- A window whose application refuses to go comes back in a column of
         -- its own after the window that was before it; one that was first
         -- comes back first. Anything else is read as "immediate". The same

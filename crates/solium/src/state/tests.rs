@@ -19854,6 +19854,240 @@ end)
             );
         }
 
+        /// **#128, 2026-10-14: a close gives the space back when the
+        /// configuration says, and the keyboard moves on by itself.**
+        ///
+        /// Inside `reflow_on_close` for [`Desk`], the one fixture with the
+        /// shipped layouts and a real client. Each scene is started the way
+        /// the compositor starts a configuration, `start_scripts`, so what the
+        /// shipped `modes.lua` hands over at load -- floating's focus model --
+        /// is in force before the layout key is pressed, as it is in a
+        /// session. Keys are pressed through the filter the backends feed,
+        /// with `us,ru` and Russian active (#132).
+        mod after_close {
+            use super::*;
+
+            use smithay::backend::input::KeyState;
+            use smithay::input::keyboard::Keycode;
+
+            /// `init.lua`'s `super+q`: close the focused window.
+            const CLOSE_KEY: &str = r#"
+sol.bind("super+q", function()
+    for _, window in ipairs(sol.windows()) do
+        if window.focused then
+            sol.close(window.id)
+            return
+        end
+    end
+end)
+"#;
+
+            /// Super and q, as xkb keycodes: evdev 125 and 16, plus eight.
+            const SUPER: u32 = 133;
+            const Q: u32 = 24;
+
+            /// The shipped `layout`, started over the windows already open
+            /// as a session starts its configuration, with `before` ahead of
+            /// it and [`RECORDER`] after: the scripts' own top level applied
+            /// (`start_scripts`), then the layout's key, then the arrangement
+            /// let land. `"floating"` presses nothing.
+            fn start(desk: &mut Desk, layout: &str, before: &str) {
+                let required = if layout == "floating" {
+                    String::new()
+                } else {
+                    format!("require({layout:?})")
+                };
+                desk.install(&format!(
+                    "{before}\n{CLOSE_KEY}\nrequire(\"modes\")\n{required}\n{RECORDER}"
+                ));
+                let scripts = desk.state.scripts.take();
+                desk.state.start_scripts(scripts);
+                if layout != "floating" {
+                    assert!(
+                        desk.state.trigger(key_of(layout)),
+                        "{layout}: the layout key was not handled"
+                    );
+                }
+                desk.state.clock.advance(Duration::from_secs(1));
+                let now = desk.state.clock.now();
+                desk.state.settle(now);
+                desk.pump();
+            }
+
+            fn key_of(layout: &str) -> &'static str {
+                if layout == "tiling" {
+                    "super+t"
+                } else {
+                    "super+s"
+                }
+            }
+
+            /// Press `keys` in order and let them go in reverse, through the
+            /// key filter, as a keyboard does.
+            fn press(desk: &mut Desk, keys: &[u32]) {
+                for &code in keys {
+                    crate::input::key(&mut desk.state, Keycode::new(code), KeyState::Pressed, 0);
+                }
+                for &code in keys.iter().rev() {
+                    crate::input::key(&mut desk.state, Keycode::new(code), KeyState::Released, 0);
+                }
+                desk.pump();
+            }
+
+            /// `super+q` on the focused window, with Russian active.
+            fn super_q(desk: &mut Desk) {
+                press(desk, &[SUPER, Q]);
+            }
+
+            /// **`reflow_on_close` decides when the others close up**, in
+            /// each layout: at the press (`"immediate"`, the default), when
+            /// the close lands (`"when_landed"`), or only when the
+            /// application has gone (`"when_gone"`). `close_landed` is
+            /// heard once, as the close lands, whatever the setting.
+            ///
+            /// Against `0ce2ab8` it fails at the first `close_landed`: nothing
+            /// told a layout the close had landed, and `"when_landed"` was
+            /// read as `"immediate"`.
+            #[test]
+            fn with_reflow_on_close_when_landed_the_grid_waits_for_the_close_to_land() {
+                for layout in LAYOUTS {
+                    for (setting, at_press, at_landing) in [
+                        ("immediate", true, true),
+                        ("when_landed", false, true),
+                        ("when_gone", false, false),
+                    ] {
+                        let mut desk = Desk::new();
+                        let (dying, survivor) = two(
+                            &mut desk,
+                            layout,
+                            &format!(
+                                "require(\"config\").{layout}.reflow_on_close = {setting:?}\n\
+                                 heard_landed = {{}}\n\
+                                 sol.on(\"close_landed\", function(id) \
+                                 heard_landed[#heard_landed + 1] = id end)"
+                            ),
+                        );
+                        let was = desk.placed(survivor);
+                        desk.state.close_pane(dying);
+                        desk.pump();
+                        assert_eq!(
+                            desk.placed(survivor) != was,
+                            at_press,
+                            "{layout}, {setting}: at the press the survivor is at {:?}, and was \
+                             at {was:?}",
+                            desk.placed(survivor)
+                        );
+                        desk.ask();
+                        assert_eq!(
+                            desk.placed(survivor) != was,
+                            at_landing,
+                            "{layout}, {setting}: once the close landed the survivor is at \
+                             {:?}, and was at {was:?}",
+                            desk.placed(survivor)
+                        );
+                        let heard = desk
+                            .state
+                            .scripts
+                            .as_ref()
+                            .map(|scripts| {
+                                scripts.evaluate("return table.concat(heard_landed, \",\")")
+                            })
+                            .unwrap_or_default();
+                        assert_eq!(
+                            heard,
+                            dying.get().to_string(),
+                            "{layout}, {setting}: `close_landed` was not heard once, for the \
+                             window closed"
+                        );
+                    }
+                }
+            }
+
+            /// **A window that asks inside itself gets its tile back** (#231),
+            /// whether the others closed up at the press or when the close
+            /// landed: the application answers the close by drawing its
+            /// question in the same window -- kitty with a program running
+            /// -- and stays, and once the grace runs out the window is given
+            /// back to the tile it left, beside the same neighbour.
+            ///
+            /// Against `0ce2ab8` it fails at `when_landed`'s press, for the
+            /// reason the test above does.
+            #[test]
+            fn a_window_that_asks_inside_itself_gets_its_tile_back() {
+                for layout in LAYOUTS {
+                    for setting in ["immediate", "when_landed"] {
+                        let mut desk = Desk::new();
+                        let first = desk.open_surface();
+                        let second = desk.open_surface();
+                        start(
+                            &mut desk,
+                            layout,
+                            &format!("require(\"config\").{layout}.reflow_on_close = {setting:?}"),
+                        );
+                        let (asks, beside) = if desk.focused() == first.pane {
+                            (&first, &second)
+                        } else {
+                            (&second, &first)
+                        };
+                        let before = (desk.placed(asks.pane), desk.placed(beside.pane));
+                        russian(&mut desk.state);
+
+                        super_q(&mut desk);
+                        assert_eq!(
+                            desk.placed(beside.pane) != before.1,
+                            setting == "immediate",
+                            "{layout}, {setting}: at the press the neighbour is at {:?}",
+                            desk.placed(beside.pane)
+                        );
+                        desk.ask();
+                        assert_ne!(
+                            desk.placed(beside.pane),
+                            before.1,
+                            "{layout}, {setting}: the neighbour never took the space"
+                        );
+                        // Its question, drawn in the window it was asked to
+                        // close, and no sign of going.
+                        desk.answer(asks);
+                        desk.refuse();
+
+                        let id = asks.pane.get();
+                        assert!(
+                            desk.events().ends_with(&format!("refused {id}")),
+                            "{layout}, {setting}: the refusal was not told: {}",
+                            desk.events()
+                        );
+                        let after = (desk.placed(asks.pane), desk.placed(beside.pane));
+                        match layout {
+                            "tiling" => assert_eq!(
+                                after, before,
+                                "tiling, {setting}: the window did not get its tile back"
+                            ),
+                            _ => {
+                                let (back, other) = after;
+                                assert_eq!(
+                                    before.0.loc.x < before.1.loc.x,
+                                    back.loc.x < other.loc.x,
+                                    "scrolling, {setting}: the window came back on the other \
+                                     side of its neighbour"
+                                );
+                                let (left, right) = if back.loc.x < other.loc.x {
+                                    (back, other)
+                                } else {
+                                    (other, back)
+                                };
+                                assert_eq!(
+                                    left.loc.x + left.size.w + 12,
+                                    right.loc.x,
+                                    "scrolling, {setting}: the two are not neighbours: \
+                                     {left:?}, {right:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         /// **#134 review: a window opened onto a workspace nobody is looking
         /// at took the keyboard with it.**
         ///

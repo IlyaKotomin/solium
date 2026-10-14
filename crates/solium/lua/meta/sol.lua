@@ -351,6 +351,7 @@
 ---| "focus" # The keyboard moved to a window: `(id)`.
 ---| "activate" # A window asked to be brought forward, after the compositor answered: `(id, why)`. `why` is `"launch"` when an application already running answered a launch with a window it had, and `"request"` for anything else.
 ---| "closing" # A close was asked for and the window is fading: `(id)`.
+---| "close_landed" # The close's animation has played, the window is no longer drawn, and its application is being asked to go: `(id)`. After `closing`, before `close` or `refused`; never for a window that went on its own.
 ---| "refused" # Its application declined, and the window is back: `(id)`.
 ---| "close" # The window is gone: `(id)`.
 ---| "fullscreen" # A window went fullscreen, or left it: `(id, entering)`. Told once the change is made: its client has been sent its new size and it lives at its new rectangle. Once every listener has run, the compositor moves its picture there from where it is drawn, as a layout's glide does, with the timing a listener set with `sol.animate`, and at once if none set one. Until the client answers at its new size the window is held there and its last picture stretched into it, for a quarter of a second past the landing at most; the transform is released when the glide lands. With no timing the change puts no transform on the window and holds nothing. A window a mode is presenting is left where the mode draws it. A change a listener makes is made at once and not told.
@@ -914,7 +915,7 @@ function sol.unknown(key, meant) end
 ---finalizer, and the `__close` of a to-be-closed variable in the function a
 ---stop interrupts, run where no hook does, so the deadline cannot stop a loop
 ---in either.
----@overload fun(event: "open"|"focus"|"closing"|"refused"|"close", handler: fun(id: integer))
+---@overload fun(event: "open"|"focus"|"closing"|"close_landed"|"refused"|"close", handler: fun(id: integer))
 ---@overload fun(event: "activate", handler: fun(id: integer, why: "launch"|"request"))
 ---@overload fun(event: "drop", handler: fun(id: integer, x: number, y: number))
 ---@overload fun(event: "resize", handler: fun(id: integer, edge_x: number, edge_y: number, horizontal_side: "left"|"right"|nil, vertical_side: "top"|"bottom"|nil))

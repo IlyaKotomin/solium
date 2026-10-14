@@ -1641,6 +1641,23 @@ impl Scripts {
         self.dispatch(snapshot, move |lua, _| call_listeners(lua, "closing", id))
     }
 
+    /// A close has landed: its animation has played, the window is no longer
+    /// drawn, and its client is being asked to go. Between `closing` and
+    /// `close` or `refused`, once per close the compositor asked for, and
+    /// never for a window that went on its own.
+    ///
+    /// The moment a layout set to wait for the animation reflows
+    /// (`reflow_on_close = "when_landed"`, #128): later than `closing`, so the
+    /// other windows stay put while the window plays out, and earlier than
+    /// `close`, so they do not wait on the application.
+    /// `with_reflow_on_close_when_landed_the_grid_waits_for_the_close_to_land`
+    /// in `state/tests.rs`.
+    pub(crate) fn close_landed(&mut self, id: u64, snapshot: Snapshot) -> Outcome {
+        self.dispatch(snapshot, move |lua, _| {
+            call_listeners(lua, "close_landed", id)
+        })
+    }
+
     /// A window that was closing is staying: its client declined, and the
     /// window is back on screen.
     ///
@@ -13468,42 +13485,46 @@ mod dialogs {
             );
         }
 
-        /// **With `reflow_on_close = "when_gone"`, a window being closed
-        /// still takes its workspace.** That setting keeps a closing window's
-        /// tile until its application has gone, so a workspace whose only
-        /// window is closing is not empty to it: window 3 goes on to workspace
-        /// 3, rather than into a fresh tree on workspace 2 that has it cover
-        /// window 5 while window 5 fades (#134 review). Closing up at once, the
-        /// same workspace is empty -- that half is
-        /// `a_window_being_closed_is_room_for_the_next_one`.
+        /// **With `reflow_on_close = "when_gone"` or `"when_landed"`, a
+        /// window being closed still takes its workspace.** Those settings
+        /// keep a closing window's tile while it fades, and "when_gone" until
+        /// its application has gone, so a workspace whose only window is
+        /// closing is not empty to them: window 3 goes on to workspace 3,
+        /// rather than into a fresh tree on workspace 2 that has it cover
+        /// window 5 while window 5 fades (#134 review). Closing up at once,
+        /// the same workspace is empty -- that half is
+        /// `a_window_being_closed_is_room_for_the_next_one`. Against `0ce2ab8`
+        /// `"when_landed"` fails: it was read as "immediate" (#128).
         #[test]
-        fn with_reflow_when_gone_a_closing_window_still_takes_its_workspace() {
-            let (mut scripts, _) = tiling_with(&format!(
-                "{}\nrequire(\"config\").tiling.reflow_on_close = \"when_gone\"",
-                minimum(1300, 800)
-            ));
-            switched_on(&mut scripts);
-            let _ = scripts.evaluate("require(\"workspaces\").of[5] = 2\nreturn \"\"");
-            let _ = open(&mut scripts, 1, &[5, 1]);
-            let mut windows = vec![
-                window(5, 800.0, 600.0),
-                window(1, 800.0, 600.0),
-                window(3, 800.0, 600.0),
-            ];
-            windows[0].leaving = true;
-            let _ = scripts.opened(
-                3,
-                Snapshot {
-                    cursor: (500.0, 500.0),
-                    ..snapshot(windows)
-                },
-            );
-            assert_eq!(
-                workspace_of(&scripts, 3),
-                "3",
-                "a workspace whose only window keeps its tile while it closes was counted as \
-                 empty"
-            );
+        fn waiting_to_reflow_a_closing_window_still_takes_its_workspace() {
+            for setting in ["when_gone", "when_landed"] {
+                let (mut scripts, _) = tiling_with(&format!(
+                    "{}\nrequire(\"config\").tiling.reflow_on_close = {setting:?}",
+                    minimum(1300, 800)
+                ));
+                switched_on(&mut scripts);
+                let _ = scripts.evaluate("require(\"workspaces\").of[5] = 2\nreturn \"\"");
+                let _ = open(&mut scripts, 1, &[5, 1]);
+                let mut windows = vec![
+                    window(5, 800.0, 600.0),
+                    window(1, 800.0, 600.0),
+                    window(3, 800.0, 600.0),
+                ];
+                windows[0].leaving = true;
+                let _ = scripts.opened(
+                    3,
+                    Snapshot {
+                        cursor: (500.0, 500.0),
+                        ..snapshot(windows)
+                    },
+                );
+                assert_eq!(
+                    workspace_of(&scripts, 3),
+                    "3",
+                    "{setting}: a workspace whose only window keeps its tile while it closes was \
+                 counted as empty"
+                );
+            }
         }
 
         /// **With `follow_overflow` off, each window with no room takes

@@ -248,6 +248,12 @@ impl Solium {
             if let Some(pane) = self.panes.get_mut(id) {
                 pane.mark_asked(now);
             }
+            // **The close has landed, and a layout waiting for that reflows
+            // now** (`reflow_on_close = "when_landed"`, #128). After
+            // `mark_asked`, so the window is still `leaving` in the snapshot,
+            // as it is until `close` or `refused`.
+            // `with_reflow_on_close_when_landed_the_grid_waits_for_the_close_to_land`.
+            self.trigger_close_landed(id);
             // **And the keyboard leaves with the pixels.** After `mark_asked`,
             // not before: `stop_closing` above has already cleared the other
             // half of `Pane::leaving`, so until this line the pane would still
@@ -972,6 +978,22 @@ impl Solium {
             return;
         };
         let outcome = scripts.closing(pane.get(), snapshot);
+        self.scripts = Some(scripts);
+        self.apply(outcome);
+    }
+
+    /// Tell scripts a close has landed: its animation has played, and its
+    /// client is being asked to go.
+    ///
+    /// See [`Scripts::close_landed`]. Fired from [`Self::settle_closing`]
+    /// alone, and only for a window with a client to ask: one whose
+    /// application never arrived is `close`d there instead.
+    fn trigger_close_landed(&mut self, pane: crate::pane::PaneId) {
+        let snapshot = self.snapshot();
+        let Some(mut scripts) = self.scripts.take() else {
+            return;
+        };
+        let outcome = scripts.close_landed(pane.get(), snapshot);
         self.scripts = Some(scripts);
         self.apply(outcome);
     }
