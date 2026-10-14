@@ -427,6 +427,24 @@ lock.
 `dev/effects-check.sh blur` blurs a video player's own pixels through a rule
 and shows a still window's chain run only on the passes that captured it.
 
+The first desktop frame waits for what it shows (spec C14: nothing pops in
+after it). Once a pass, at the end of `prepare`, `render::hold_first_frame`
+asks `warm::Warm` whether to hold, given `Solium::first_frame_ready`: today
+`Solium::effects_ready`, every program asked compiled (`Host::ready`) and
+every xray cut ever wanted built once (`Xrays::ready`); milestone 1's
+warm-up list adds its own terms to the same predicate. While it holds,
+`elements` draws only the clear colour and the next pass is asked for;
+`prepare` runs as always behind it, so programs compile, scenes render and
+cuts build. Once a frame is let through it never holds again, so a hotplug,
+a lock and a reload draw at once. `sol.startup{ first_frame = { hold,
+max_ms, on_reload } }` (`startup.first_frame` in `config.lua`) says whether
+it holds (`true`); the longest it does (2000 ms, 0 to 10000, 0 never
+holding), after which whatever is late is drawn as it is and named in the
+log; and whether each successful reload arms it again (`false`)
+(`warm::tests::the_hold_is_capped_at_max_ms`,
+`warm::tests::hold_and_on_reload_are_obeyed`). With no effects nothing is
+pending, and the first frame is drawn at once.
+
 Every way an effect fails leaves its part drawn: a Lua error or a lint keeps
 the set out at load, and a program that will not compile, a run that fails
 on the GPU and a self input never captured leave the slot wanted and never

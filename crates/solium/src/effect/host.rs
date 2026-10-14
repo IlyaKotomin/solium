@@ -1257,12 +1257,9 @@ impl<P: Clone> Host<P> {
     }
 
     /// Every asked program compiled and no version waiting: the effects'
-    /// "ready" on the warm-up list (spec C14, Ruling 7).
+    /// "ready" on the warm-up list (spec C14, Ruling 7), which
+    /// `Solium::effects_ready` reads for the first frame's gate.
     /// `tests::a_cold_effect_is_ready_after_the_first_compile`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the warm-up list (milestone 1, T2) reads it")
-    )]
     pub(crate) fn ready(&self) -> bool {
         self.asked.is_empty() && self.slots.values().all(|slot| slot.pending.is_none())
     }

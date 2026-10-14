@@ -68,6 +68,7 @@ mod surface;
 mod synth;
 mod text_input;
 mod tty;
+mod warm;
 mod warp;
 mod winit;
 mod xwayland;

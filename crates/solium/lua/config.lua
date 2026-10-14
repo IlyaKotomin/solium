@@ -1421,6 +1421,15 @@ local defaults = {
         memo = { split = "resize", keep_passes = 0, budget_mib = 0 },
     },
 
+    -- Starting up. The first desktop frame waits until what it shows is
+    -- ready (the wallpaper's blur, the shell's materials), so nothing pops
+    -- in after it: at most `max_ms` (0 to 10000; 0 never waits), not at all
+    -- with `hold = false`, and after every reload too with `on_reload = true`.
+    -- With no effects there is nothing to wait for, and nothing waits.
+    startup = {
+        first_frame = { hold = true, max_ms = 2000, on_reload = false },
+    },
+
     -- How much of a window trails behind it in the genie, for the Developer
     -- Tweaks panel's version of that effect (`--debug-mode` only).
     --

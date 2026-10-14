@@ -535,6 +535,25 @@ function sol.problems() end
 ---@return nil
 function sol.effects(options) end
 
+---The first desktop frame's gate, `sol.startup`'s `first_frame`.
+---@class sol.FirstFrameOptions
+---@field hold? boolean Hold the first desktop frame (drawing only the clear colour) until what it shows is ready: every effect compiled and every backdrop picture a T2 effect reads built once. Default `true`.
+---@field max_ms? integer The longest it is held, 0 to 10000 ms; 0 never holds. What is still not ready then is drawn as it is, and named in the log. Default 2000.
+---@field on_reload? boolean Hold again after each successful reload until ready. Default `false`.
+
+---What `sol.startup` takes. A key it does not know, or a value outside its
+---type or bounds (`1/0` included), is refused whole, named by
+---`sol.problems()` under `"startup"`, and what ran stays.
+---@class sol.StartupOptions
+---@field first_frame? sol.FirstFrameOptions
+
+---How the compositor starts: the first frame's gate. Applied at once; a
+---reload re-reads it, and one with `on_reload` holds its frame again.
+---With no table, the defaults.
+---@param options? sol.StartupOptions
+---@return nil
+function sol.startup(options) end
+
 ---Read the monitors, or arrange them.
 ---
 ---With no argument, answers every monitor. With a list, drives and places the

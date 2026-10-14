@@ -758,6 +758,10 @@ pub(crate) struct Solium {
     /// capped by `effects.memo.budget_mib`, swept with the store.
     /// `effect::memo::tests::two_slots_with_one_prefix_share_one_memo`.
     pub(crate) memos: crate::effect::memo::Memos,
+    /// The first desktop frame's gate: held, at most
+    /// `startup.first_frame.max_ms`, until [`Solium::first_frame_ready`]
+    /// (spec C14). `warm::tests::the_first_frame_is_held_until_ready_then_never_again`.
+    pub(crate) warm: crate::warm::Warm,
 
     /// Hardware buffer sharing: `zwp_linux_dmabuf_v1`.
     ///
@@ -1300,6 +1304,7 @@ impl Solium {
             store: crate::effect::store::Store::default(),
             xrays: crate::effect::xray::Xrays::default(),
             memos: crate::effect::memo::Memos::default(),
+            warm: crate::warm::Warm::default(),
             textures: None,
             focusing: false,
             closing: None,
@@ -2086,6 +2091,22 @@ impl Solium {
         self.panes
             .get(id)
             .map_or(Insets::NONE, |pane| insets_for(pane.frame()))
+    }
+
+    /// The effects are ready for the first frame: the host has nothing
+    /// pending and every xray cut wanted has been built once (spec C14).
+    /// Tasks 59 and 60 add the materials' terms.
+    /// `tests::real_client::the_first_frame_waits_for_its_xray`.
+    pub(crate) fn effects_ready(&self) -> bool {
+        self.effects.ready() && self.xrays.ready()
+    }
+
+    /// What the first desktop frame waits for (`warm::Warm`): today the
+    /// effects; U17 adds the shell's scenes and the services' first data
+    /// here, so there is one gate.
+    /// `tests::real_client::the_first_frame_waits_for_its_xray`.
+    pub(crate) fn first_frame_ready(&self) -> bool {
+        self.effects_ready()
     }
 
     /// Raise a window and give it the keyboard.

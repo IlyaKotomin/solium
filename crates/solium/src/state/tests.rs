@@ -225,6 +225,87 @@ fn a_reload_drops_a_refused_settings_problem() {
     );
 }
 
+/// **`sol.startup` configures the first frame's gate, and a refusal
+/// keeps what ran**: `max_ms = 500` lets the frame through at 500 ms; a
+/// reload saying `max_ms = -1` is a problem under `startup`, naming the
+/// key, and the gate keeps 500; a reload that mends it drops the problem.
+#[test]
+fn sol_startup_configures_the_gate_and_a_refusal_keeps_what_ran() {
+    use std::time::Duration;
+    let directory = crate::effect::host::tests::scratch("state-startup");
+    let entry = directory.join("init.lua");
+    let display = smithay::reexports::wayland_server::Display::<Solium>::new()
+        .expect("creating a test wayland display");
+    let mut state = Solium::new(display.handle());
+    let ms = Duration::from_millis;
+    let said = |state: &Solium| {
+        state
+            .effects
+            .problems()
+            .iter()
+            .filter(|problem| problem.effect == "startup")
+            .map(|problem| problem.message.clone())
+            .collect::<Vec<_>>()
+    };
+    let write = |lua: &str| std::fs::write(&entry, lua).expect("writing the test script");
+    write("sol.pane('none')\nsol.startup({ first_frame = { max_ms = 500, on_reload = true } })\n");
+    state.reload_from(&entry);
+    assert!(said(&state).is_empty(), "{:?}", said(&state));
+    assert!(state.warm.holding(ms(1000), false));
+    assert!(state.warm.holding(ms(1499), false));
+    assert!(!state.warm.holding(ms(1500), false), "max_ms = 500 not obeyed");
+    write("sol.pane('none')\nsol.startup({ first_frame = { max_ms = -1 } })\n");
+    state.reload_from(&entry);
+    let refused = said(&state);
+    assert!(
+        refused.len() == 1 && refused[0].contains("max_ms"),
+        "{refused:?}"
+    );
+    assert!(state.warm.holding(ms(2000), false), "the refusal dropped on_reload");
+    assert!(!state.warm.holding(ms(2500), false), "the refusal dropped max_ms = 500");
+    write("sol.pane('none')\nsol.startup({ first_frame = { max_ms = 500 } })\n");
+    state.reload_from(&entry);
+    let _ = std::fs::remove_dir_all(directory);
+    assert!(said(&state).is_empty(), "{:?}", said(&state));
+}
+
+/// **A reload arms the first frame's gate again only with `on_reload`**:
+/// released at its first ready pass, a reload with `on_reload = false`
+/// draws at once, and one with `on_reload = true` holds until ready, the
+/// new configuration's `on_reload` the one obeyed.
+#[test]
+fn a_reload_arms_the_first_frames_gate_only_with_on_reload() {
+    use std::time::Duration;
+    let directory = crate::effect::host::tests::scratch("state-startup-reload");
+    let entry = directory.join("init.lua");
+    let display = smithay::reexports::wayland_server::Display::<Solium>::new()
+        .expect("creating a test wayland display");
+    let mut state = Solium::new(display.handle());
+    let ms = Duration::from_millis;
+    let write = |on: bool| {
+        std::fs::write(
+            &entry,
+            format!("sol.pane('none')\nsol.startup({{ first_frame = {{ on_reload = {on} }} }})\n"),
+        )
+        .expect("writing the test script")
+    };
+    write(false);
+    state.reload_from(&entry);
+    assert!(!state.warm.holding(ms(0), true), "the premise: released");
+    state.reload_from(&entry);
+    assert!(
+        !state.warm.holding(ms(100), false),
+        "on_reload = false held after a reload"
+    );
+    write(true);
+    state.reload_from(&entry);
+    let _ = std::fs::remove_dir_all(directory);
+    assert!(
+        state.warm.holding(ms(200), false),
+        "a reload with on_reload = true did not arm the gate"
+    );
+}
+
 /// **A refused set with broken rules says both**: its settings' error and
 /// every rule's, as each alone would.
 #[test]
@@ -11471,6 +11552,82 @@ end)"#,
             )]
         );
     }
+
+    /// **The first frame waits for its xray** (spec C14): with a T2 rule
+    /// wanted, the effects are not ready until every wanted cut has been
+    /// built once; with none wanted they are ready as the host is.
+    #[test]
+    fn the_first_frame_waits_for_its_xray() {
+        fx2_fixture!(fixture, "xray-warmup");
+        assert_eq!(
+            fixture.state.effects_ready(),
+            fixture.state.effects.ready(),
+            "no rule, no xray to wait for"
+        );
+        translucent_window(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur" } }"#,
+        );
+        let _slots = resolved(&mut fixture);
+        assert!(
+            !fixture.state.effects_ready(),
+            "ready before its xray was built"
+        );
+        let monitor = first_monitor(&fixture);
+        fixture
+            .state
+            .xrays
+            .drawn(&monitor, crate::effect::xray::Cut::Background, true);
+        assert_eq!(
+            fixture.state.effects_ready(),
+            fixture.state.effects.ready()
+        );
+        assert_eq!(
+            fixture.state.first_frame_ready(),
+            fixture.state.effects_ready(),
+            "one gate, the effects one of its terms"
+        );
+    }
+
+    /// **A held first frame asks for the next pass, and the cap lets it
+    /// through**: with a T2 slot's cut not built, the end of `prepare`
+    /// holds (so `elements` draws only the clear colour) and asks for
+    /// another pass, since nothing else may damage the screen to release
+    /// it; at `startup.first_frame.max_ms` it is drawn whatever is late,
+    /// asking for nothing. With no rule nothing is held and nothing is
+    /// asked (spec §8.4).
+    #[test]
+    fn a_held_first_frame_asks_for_the_next_pass() {
+        fx2_fixture!(fixture, "warm-hold");
+        translucent_window(&mut fixture);
+        fixture.state.redraw = false;
+        assert!(
+            !crate::render::hold_first_frame(&mut fixture.state),
+            "held with no rule"
+        );
+        assert!(!fixture.state.redraw, "a pass asked for with no rule");
+        // A session starting afresh, its first pass not asked yet.
+        fixture.state.warm = crate::warm::Warm::default();
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur" } }"#,
+        );
+        let _slots = resolved(&mut fixture);
+        fixture.state.redraw = false;
+        assert!(crate::render::hold_first_frame(&mut fixture.state));
+        assert!(fixture.state.redraw, "a held pass asked for no next one");
+        fixture.state.redraw = false;
+        fixture.state.clock.advance(std::time::Duration::from_millis(
+            crate::warm::FirstFrame::default().max_ms,
+        ));
+        assert!(
+            !crate::render::hold_first_frame(&mut fixture.state),
+            "held past max_ms"
+        );
+        assert!(!fixture.state.redraw);
+    }
+
 
     /// **Two windows with one blur want one memo.**
     #[test]

@@ -17,6 +17,9 @@ sol.session(config.session)
 -- Settings the compositor itself holds, applied from the same file as
 -- everything else. All of them take effect immediately when reloaded.
 sol.pane(config.pane)
+-- How the compositor starts: the first frame waits for what it shows. Before
+-- the effects, which it waits for. See config.lua's `startup`.
+sol.startup(config.startup)
 -- Which effects go where. See config.lua's `effects`.
 sol.effects(config.effects)
 sol.loading(config.loading)

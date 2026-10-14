@@ -324,11 +324,8 @@ impl Xrays {
     }
 
     /// Every cut ever wanted has been built once: the first frame has its
-    /// xray (spec C14). `tests::a_cuts_generation_moves_only_when_it_is_redrawn`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Task 45's Solium::effects_ready reads it")
-    )]
+    /// xray (spec C14), as `Solium::effects_ready` reads it.
+    /// `tests::a_cuts_generation_moves_only_when_it_is_redrawn`.
     pub(crate) fn ready(&self) -> bool {
         self.asked.iter().all(|key| self.built.contains(key))
     }

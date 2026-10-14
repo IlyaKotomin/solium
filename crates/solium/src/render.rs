@@ -271,6 +271,11 @@ pub(crate) struct Prepared {
     /// Every rule resolved once this pass ([`build_slots`]), so every output
     /// and every screencopy places from the same answer.
     pub(crate) slots: crate::effect::plan::Slots,
+    /// The first frame's gate holds this pass ([`hold_first_frame`]):
+    /// [`elements`] draws only the clear colour, on every monitor and in
+    /// every screencopy.
+    /// `state::tests::real_client::a_held_first_frame_asks_for_the_next_pass`.
+    pub(crate) held: bool,
 }
 
 /// One warp `prepare` made: the capture drawn through it, the program, the id
@@ -792,12 +797,48 @@ pub(crate) fn prepare(state: &mut Solium, renderer: &mut GlesRenderer) -> Prepar
         pass: 0,
     };
     let slots = effect_phases(&mut gpu);
+    let Gpu {
+        state,
+        warps,
+        overs,
+        hidden,
+        ..
+    } = gpu;
+    // Once a pass, after the sweep, whatever the number of monitors: the
+    // effects compiled, the scenes rendered and the cuts built above, so
+    // what the gate waits for is this pass's answer.
+    let held = hold_first_frame(state);
     Prepared {
-        warps: gpu.warps,
-        overs: gpu.overs,
-        hidden: gpu.hidden,
+        warps,
+        overs,
+        hidden,
         slots,
+        held,
     }
+}
+
+/// The first desktop frame's gate (`warm::Warm`, spec C14), asked once a
+/// pass at the end of `prepare`: `true` while [`elements`] draws only the
+/// clear colour. A held pass asks for the next one, since a frame of the
+/// clear colour damaged nothing and nothing else may come along to draw
+/// the frame that releases it; what is still not ready when `max_ms` lets
+/// the frame through is named in the log.
+/// `state::tests::real_client::a_held_first_frame_asks_for_the_next_pass`,
+/// `warm::tests::the_hold_is_capped_at_max_ms`.
+pub(crate) fn hold_first_frame(state: &mut Solium) -> bool {
+    let ready = state.first_frame_ready();
+    let released = state.warm.released();
+    let held = state.warm.holding(state.clock.now(), ready);
+    if held {
+        state.redraw = true;
+    } else if !ready && !released && state.warm.released() {
+        tracing::warn!(
+            compiling = !state.effects.ready(),
+            xray = !state.xrays.ready(),
+            "warm-up: the first frame drawn at startup.first_frame.max_ms, the effects still not ready"
+        );
+    }
+    held
 }
 
 /// `prepare`'s effect phases, so their order is one function a test drives
@@ -3966,6 +4007,12 @@ pub(crate) fn elements(
     // 7 ms of Qt and a pane walk that costs 7 ms of Rust look identical from
     // out here and want completely different fixes.
     let _elements = crate::pacing::span(crate::pacing::Phase::Elements);
+    // The first frame's gate holds: the frame is the clear colour, as a
+    // monitor with nothing on it is today, until what it shows is ready
+    // (`state::tests::real_client::a_held_first_frame_asks_for_the_next_pass`).
+    if prepared.held {
+        return Vec::new();
+    }
     let Picture {
         screen,
         scale,

@@ -619,6 +619,7 @@ impl Solium {
                     }
                 }
                 Command::Effects { rules, settings } => self.apply_effects_set(rules, settings),
+                Command::Startup(first_frame) => self.apply_startup(first_frame),
                 Command::Decoration { name } => {
                     // The slots windows occupy are kept; what changes is how
                     // much of each slot the frame takes, so every client is
@@ -946,7 +947,12 @@ impl Solium {
                 // the old configuration's: the new one says it again, or it
                 // is gone (`tests::a_reload_drops_a_refused_settings_problem`).
                 self.effects.clear_problems_of("settings");
+                self.effects.clear_problems_of("startup");
                 self.start_scripts(Some(scripts));
+                // After the new configuration's `sol.startup`, so its
+                // `on_reload` is the one obeyed: the first frame's gate armed
+                // again (`tests::a_reload_arms_the_first_frames_gate_only_with_on_reload`).
+                self.warm.reloaded();
                 // A configuration that loads mends the one that did not
                 // (`a_failed_reload_is_a_problem_until_one_succeeds`).
                 self.effects.clear_problems_of("config");
@@ -1165,6 +1171,24 @@ impl Solium {
                 }
                 self.apply_effects(rules);
             }
+        }
+    }
+
+    /// `sol.startup`'s `first_frame`, the first frame's gate: taken whole,
+    /// or refused on the overlay under `startup`, keeping what ran.
+    /// `tests::sol_startup_configures_the_gate_and_a_refusal_keeps_what_ran`.
+    pub(crate) fn apply_startup(&mut self, first_frame: Result<crate::warm::FirstFrame, String>) {
+        self.effects.clear_problems_of("startup");
+        match first_frame {
+            Ok(first_frame) => self.warm.configure(first_frame),
+            Err(error) => self
+                .effects
+                .push_problem(crate::effect::host::Problem::error(
+                    "startup",
+                    &Scripts::config_path(),
+                    None,
+                    error,
+                )),
         }
     }
 

@@ -628,6 +628,10 @@ pub(crate) enum Command {
         rules: Result<Vec<crate::effect::rules::Rule>, Vec<crate::effect::rules::RuleError>>,
         settings: Result<crate::effect::settings::Settings, String>,
     },
+    /// `sol.startup{ first_frame = … }`: the first frame's gate, read and
+    /// checked (`warm::startup`), or why it was refused
+    /// (`tests::sol_startup_reaches_the_compositor`).
+    Startup(Result<crate::warm::FirstFrame, String>),
 }
 
 /// What the compositor does with a window whose application has not connected.
@@ -2644,6 +2648,22 @@ fn build_api(lua: &Lua) -> mlua::Result<Table> {
             };
             with_pending(lua, |pending| {
                 pending.commands.push(Command::Effects { rules, settings });
+            })
+        })?,
+    )?;
+
+    // How the compositor starts: the first desktop frame's gate
+    // (`warm::Warm`), `startup.first_frame`, read and checked here and
+    // applied at once (`tests::sol_startup_reaches_the_compositor`).
+    sol.set(
+        "startup",
+        lua.create_function(|lua, options: Option<Table>| {
+            let read = match options {
+                None => Ok(crate::warm::FirstFrame::default()),
+                Some(table) => crate::warm::startup(&table)?,
+            };
+            with_pending(lua, |pending| {
+                pending.commands.push(Command::Startup(read));
             })
         })?,
     )?;
@@ -9229,6 +9249,62 @@ mod tests {
             "`effects.xray` is a table",
             "`effects.xray.layers` is a list of words",
             "`effects.xray.layers` is a list of words",
+        ];
+        assert_eq!(refused.len(), says.len(), "{refused:?}");
+        for (refused, says) in refused.iter().zip(says) {
+            assert!(
+                refused.as_ref().is_err_and(|error| error.contains(says)),
+                "{says}: {refused:?}"
+            );
+        }
+    }
+
+    /// **`sol.startup` reaches the compositor**: `first_frame` read and
+    /// checked into `Command::Startup`, with no table the default, and a
+    /// refused value, a number that is not finite or an unknown key an
+    /// `Err` naming what is wrong.
+    #[test]
+    fn sol_startup_reaches_the_compositor() {
+        let directory =
+            std::env::temp_dir().join(format!("solium-startup-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&directory);
+        let config = directory.join("init.lua");
+        std::fs::write(
+            &config,
+            "sol.startup({ first_frame = { max_ms = 500 } })\n\
+             sol.startup()\n\
+             sol.startup({ first_frame = { max_ms = -1 } })\n\
+             sol.startup({ first_frame = { max_ms = 1/0 } })\n\
+             sol.startup({ frist_frame = {} })\n\
+             sol.startup({ first_frame = 5 })\n",
+        )
+        .expect("writing");
+        let mut scripts = Scripts::load(&config).expect("loading");
+        let commands = scripts.startup().commands;
+        let _ = std::fs::remove_dir_all(&directory);
+        let read: Vec<_> = commands
+            .into_iter()
+            .filter_map(|command| match command {
+                Command::Startup(first_frame) => Some(first_frame),
+                _ => None,
+            })
+            .collect();
+        let [given, none, refused @ ..] = read.as_slice() else {
+            panic!("six calls: {read:?}");
+        };
+        assert_eq!(
+            given,
+            &Ok(crate::warm::FirstFrame {
+                max_ms: 500,
+                ..crate::warm::FirstFrame::default()
+            })
+        );
+        assert_eq!(none, &Ok(crate::warm::FirstFrame::default()));
+        let says = [
+            "`startup.first_frame.max_ms`",
+            "`startup.first_frame.max_ms`",
+            "did you mean `first_frame`?",
+            "`startup.first_frame` is a table",
         ];
         assert_eq!(refused.len(), says.len(), "{refused:?}");
         for (refused, says) in refused.iter().zip(says) {
