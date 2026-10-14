@@ -1319,6 +1319,31 @@ only way of knowing what is current should also check `modes.current()` once
 at its own top level, exactly as `overview.lua` checks its own `kept.active`
 there.
 
+### Where a new window lands on the desktop
+
+With no layout in charge, `lua/floating.lua` places and sizes every new window
+other than a dialog, on the work area of the monitor it opened on, which is the
+one under the pointer. `config.floating.placement` decides it:
+
+| key | default | |
+|---|---|---|
+| `policy` | `"center"` | where the window goes: the middle of the work area; `"cascade"`, one step from the last window opened; `"pointer"`, centred on the pointer |
+| `cascade` | `{ x = 32, y = 32 }` | one step, right and down, in logical pixels |
+| `wrap` | `"corner"` | where a new diagonal starts when the next step would leave the work area: its top-left plus one step; `"center"`, the middle moved right by one step |
+| `size` | `0.6` | a window's share of the work area on each axis, until its application has shown a size of its own |
+
+The policy only says where to start. A spot is taken when another window's
+top-left corner is nearer to it than half a step on both axes, and a new window
+steps on past every taken spot, so windows opened in a row step down and right
+one `cascade` apart instead of piling up (#240). When the next step would take
+the window past the edge of the work area, a new diagonal starts where `wrap`
+says, one `cascade.x` further right each time that one fills too, so no
+diagonal retraces another. Only when every spot is taken, which for a window as
+large as the work area is every spot after the first, does a window land on
+another. The scenarios `desktop-placement-*.lua` in `crates/solium/tests/`
+open three, four and ten windows in a row, wrap at the edge both ways, and
+place on two monitors.
+
 ## Worth knowing
 
 `solium --check` prints every binding it registered and will tell you an edit

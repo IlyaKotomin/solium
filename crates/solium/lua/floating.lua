@@ -322,61 +322,134 @@ if modes.current() == "floating" then
     bind_keys()
 end
 
--- Collision avoidance for `placement.policy = "center"`: whether `rect` sits
--- over any of `others`.
-local function overlaps(rect, others)
+-- `config.floating.placement`, each key checked, and the shipped value for
+-- one a configuration from before it has none of, or one this file cannot
+-- use: a `size` outside (0, 1], or a `cascade` axis that is not a step of a
+-- pixel or more -- a step of nothing would put every window on the first,
+-- and the walk below would never leave the spot it started on.
+-- `desktop_mode_a_cascade_of_no_step_is_read_as_the_shipped_one`.
+local function placement_settings()
+    local given = type(config.floating.placement) == "table" and config.floating.placement or {}
+    local size = given.size
+    if type(size) ~= "number" or size <= 0 or size > 1 then
+        size = 0.6
+    end
+    local cascade = type(given.cascade) == "table" and given.cascade or {}
+    local function step(value)
+        if type(value) == "number" and value >= 1 then
+            return value
+        end
+        return 32
+    end
+    return {
+        policy = given.policy,
+        size = size,
+        step = { x = step(cascade.x), y = step(cascade.y) },
+        wrap = given.wrap == "center" and "center" or "corner",
+    }
+end
+
+-- The top-left corner a `w` by `h` window has when centred on `area`, on a
+-- whole pixel, so a row of steps from it stays on whole pixels too.
+-- `desktop-placement-center.lua`.
+local function centred(area, w, h)
+    return {
+        x = math.floor(area.x + (area.w - w) / 2),
+        y = math.floor(area.y + (area.h - h) / 2),
+    }
+end
+
+-- Whether a `w` by `h` window with its top-left corner at `spot` is inside
+-- `area`, within the pixel `NEAR` allows for a divide.
+-- `desktop-placement-wrap-corner.lua`.
+local function fits(spot, w, h, area)
+    return spot.x >= area.x - NEAR and spot.y >= area.y - NEAR
+        and spot.x + w <= area.x + area.w + NEAR
+        and spot.y + h <= area.y + area.h + NEAR
+end
+
+-- Whether `spot` is taken: another window's top-left corner is nearer to it
+-- than half a `step` on both axes. Half a step, so a spot the cascade itself
+-- made, a whole step from the one before, is free whatever a pixel of
+-- rounding did to either, while a window dragged a few pixels off a spot
+-- still holds it -- a new window there would sit all but on top of it.
+-- `desktop_mode_a_spot_a_window_was_nudged_off_is_still_taken`.
+local function taken(spot, others, step)
     for _, other in ipairs(others) do
-        if rect.x < other.x + other.w and other.x < rect.x + rect.w
-            and rect.y < other.y + other.h and other.y < rect.y + rect.h
-        then
+        if math.abs(other.x - spot.x) < step.x / 2 and math.abs(other.y - spot.y) < step.y / 2 then
             return true
         end
     end
     return false
 end
 
--- A rect `w` by `h`, centred on `area`, moved by `offset` a growing number of
--- times and clamped back inside `area` each time, until it clears every rect
--- in `others` or this has been tried too many times to be worth another. The
--- cap is not a tuning knob: it is what keeps a desktop that is already full
--- from looping instead of simply opening the window somewhere, which is what
--- `dialogs.within`'s clamp eventually forces anyway.
+-- Where the `n`th new diagonal starts, once the one before would leave the
+-- work area (`placement.wrap`). "corner": the work area's top-left plus one
+-- step, and one `step.x` further right for each diagonal after that.
+-- "center": the centre, one `step.x` further right for each diagonal, so the
+-- first never starts on the first window. Either way each starts on a column
+-- of its own, so no diagonal ever retraces another.
+-- `desktop-placement-wrap-corner.lua`, `desktop-placement-wrap-center.lua`.
+local function restart(n, area, w, h, step, wrap)
+    if wrap == "center" then
+        local centre = centred(area, w, h)
+        return { x = centre.x + step.x * n, y = centre.y }
+    end
+    return { x = area.x + step.x * n, y = area.y + step.y }
+end
+
+-- The first spot from `start` that no window in `others` has taken: one
+-- `step` down and right at a time, and a new diagonal (`restart`) whenever
+-- the next step would take the window out of `area`, rather than clamping it
+-- back onto the last spot that fit (#240). Nil when even the next diagonal's
+-- first spot does not fit: every spot this walk can reach is taken, which
+-- for a window as large as the work area is every spot after the first.
 --
--- **Starts past as many steps as `others` already holds**, rather than from
--- the centre every time. The search is a fixed sequence of points from the
--- centre outward, so two windows that each give up without ever finding a
--- clear one -- a desktop with no more room, well inside `TRIES` for windows
--- as large as the share `default_size` hands back -- would otherwise give up
--- at the *same* point and land exactly on top of each other, the second
--- window invisible behind the one just placed.
--- `desktop_mode_places_three_new_windows_without_stacking_them` is the two
--- most recent windows, not only the first two.
-local TRIES = 16
-local function cascaded_from_centre(area, w, h, others, offset)
-    local cx, cy = area.x + (area.w - w) / 2, area.y + (area.h - h) / 2
-    local base = #others
-    local rect
-    for step = base, base + TRIES do
-        rect = dialogs.within({ x = cx + offset.x * step, y = cy + offset.y * step, w = w, h = h }, area)
-        if not overlaps(rect, others) then
-            return rect
+-- Finite without a cap: a step is a pixel or more on both axes
+-- (`placement_settings`), so every diagonal leaves the area, and each
+-- restart starts further right than the one before, so they run out too.
+-- `desktop-placement-center.lua`, `desktop-placement-pointer.lua`.
+local function free_spot(start, w, h, area, others, step, wrap)
+    local spot = start
+    local restarts = 0
+    while true do
+        if not fits(spot, w, h, area) then
+            restarts = restarts + 1
+            spot = restart(restarts, area, w, h, step, wrap)
+            if not fits(spot, w, h, area) then
+                return nil
+            end
+        end
+        if not taken(spot, others, step) then
+            return spot
+        end
+        spot = { x = spot.x + step.x, y = spot.y + step.y }
+    end
+end
+
+-- The window of `others` opened last: ids are handed out in order and never
+-- reused, so the highest. `"cascade"`'s "the last window opened", which is
+-- not the last one `workspaces.visible` happens to list.
+-- `desktop-placement-cascade.lua`.
+local function newest(others)
+    local last = nil
+    for _, other in ipairs(others) do
+        if not last or other.id > last.id then
+            last = other
         end
     end
-    return rect
+    return last
 end
 
 -- The size a new window opens at: its own, if it has shown a frame and so
--- has one worth believing; otherwise a share of the work area
+-- has one worth believing; otherwise `share` of the work area
 -- (`placement.size`). Either way capped by the work area and, once the
 -- application has said, by its own minimum and maximum (#115) -- the same
 -- two settings and the same `sizes.lua` every layout reads them through, so
 -- floating does not grow a second opinion about whether an application's
 -- size claim is believed.
-local function default_size(window, area)
-    local share = type(config.floating.placement) == "table" and config.floating.placement.size or 0.6
-    if type(share) ~= "number" or share <= 0 or share > 1 then
-        share = 0.6
-    end
+-- `desktop_mode_a_window_with_no_size_of_its_own_gets_a_share_of_the_work_area`.
+local function default_size(window, area, share)
     local w, h
     if window.shown and window.w > 0 and window.h > 0 then
         w, h = window.w, window.h
@@ -396,26 +469,46 @@ local function default_size(window, area)
     return math.min(w, area.w), math.min(h, area.h)
 end
 
--- Where window `id` goes: `config.floating.placement.policy`, from
--- `area` (its monitor's work area) and `others` (the floating windows
--- already on that monitor's desk, for "center" to cascade away from).
+-- Where window `window` goes: `config.floating.placement`, from `area` (the
+-- work area of the monitor it opened on) and `others` (the floating windows
+-- already on that monitor's desk).
+--
+-- The policy only says where the walk starts: the centre ("center", and
+-- anything unknown), one step from the last window opened ("cascade"), or
+-- centred on the pointer ("pointer"). Every policy then steps past the spots
+-- already taken, so no two new windows share one (#240). Until #240 the
+-- "center" search stepped away from any window the new one *overlapped* --
+-- and at 60% of the work area a step of 32 pixels overlaps every time, so
+-- the search ran out at the bottom-right corner it was clamped into, and
+-- every window after the first landed there.
+-- `desktop_mode_four_spawned_windows_step_down_by_cascade` and the
+-- `desktop-placement-*.lua` scenarios.
 function floating.placement_for(window, area, others)
-    local w, h = default_size(window, area)
-    local settings = config.floating.placement
-    local policy = type(settings) == "table" and settings.policy or "center"
-    local offset = (type(settings) == "table" and settings.cascade) or { x = 32, y = 32 }
-    if policy == "pointer" then
+    local settings = placement_settings()
+    local w, h = default_size(window, area, settings.size)
+    local step = settings.step
+    local start
+    local last = settings.policy == "cascade" and newest(others)
+    if settings.policy == "pointer" then
         local cursor = sol.cursor()
-        return dialogs.within({ x = cursor.x - w / 2, y = cursor.y - h / 2, w = w, h = h }, area)
+        local around = dialogs.within({
+            x = math.floor(cursor.x - w / 2),
+            y = math.floor(cursor.y - h / 2),
+            w = w,
+            h = h,
+        }, area)
+        start = { x = around.x, y = around.y }
+    elseif last then
+        start = { x = last.x + step.x, y = last.y + step.y }
+    else
+        start = centred(area, w, h)
     end
-    if policy == "cascade" then
-        local last = others[#others]
-        if not last then
-            return { x = area.x + (area.w - w) / 2, y = area.y + (area.h - h) / 2, w = w, h = h }
-        end
-        return dialogs.within({ x = last.x + offset.x, y = last.y + offset.y, w = w, h = h }, area)
+    local spot = free_spot(start, w, h, area, others, step, settings.wrap)
+    if not spot then
+        -- Nowhere free: the start, kept inside the work area.
+        return dialogs.within({ x = start.x, y = start.y, w = w, h = h }, area)
     end
-    return cascaded_from_centre(area, w, h, others, offset)
+    return { x = spot.x, y = spot.y, w = w, h = h }
 end
 
 -- A new window, while floating is in charge: placed and sized by
@@ -431,6 +524,12 @@ sol.on("open", function(id)
     if not window then
         return
     end
+    -- The focused monitor's work area: the compositor opens every new window
+    -- on the monitor under the pointer (`Solium::active_output`, which both
+    -- a launch's slot and a client's first placement read), so at this
+    -- moment that is the one `window.monitor` names -- and naming it rather
+    -- than asking again keeps the window on the monitor `workspaces.lua`'s
+    -- own `open` has just filed it under. `desktop-placement-two-monitors.lua`.
     local area = monitors.named(window.monitor)
     local others = {}
     for _, each in ipairs(workspaces.visible()) do
