@@ -1657,7 +1657,7 @@ mod real_client {
     use std::os::unix::net::UnixStream;
     use wayland_client::protocol::{
         wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager,
-        wl_data_offer, wl_keyboard, wl_output, wl_pointer, wl_registry, wl_seat, wl_shm,
+        wl_data_offer, wl_keyboard, wl_output, wl_pointer, wl_region, wl_registry, wl_seat, wl_shm,
         wl_shm_pool, wl_subcompositor, wl_subsurface, wl_surface,
     };
     use wayland_client::{Connection, Dispatch, QueueHandle};
@@ -1671,7 +1671,7 @@ mod real_client {
         zwp_idle_inhibit_manager_v1, zwp_idle_inhibitor_v1,
     };
     use wayland_protocols::wp::pointer_constraints::zv1::client::{
-        zwp_locked_pointer_v1, zwp_pointer_constraints_v1,
+        zwp_confined_pointer_v1, zwp_locked_pointer_v1, zwp_pointer_constraints_v1,
     };
     use wayland_protocols::xdg::activation::v1::client::{
         xdg_activation_token_v1, xdg_activation_v1,
@@ -2330,6 +2330,10 @@ mod real_client {
     wayland_client::delegate_noop!(Client: ignore zwlr_layer_surface_v1::ZwlrLayerSurfaceV1);
     wayland_client::delegate_noop!(Client: ignore zwp_pointer_constraints_v1::ZwpPointerConstraintsV1);
     wayland_client::delegate_noop!(Client: ignore zwp_locked_pointer_v1::ZwpLockedPointerV1);
+    // For a pointer confined to a region of a window: #220's
+    // `follow::a_pointer_confined_mid_flight_stays_where_the_client_holds_it`.
+    wayland_client::delegate_noop!(Client: ignore zwp_confined_pointer_v1::ZwpConfinedPointerV1);
+    wayland_client::delegate_noop!(Client: ignore wl_region::WlRegion);
 
     /// The two events this fixture does not ignore. See
     /// [`Client::configures`] and [`Client::closes`].
@@ -30470,6 +30474,54 @@ end)"#,
                 ),
                 ((1032.0, 132.0).into(), true, true),
                 "(the pointer, on the second window, the keyboard still on the first)"
+            );
+        }
+
+        /// **A pointer confined mid-flight stays where the client holds
+        /// it**: a warp onto a window, the window's client confining the
+        /// pointer to itself while the picture is still on its way, and the
+        /// mouse moved: the pointer stays in the window rather than going on
+        /// from the picture, which is outside it.
+        #[test]
+        fn a_pointer_confined_mid_flight_stays_where_the_client_holds_it() {
+            use zwp_pointer_constraints_v1::Lifetime;
+            let mut desk = Desk::new(1);
+            desk.install("");
+            let opened = desk.open();
+            let id = desk.id(&opened);
+            desk.apply(vec![floated(id, 600.0, 200.0, 0)]);
+            desk.rest();
+            desk.mouse_to((100.0, 900.0).into());
+            desk.warp(WarpTo::Window { id, at: (0.5, 0.5) }, linear(10_000));
+            let pointer = desk.client.seat_pointer(&desk.qh);
+            let compositor = desk.client.compositor.clone().expect("wl_compositor bound");
+            let region = compositor.create_region(&desk.qh, ());
+            region.add(0, 0, 64, 64);
+            let _confined = desk
+                .client
+                .pointer_constraints
+                .clone()
+                .expect("zwp_pointer_constraints_v1 bound")
+                .confine_pointer(
+                    &opened.surface,
+                    &pointer,
+                    Some(&region),
+                    Lifetime::Persistent,
+                    &desk.qh,
+                    (),
+                );
+            desk.pump();
+            desk.state.clock.advance(Duration::from_secs(5));
+            let drawn = desk.drawn();
+            assert!(
+                drawn.x < 500.0,
+                "the premise: the picture is still on its way, outside the window, at {drawn:?}"
+            );
+            desk.nudge((1.0, 0.0));
+            assert_eq!(
+                (desk.at(), desk.state.flight.is_none()),
+                ((632.0, 232.0).into(), true),
+                "(where the pointer is, the flight over)"
             );
         }
 

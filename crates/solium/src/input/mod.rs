@@ -648,11 +648,20 @@ fn pointer_relative<B: InputBackend>(state: &mut Solium, event: impl PointerMoti
         .outputs()
         .filter_map(|output| state.space.output_geometry(output))
         .collect();
+    let was = pointer.current_location();
     // From where the pointer is drawn, mid-flight included: the hand on the
-    // mouse moves what it sees, and the flight is over (#220).
-    // `state::tests::real_client::follow::real_motion_mid_flight_wins_at_once`.
-    let was = warp::interrupt(state).unwrap_or_else(|| pointer.current_location());
-    let (location, locked) = held(state, &pointer, confine(&screens, was + event.delta()), was);
+    // mouse moves what it sees, and the flight is over (#220). A client that
+    // holds the pointer holds it where it is, though: a confined pointer is
+    // not walked out of its window from a picture still on its way in.
+    // `state::tests::real_client::follow::real_motion_mid_flight_wins_at_once`,
+    // `state::tests::real_client::follow::a_pointer_confined_mid_flight_stays_where_the_client_holds_it`.
+    let from = warp::interrupt(state).unwrap_or(was);
+    let (location, locked) = held(
+        state,
+        &pointer,
+        confine(&screens, from + event.delta()),
+        was,
+    );
     let under = state.surface_under(location);
     // A locked pointer does not move, and the protocol is explicit that it is
     // not merely held in place: the compositor sends no motion at all. Sending
