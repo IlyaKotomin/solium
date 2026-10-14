@@ -3186,6 +3186,13 @@ pub(crate) fn stacked_elements(
 /// is in no layer's band, so no cut holds it; [`stacked`] lists only
 /// declared ones.
 /// `state::tests::real_client::reflow_on_close::stacking::xray_holds_the_cuts_bands_and_nothing_else`.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Task 44's xray phase keeps SessionLayers' entries by it, and build_slots a part's cut"
+    )
+)]
 pub(crate) fn band_of(state: &Solium, each: &Stacked) -> Band {
     match each {
         Stacked::Layer(surface, _) => Band::Layer(layer::ours(surface.layer()), Owner::Client),

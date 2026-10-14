@@ -1,11 +1,3 @@
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Task 44 builds each wanted cut in prepare and keys memos by it"
-    )
-)]
-
 //! xray (Ruling F29): the sharp picture of the layers below a part's band,
 //! per monitor, from which every T2 effect reads its `backdrop`. Its source
 //! is a parameter, so FX6's lock xray is a second one (Ruling F52).
@@ -235,6 +227,10 @@ pub(crate) trait XraySource: std::fmt::Debug {
 
 /// The session's layers in the cut's bands, in `render::stacked`'s order.
 /// `state::tests::real_client::reflow_on_close::stacking::xray_holds_the_cuts_bands_and_nothing_else`.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Task 44's xray phase builds each cut from it")
+)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct SessionLayers;
 
@@ -282,6 +278,10 @@ pub(crate) struct Xrays {
 impl Xrays {
     /// A slot reads `(output, cut)` this pass.
     /// `tests::a_cuts_generation_moves_only_when_it_is_redrawn`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Task 44's resolve wants each T2 place's cut")
+    )]
     pub(crate) fn want(&mut self, output: &str, cut: Cut) {
         self.wanted.insert((output.to_owned(), cut));
         self.asked.insert((output.to_owned(), cut));
@@ -289,6 +289,10 @@ impl Xrays {
 
     /// The cuts wanted this pass, in order.
     /// `tests::a_cuts_generation_moves_only_when_it_is_redrawn`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Task 44's xray phase builds each wanted cut")
+    )]
     pub(crate) fn wanted(&self) -> Vec<(String, Cut)> {
         let mut wanted: Vec<_> = self.wanted.iter().cloned().collect();
         wanted.sort();
@@ -296,6 +300,10 @@ impl Xrays {
     }
 
     /// `tests::a_cut_nobody_wants_is_kept_for_keep_ms`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Task 44's resolve clears the wants each pass")
+    )]
     pub(crate) fn clear_wants(&mut self) {
         self.wanted.clear();
     }
@@ -312,6 +320,13 @@ impl Xrays {
     /// counter's next value.
     /// `tests::a_cuts_generation_moves_only_when_it_is_redrawn`,
     /// `tests::no_two_cuts_or_monitors_ever_share_a_generation`.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Task 44's xray phase marks each cut drawn or kept"
+        )
+    )]
     pub(crate) fn drawn(&mut self, output: &str, cut: Cut, redrawn: bool) {
         let key = (output.to_owned(), cut);
         self.built.insert(key.clone());
@@ -322,6 +337,13 @@ impl Xrays {
     }
 
     /// `tests::a_cuts_generation_moves_only_when_it_is_redrawn`.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Task 44 keys memos and T2 runs on a cut's generation"
+        )
+    )]
     pub(crate) fn generation(&self, output: &str, cut: Cut) -> Option<u64> {
         self.generations.get(&(output.to_owned(), cut)).copied()
     }
@@ -340,6 +362,10 @@ impl Xrays {
 
     /// Every cut ever wanted has been built once: the first frame has its
     /// xray (spec C14). `tests::a_cuts_generation_moves_only_when_it_is_redrawn`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Task 45's Solium::effects_ready reads it")
+    )]
     pub(crate) fn ready(&self) -> bool {
         self.asked.iter().all(|key| self.built.contains(key))
     }
@@ -350,6 +376,10 @@ impl Xrays {
     /// The generation counter is never reset (the type's doc says why).
     /// `tests::a_cut_nobody_wants_is_kept_for_keep_ms`,
     /// `tests::a_memo_kept_past_its_cuts_sweep_runs_again_on_the_rebuilt_cut`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Task 44's prepare sweeps the cuts at its end")
+    )]
     pub(crate) fn sweep(&mut self, now: Duration, idle: Duration, pool: &mut crate::pool::Pool) {
         for key in &self.wanted {
             self.last_wanted.insert(key.clone(), now);
@@ -624,13 +654,20 @@ mod tests {
             None,
             "kept past keep_ms"
         );
-        // keep_ms = 0: gone at the next sweep; keep_ms = 5000: still held at 3 s.
+        // Each keeps a cut wanted in the very pass it sweeps, keep_ms = 0
+        // too, or its target would be given back and rebuilt every pass and
+        // every memo over it run again; then keep_ms = 0 gives it back at
+        // the next sweep, and keep_ms = 5000 still holds it at 3 s.
         for (keep_ms, held_at_3s) in [(0, false), (5000, true)] {
             let (mut xrays, mut pool) = (Xrays::default(), Pool::new(0));
             let idle = Duration::from_millis(keep_ms);
             xrays.want("DP-1", Cut::Background);
             xrays.drawn("DP-1", Cut::Background, true);
             xrays.sweep(Duration::ZERO, idle, &mut pool);
+            assert!(
+                xrays.generation("DP-1", Cut::Background).is_some(),
+                "keep_ms = {keep_ms}: swept in the pass that wants it"
+            );
             xrays.clear_wants();
             xrays.sweep(
                 Duration::from_millis(if keep_ms == 0 { 1 } else { 3000 }),
