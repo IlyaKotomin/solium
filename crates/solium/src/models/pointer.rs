@@ -315,6 +315,7 @@ pub(crate) mod tests {
                     duration: std::time::Duration::from_secs(10),
                     easing: crate::present::Curve::Linear,
                 }),
+                interrupt: crate::script::Interrupt::Pointer,
             },
         );
         state.redraw = false;

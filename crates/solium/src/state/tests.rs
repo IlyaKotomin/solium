@@ -15580,6 +15580,7 @@ end)"#,
                         y: 800.0,
                     },
                     motion: None,
+                    interrupt: crate::script::Interrupt::Pointer,
                 })],
                 ..Outcome::default()
             });
@@ -15591,6 +15592,7 @@ end)"#,
                     warp: Some(Warp {
                         to: WarpTo::Window { id, at: (0.5, 0.5) },
                         motion: None,
+                        interrupt: crate::script::Interrupt::Pointer,
                     }),
                 }],
                 ..Outcome::default()
@@ -29768,7 +29770,7 @@ end)"#,
     mod follow {
         use super::*;
         use crate::keymap::tests::{set_us_ru, tap};
-        use crate::script::{FocusSource, Warp, WarpTo};
+        use crate::script::{FocusSource, Interrupt, Warp, WarpTo};
         use smithay::backend::input::ButtonState;
 
         /// Super, the arrows and `t`, as xkb keycodes: evdev 125, 105, 106
@@ -30001,9 +30003,25 @@ end)"#,
                 self.pump();
             }
 
-            /// A warp, asked for by a script.
+            /// A warp, asked for by a script, that the mouse carries on from
+            /// where the pointer is.
             fn warp(&mut self, to: WarpTo, motion: Option<AnimationSpec>) {
-                self.apply(vec![Command::Warp(Warp { to, motion })]);
+                self.warp_with(to, motion, Interrupt::Pointer);
+            }
+
+            /// A warp, asked for by a script, that the mouse carries on from
+            /// as `interrupt` says.
+            fn warp_with(
+                &mut self,
+                to: WarpTo,
+                motion: Option<AnimationSpec>,
+                interrupt: Interrupt,
+            ) {
+                self.apply(vec![Command::Warp(Warp {
+                    to,
+                    motion,
+                    interrupt,
+                })]);
             }
 
             /// A scene's action, heard by the `surface` listeners and
@@ -30305,6 +30323,7 @@ end)"#,
                 Command::Warp(Warp {
                     to: WarpTo::Window { id, at: (0.5, 0.5) },
                     motion: linear(200),
+                    interrupt: Interrupt::Pointer,
                 }),
                 floated(id, 1000.0, 500.0, 10_000),
             ]);
@@ -30339,6 +30358,7 @@ end)"#,
                 Command::Warp(Warp {
                     to: WarpTo::Window { id, at: (0.5, 0.5) },
                     motion: linear(300),
+                    interrupt: Interrupt::Pointer,
                 }),
             ]);
             assert_eq!(
@@ -30355,37 +30375,126 @@ end)"#,
         }
 
         /// **Real motion mid-flight wins at once**: the mouse moved while a
-        /// warp's picture is half way carries on from where it is drawn, and
-        /// the flight is over.
+        /// warp's picture is half way ends the flight, and carries on from
+        /// where the warp put the pointer -- or, for a warp whose
+        /// `interrupt` is `"picture"`, from where the picture is drawn --
+        /// and the picture is drawn where the pointer is.
         #[test]
         fn real_motion_mid_flight_wins_at_once() {
             let mut desk = Desk::new(1);
             desk.install("");
-            desk.mouse_to((100.0, 100.0).into());
-            desk.warp(
-                WarpTo::Point {
-                    x: 1100.0,
-                    y: 600.0,
-                },
-                linear(10_000),
-            );
-            desk.state.clock.advance(Duration::from_secs(5));
-            let half = desk.drawn();
+            let mut carried = Vec::new();
+            for interrupt in [Interrupt::Pointer, Interrupt::Picture] {
+                desk.mouse_to((100.0, 100.0).into());
+                desk.warp_with(
+                    WarpTo::Point {
+                        x: 1100.0,
+                        y: 600.0,
+                    },
+                    linear(10_000),
+                    interrupt,
+                );
+                desk.state.clock.advance(Duration::from_secs(5));
+                let half = desk.drawn();
+                assert!(
+                    near(half, (600.0, 350.0).into()),
+                    "the premise: half way through it is drawn half way, at {half:?}"
+                );
+                desk.nudge((10.0, 0.0));
+                assert_eq!(desk.drawn(), desk.at(), "{interrupt:?}: drawn where it is");
+                carried.push((interrupt, desk.state.flight.is_none(), desk.at()));
+            }
+            let went_on = |at: Point<f64, Logical>, from: (f64, f64)| {
+                near(at, Point::from(from) + Point::from((10.0, 0.0)))
+            };
             assert!(
-                near(half, (600.0, 350.0).into()),
-                "the premise: half way through it is drawn half way, at {half:?}"
+                matches!(
+                    carried.as_slice(),
+                    [(_, true, pointer), (_, true, picture)]
+                        if went_on(*pointer, (1100.0, 600.0)) && went_on(*picture, (600.0, 350.0))
+                ),
+                "(interrupt, the flight over, where the pointer went on to): {carried:?}"
             );
-            desk.nudge((10.0, 0.0));
+        }
+
+        /// **With focus following the mouse, a nudge mid-flight keeps the
+        /// keyboard where the key put it**: a key in tiling focuses the
+        /// window alone in its column and takes the pointer to it, and the
+        /// mouse moved a pixel 30 ms into the picture's flight -- with the
+        /// picture still over the window it left -- carries on from where
+        /// the pointer is, so focus following the mouse leaves the keyboard
+        /// on the window the key chose.
+        #[test]
+        fn with_focus_following_the_mouse_a_nudge_mid_flight_keeps_the_keyboard_where_the_key_put_it()
+         {
+            let mut desk = Desk::new(1);
+            let (left, right, arrow) = three_tiled(&mut desk, true);
+            desk.state.profile.focus_follows_mouse = true;
+            desk.mouse_to(centre(desk.placed(right.pane)));
+            assert!(
+                desk.focused().as_ref() == Some(&right.window),
+                "the premise: focus followed the mouse onto the window beside"
+            );
+            desk.keys(&[SUPER, arrow]);
+            let to = centre(desk.placed(left.pane));
+            desk.state.clock.advance(Duration::from_millis(30));
+            let drawn = desk.drawn();
+            assert!(
+                desk.state
+                    .window_under(drawn)
+                    .is_some_and(|(window, _)| window == right.window),
+                "the premise: 30 ms in, the picture is still over the window it left, at {drawn:?}"
+            );
+            desk.nudge((1.0, 0.0));
             assert_eq!(
                 (
+                    desk.focused().as_ref() == Some(&left.window),
+                    desk.at(),
                     desk.state.flight.is_none(),
-                    near(desk.at(), half + Point::from((10.0, 0.0)))
                 ),
-                (true, true),
-                "(the flight is over, the pointer went on from where it was drawn): at {:?}",
-                desk.at()
+                (true, to + Point::from((1.0, 0.0)), true),
+                "(the keyboard still where the key put it, the pointer, the flight over)"
             );
-            assert_eq!(desk.drawn(), desk.at(), "and it is drawn where it is");
+        }
+
+        /// **Real motion after a warp reports only its own speed**: the jump
+        /// a warp makes is no motion of the mouse's, so the mouse moved ten
+        /// pixels every 8 ms just after one -- carried out at once, or
+        /// interrupting a flight from the pointer or from the picture -- is
+        /// 1250 pixels a second along `x`, as `Solium.cursor.velocity` would
+        /// say it, and not the distance the warp put behind it.
+        #[test]
+        fn real_motion_after_a_warp_reports_only_its_own_speed() {
+            let mut desk = Desk::new(1);
+            desk.install("");
+            let mut speeds = Vec::new();
+            for (motion, interrupt) in [
+                (None, Interrupt::Pointer),
+                (linear(10_000), Interrupt::Pointer),
+                (linear(10_000), Interrupt::Picture),
+            ] {
+                desk.mouse_to((100.0, 100.0).into());
+                let _ = desk.state.pointer.velocity();
+                desk.warp_with(
+                    WarpTo::Point {
+                        x: 1100.0,
+                        y: 600.0,
+                    },
+                    motion,
+                    interrupt,
+                );
+                desk.state.clock.advance(Duration::from_millis(50));
+                desk.nudge((10.0, 0.0));
+                desk.nudge((10.0, 0.0));
+                let speed = desk.state.pointer.velocity();
+                speeds.push((speed.x.round(), speed.y.round()));
+            }
+            assert_eq!(
+                speeds,
+                vec![(1250.0, 0.0), (1250.0, 0.0), (1250.0, 0.0)],
+                "(after a warp at once, after one whose flight the mouse ended going on from \
+                 the pointer, and from the picture)"
+            );
         }
 
         /// **A press mid-flight lands it**: the press goes where the pointer
@@ -30492,7 +30601,11 @@ end)"#,
             desk.apply(vec![floated(id, 600.0, 200.0, 0)]);
             desk.rest();
             desk.mouse_to((100.0, 900.0).into());
-            desk.warp(WarpTo::Window { id, at: (0.5, 0.5) }, linear(10_000));
+            desk.warp_with(
+                WarpTo::Window { id, at: (0.5, 0.5) },
+                linear(10_000),
+                Interrupt::Picture,
+            );
             let pointer = desk.client.seat_pointer(&desk.qh);
             let compositor = desk.client.compositor.clone().expect("wl_compositor bound");
             let region = compositor.create_region(&desk.qh, ());

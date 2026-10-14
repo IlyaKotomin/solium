@@ -649,11 +649,13 @@ fn pointer_relative<B: InputBackend>(state: &mut Solium, event: impl PointerMoti
         .filter_map(|output| state.space.output_geometry(output))
         .collect();
     let was = pointer.current_location();
-    // From where the pointer is drawn, mid-flight included: the hand on the
-    // mouse moves what it sees, and the flight is over (#220). A client that
-    // holds the pointer holds it where it is, though: a confined pointer is
-    // not walked out of its window from a picture still on its way in.
+    // Mid-flight the flight is over (#220), and the hand on the mouse moves
+    // on from where the warp put the pointer, or from where the picture is
+    // for a warp whose `interrupt` says so. A client that holds the pointer
+    // holds it where it is, though: a confined pointer is not walked out of
+    // its window from a picture still on its way in.
     // `state::tests::real_client::follow::real_motion_mid_flight_wins_at_once`,
+    // `state::tests::real_client::follow::with_focus_following_the_mouse_a_nudge_mid_flight_keeps_the_keyboard_where_the_key_put_it`,
     // `state::tests::real_client::follow::a_pointer_confined_mid_flight_stays_where_the_client_holds_it`.
     let from = warp::interrupt(state).unwrap_or(was);
     let (location, locked) = held(

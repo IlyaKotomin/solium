@@ -194,6 +194,7 @@
 ---@class sol.Warp
 ---@field to? "center"|{ x: number, y: number } Where on the window, as a share of its width and height. `"center"` by default. Not for a point, which is already a place.
 ---@field motion? sol.Motion How the picture flies. Left out, it is there at once; a duration left out is 220 ms, an easing `"outCubic"`.
+---@field interrupt? "pointer"|"picture" Where the mouse carries on from if it moves before the picture lands: `"pointer"`, where the warp put it (the default), or `"picture"`, where the picture is drawn.
 
 ---Where and how `sol.present` draws a window. A key left out says nothing: with
 ---no rect the window is drawn at its own, with no opacity it is opaque, and
@@ -768,7 +769,9 @@ function sol.focus(id, options) end
 ---instant, and no focus follows it. Its picture flies there from wherever it
 ---is drawn, along `warp.motion`; `Solium.cursor` says so while it does
 ---(`moving`, `from`, `to`, `velocity`). Moving the mouse mid-flight carries on
----from where the picture is, and a press lands it. Carried out once every
+---from where the pointer is, or from the picture as `warp.interrupt` says; the
+---jump is never measured as the mouse's speed; and a press lands it. Carried
+---out once every
 ---command of this handler is applied, so a window it has just moved is warped
 ---to where it was moved; the last warp asked for wins. Kept on a screen.
 ---Refused while a button or a client holds the pointer, and while the session

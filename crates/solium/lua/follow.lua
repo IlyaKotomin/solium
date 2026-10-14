@@ -57,10 +57,30 @@ local function motion()
     return nil
 end
 
+-- Where the mouse carries on from if it moves before the picture lands:
+-- "pointer", where the warp put it, or "picture", where the picture is.
+-- `which_focus_changes_take_the_pointer_along_where_to_and_how_is_configured`.
+local function interrupt()
+    local given = settings().interrupt
+    if given == nil or given == "pointer" or given == "picture" then
+        return given
+    end
+    once(string.format(
+        "focus.cursor.interrupt is %s, which is neither \"pointer\" nor \"picture\"; the mouse carries on from the pointer",
+        tostring(given)
+    ))
+    return nil
+end
+
+-- The options every warp here is asked with.
+local function options(to)
+    return { to = to, motion = motion(), interrupt = interrupt() }
+end
+
 -- Take the pointer to window `id`, if a focus change from `source` does.
 function follow.window(id, source)
     if id ~= nil and follow.wanted(source) then
-        sol.warp(id, { to = settings().to or "center", motion = motion() })
+        sol.warp(id, options(settings().to or "center"))
     end
 end
 
@@ -83,7 +103,7 @@ function follow.monitor(name, source)
     end
     local monitor = monitors.named(name)
     if monitor then
-        sol.warp({ x = monitor.x + monitor.w / 2, y = monitor.y + monitor.h / 2 }, { motion = motion() })
+        sol.warp({ x = monitor.x + monitor.w / 2, y = monitor.y + monitor.h / 2 }, options(nil))
     end
 end
 

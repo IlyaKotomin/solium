@@ -789,8 +789,8 @@ local defaults = {
         -- glides there along `motion`. The pointer itself is there at once,
         -- so what it is over -- a hover, a click, the cursor's shape -- is
         -- the new window's from the first instant. Moving the mouse while it
-        -- glides takes it from wherever it is drawn. `lua/follow.lua` is
-        -- the whole of the policy, and `sol.warp` the compositor's part.
+        -- glides carries on as `interrupt` says. `lua/follow.lua` is the
+        -- whole of the policy, and `sol.warp` the compositor's part.
         cursor = {
             -- Which focus changes take the pointer along, by what moved the
             -- keyboard: the `source` the `focus` event is told
@@ -819,6 +819,13 @@ local defaults = {
             -- every `motion` here, or `easing = "spring"`, which takes as
             -- long as it takes. `false` puts it there at once.
             motion = { duration = 260, easing = "outCubic" },
+            -- Where the mouse carries on from if it moves before the picture
+            -- lands: "pointer", from where the pointer already is -- the
+            -- picture jumps there, and with focus following the mouse the
+            -- window the key chose keeps the keyboard -- or "picture", from
+            -- where you see the picture, which may be over the window you
+            -- left.
+            interrupt = "pointer",
             -- A workspace switch that leaves no window to take the keyboard,
             -- from a source above that takes the pointer along: "center" puts
             -- the pointer in the middle of the monitor that switched, "stay"

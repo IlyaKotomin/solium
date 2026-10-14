@@ -10,15 +10,19 @@
 //! picture travels, from wherever it was drawn, along the motion the script
 //! asked for: the split panes make, input at the real place and the drawing
 //! presented. [`crate::cursor::flight`] is the picture's half.
-//! `tests::real_client::follow::a_warp_moves_the_pointer_at_once_and_flies_its_picture`.
+//! `tests::real_client::follow::a_key_takes_the_pointer_to_the_window_it_focuses_at_once_and_flies_its_picture`.
 //!
 //! **The hand on the mouse wins.** Real motion mid-flight ends the flight at
-//! once and carries on from where the pointer is drawn, since that is where
-//! the user sees it; a press lands it, so the click and the picture agree. A
+//! once and carries on from where the warp put the pointer -- or, for a warp
+//! whose `interrupt` says so, from where the picture is drawn -- and a press
+//! lands it, so the click and the picture agree. The jump a warp makes is no
+//! motion of the mouse's, so it is never measured as the pointer's speed. A
 //! warp is refused while a button holds the pointer (a drag, a menu, a scene's
 //! press or grab), while a client holds it (a locked or confined pointer), and
 //! while the session is locked.
 //! `tests::real_client::follow::real_motion_mid_flight_wins_at_once`,
+//! `tests::real_client::follow::with_focus_following_the_mouse_a_nudge_mid_flight_keeps_the_keyboard_where_the_key_put_it`,
+//! `tests::real_client::follow::real_motion_after_a_warp_reports_only_its_own_speed`,
 //! `tests::real_client::follow::a_press_mid_flight_lands_it`,
 //! `tests::real_client::follow::a_held_pointer_is_not_warped`,
 //! `tests::real_client::lock_focus::no_warp_moves_the_pointer_behind_the_lock`.
@@ -44,7 +48,7 @@ use smithay::{
 use crate::{
     cursor::flight::Flight,
     qml::hosted::PointerKind,
-    script::{Warp, WarpTo},
+    script::{Interrupt, Warp, WarpTo},
     state::Solium,
 };
 
@@ -80,19 +84,25 @@ pub(crate) fn warp(state: &mut Solium, warp: Warp) {
     place(state, &pointer, location);
     state.flight = warp
         .motion
-        .map(|motion| Flight::new(from, location, now, motion))
+        .map(|motion| Flight::new(from, location, now, motion, warp.interrupt))
         .filter(|flight| !flight.landed(now) && flight.from() != flight.to());
     state.redraw = true;
 }
 
 /// Real motion arrived: the flight is over, and the hand on the mouse carries
-/// on from where the pointer is drawn. Returns that point while a flight was
-/// under way, for motion that is relative to it.
-/// `tests::real_client::follow::real_motion_mid_flight_wins_at_once`.
+/// on from where the pointer is, which is where the warp put it, unless the
+/// flight's `interrupt` is [`Interrupt::Picture`]. Returns where the picture
+/// had got to then, for motion that is relative to it, and `None` with no
+/// flight or one that carries on from the pointer.
+/// `tests::real_client::follow::real_motion_mid_flight_wins_at_once`,
+/// `tests::real_client::follow::with_focus_following_the_mouse_a_nudge_mid_flight_keeps_the_keyboard_where_the_key_put_it`.
 pub(crate) fn interrupt(state: &mut Solium) -> Option<Point<f64, Logical>> {
     let flight = state.flight.take()?;
     state.redraw = true;
-    Some(flight.at(state.clock.now()))
+    match flight.interrupt() {
+        Interrupt::Pointer => None,
+        Interrupt::Picture => Some(flight.at(state.clock.now())),
+    }
 }
 
 /// A press: the picture lands where the pointer is, which is where the press
@@ -120,6 +130,10 @@ fn held_by_a_client(pointer: &PointerHandle<Solium>) -> bool {
 /// hover, the compositor's cursor over its chrome is asserted again, and the
 /// client under it is given the pointer and says its own.
 fn place(state: &mut Solium, pointer: &PointerHandle<Solium>, location: Point<f64, Logical>) {
+    // No motion of the mouse's led here: the next real report starts a
+    // movement of its own.
+    // `tests::real_client::follow::real_motion_after_a_warp_reports_only_its_own_speed`.
+    state.pointer.warped();
     let grabbed = pointer.is_grabbed();
     if state.lock.is_none() {
         let motion = super::scene_event(state, PointerKind::Motion);

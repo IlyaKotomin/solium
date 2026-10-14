@@ -605,7 +605,7 @@ skipping it names the window as its own split target.
 
 ```lua
 sol.warp(id)                                   -- to a window's centre, at once
-sol.warp(id, { to = { x = 0.5, y = 0.25 }, motion = { duration = 260, easing = "outCubic" } })
+sol.warp(id, { to = { x = 0.5, y = 0.25 }, motion = { duration = 260, easing = "outCubic" }, interrupt = "picture" })
 sol.warp({ x = 960, y = 540 }, { motion = { easing = "spring" } })
 sol.focus(id, { warp = true })                 -- the keyboard, then the pointer
 ```
@@ -631,13 +631,19 @@ a handler asks for wins, and a point off every screen is kept on one
 `state::tests::real_client::follow::a_tiled_window_is_warped_to_its_tile_before_its_client_has_filled_it`,
 `state::tests::real_client::follow::a_warp_to_nothing_goes_nowhere_and_one_off_every_screen_is_kept_on_one`).
 
-The hand on the mouse wins. Moving the mouse mid-flight carries on from where
-the picture is, a press lands it where the pointer is, and a second warp starts
-from wherever the first had got to. Nothing is warped while a button holds the
+The hand on the mouse wins. Moving the mouse mid-flight ends the flight and
+carries on from where the pointer is, so with focus following the mouse the
+window the warp went to keeps the keyboard; `interrupt = "picture"` carries on
+from where the picture is drawn instead. The jump is no motion of the mouse's,
+so the velocity `Solium.cursor` says after it is the mouse's own. A press lands
+the flight where the pointer is, and a second warp starts from wherever the
+first had got to. Nothing is warped while a button holds the
 pointer, while a client holds it (a game's locked pointer), or behind the lock.
 When the picture lands, what the pointer is over is asked again, so a window
 that slid in under it since has it and says its cursor (#229)
 (`state::tests::real_client::follow::real_motion_mid_flight_wins_at_once`,
+`state::tests::real_client::follow::with_focus_following_the_mouse_a_nudge_mid_flight_keeps_the_keyboard_where_the_key_put_it`,
+`state::tests::real_client::follow::real_motion_after_a_warp_reports_only_its_own_speed`,
 `state::tests::real_client::follow::a_press_mid_flight_lands_it`,
 `state::tests::real_client::follow::a_second_warp_mid_flight_starts_from_where_the_picture_is`,
 `state::tests::real_client::follow::a_held_pointer_is_not_warped`,

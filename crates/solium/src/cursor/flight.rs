@@ -12,7 +12,7 @@ use std::time::Duration;
 use smithay::utils::{Logical, Point};
 use solium_animation::{Animation, lerp};
 
-use crate::script::AnimationSpec;
+use crate::script::{AnimationSpec, Interrupt};
 
 /// How far ahead the velocity is measured, on the compositor's clock.
 ///
@@ -30,10 +30,12 @@ pub(crate) struct Flight {
     from: Point<f64, Logical>,
     to: Point<f64, Logical>,
     animation: Animation,
+    interrupt: Interrupt,
 }
 
 impl Flight {
-    /// A flight from `from` to `to`, starting at `now`, timed by `motion`. A
+    /// A flight from `from` to `to`, starting at `now`, timed by `motion`,
+    /// that real motion mid-flight carries on from as `interrupt` says. A
     /// spring takes as long as it takes, whatever the duration says.
     /// `tests::the_drawn_pointer_flies_from_where_it_was_to_where_the_pointer_is`.
     pub(crate) fn new(
@@ -41,11 +43,13 @@ impl Flight {
         to: Point<f64, Logical>,
         now: Duration,
         motion: AnimationSpec,
+        interrupt: Interrupt,
     ) -> Self {
         Self {
             from,
             to,
             animation: Animation::new(now, motion.duration, motion.easing),
+            interrupt,
         }
     }
 
@@ -92,6 +96,11 @@ impl Flight {
     pub(crate) const fn to(&self) -> Point<f64, Logical> {
         self.to
     }
+
+    /// Where real motion mid-flight carries on from.
+    pub(crate) const fn interrupt(&self) -> Interrupt {
+        self.interrupt
+    }
 }
 
 #[cfg(test)]
@@ -102,7 +111,7 @@ mod tests {
     use solium_animation::Curve;
 
     use super::Flight;
-    use crate::script::AnimationSpec;
+    use crate::script::{AnimationSpec, Interrupt};
 
     fn ms(millis: u64) -> Duration {
         Duration::from_millis(millis)
@@ -130,6 +139,7 @@ mod tests {
             point(500.0, 300.0),
             ms(1000),
             linear(200),
+            Interrupt::Pointer,
         );
         assert_eq!(
             (
@@ -158,7 +168,13 @@ mod tests {
     /// all the way, and zero from the landing on.
     #[test]
     fn the_velocity_is_the_flights_own_and_nothing_once_it_lands() {
-        let flight = Flight::new(point(0.0, 0.0), point(400.0, 0.0), ms(0), linear(200));
+        let flight = Flight::new(
+            point(0.0, 0.0),
+            point(400.0, 0.0),
+            ms(0),
+            linear(200),
+            Interrupt::Pointer,
+        );
         let near = |velocity: Point<f64, Logical>, x: f64| {
             (velocity.x - x).abs() < 1.0 && velocity.y.abs() < 1.0
         };

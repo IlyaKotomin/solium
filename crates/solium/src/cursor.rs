@@ -872,6 +872,13 @@ impl Pointer {
         self.motion.moved(at, location);
     }
 
+    /// The pointer was put somewhere by a warp, not moved there by the mouse:
+    /// see `scene::Motion::restart`.
+    /// `state::tests::real_client::follow::real_motion_after_a_warp_reports_only_its_own_speed`.
+    pub(crate) fn warped(&mut self) {
+        self.motion.restart();
+    }
+
     /// How fast the pointer has moved since this was last asked, in logical
     /// pixels a second. `scene::tests::velocity_is_the_motion_since_it_was_last_read`.
     pub(crate) fn velocity(&mut self) -> Point<f64, Logical> {

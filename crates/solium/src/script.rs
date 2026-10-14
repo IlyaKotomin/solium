@@ -674,13 +674,31 @@ pub(crate) enum WarpTo {
     Window { id: u64, at: (f64, f64) },
 }
 
-/// A warp: where the pointer goes, and how its picture flies there. The
+/// A warp: where the pointer goes, how its picture flies there, and where
+/// the mouse carries on from if it moves before the picture lands. The
 /// pointer itself goes at once; with no motion its picture does too.
 /// See `crate::input::warp`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Warp {
     pub(crate) to: WarpTo,
     pub(crate) motion: Option<AnimationSpec>,
+    pub(crate) interrupt: Interrupt,
+}
+
+/// Where real motion mid-flight carries on from: a warp's `interrupt`
+/// (#220).
+/// `state::tests::real_client::follow::real_motion_mid_flight_wins_at_once`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Interrupt {
+    /// From where the warp put the pointer, which is what it is over and
+    /// where a press goes: the picture is there at once, and the mouse moves
+    /// on from it. With focus following the mouse, the window the warp went
+    /// to keeps the keyboard.
+    /// `state::tests::real_client::follow::with_focus_following_the_mouse_a_nudge_mid_flight_keeps_the_keyboard_where_the_key_put_it`.
+    #[default]
+    Pointer,
+    /// From where the picture has got to, which is where the user sees it.
+    Picture,
 }
 
 /// What the compositor does with a window whose application has not connected.
@@ -4250,15 +4268,17 @@ fn build_api(lua: &Lua) -> mlua::Result<Table> {
                     Value::Boolean(true) => Some(Warp {
                         to: WarpTo::Window { id, at: CENTRE },
                         motion: None,
+                        interrupt: Interrupt::default(),
                     }),
                     Value::Table(warp) => {
-                        let (at, motion) = warp_options(Some(&warp), "sol.focus")?;
+                        let (at, motion, interrupt) = warp_options(Some(&warp), "sol.focus")?;
                         Some(Warp {
                             to: WarpTo::Window {
                                 id,
                                 at: at.unwrap_or(CENTRE),
                             },
                             motion,
+                            interrupt,
                         })
                     }
                     other => {
@@ -4288,7 +4308,7 @@ fn build_api(lua: &Lua) -> mlua::Result<Table> {
     sol.set(
         "warp",
         lua.create_function(|lua, (target, options): (Value, Option<Table>)| {
-            let (at, motion) = warp_options(options.as_ref(), "sol.warp")?;
+            let (at, motion, interrupt) = warp_options(options.as_ref(), "sol.warp")?;
             let to = match target {
                 Value::Integer(id) => WarpTo::Window {
                     id: u64::try_from(id).map_err(|_| {
@@ -4324,7 +4344,11 @@ fn build_api(lua: &Lua) -> mlua::Result<Table> {
                 }
             };
             with_pending(lua, |pending| {
-                pending.commands.push(Command::Warp(Warp { to, motion }));
+                pending.commands.push(Command::Warp(Warp {
+                    to,
+                    motion,
+                    interrupt,
+                }));
             })
         })?,
     )?;
@@ -5588,19 +5612,22 @@ fn motion_from(options: Option<&Table>) -> mlua::Result<(Option<Duration>, Optio
 const CENTRE: (f64, f64) = (0.5, 0.5);
 
 /// A warp's options as [`warp_options`] reads them: where on a window, as a
-/// share of its width and height, and the motion its picture flies along.
-type WarpOptions = (Option<(f64, f64)>, Option<AnimationSpec>);
+/// share of its width and height, the motion its picture flies along, and
+/// where real motion mid-flight carries on from.
+type WarpOptions = (Option<(f64, f64)>, Option<AnimationSpec>, Interrupt);
 
 /// A warp's options (#220): `to`, where on a window, `"center"` or a share
-/// of its width and height `{ x, y }`, and `motion`, how the drawn pointer
-/// flies there, `{ duration, easing }`. `to` left out is `None` for the
-/// caller to fill in; `motion` left out is none, and the picture is there at
-/// once. A duration left out of a motion is the default 220 ms, and an
-/// easing the default `"outCubic"`, as `sol.animate`'s are.
+/// of its width and height `{ x, y }`; `motion`, how the drawn pointer
+/// flies there, `{ duration, easing }`; and `interrupt`, where the mouse
+/// carries on from if it moves before the picture lands, `"pointer"` or
+/// `"picture"`. `to` left out is `None` for the caller to fill in; `motion`
+/// left out is none, and the picture is there at once; `interrupt` left out
+/// is `"pointer"`. A duration left out of a motion is the default 220 ms,
+/// and an easing the default `"outCubic"`, as `sol.animate`'s are.
 /// `tests::sol_warp_names_a_window_or_a_point_and_a_bad_one_is_an_error`.
 fn warp_options(options: Option<&Table>, caller: &str) -> mlua::Result<WarpOptions> {
     let Some(options) = options else {
-        return Ok((None, None));
+        return Ok((None, None, Interrupt::default()));
     };
     let at = match options.get::<Value>("to")? {
         Value::Nil => None,
@@ -5636,7 +5663,18 @@ fn warp_options(options: Option<&Table>, caller: &str) -> mlua::Result<WarpOptio
             )));
         }
     };
-    Ok((at, motion))
+    let interrupt = match options.get::<Value>("interrupt")? {
+        Value::Nil => Interrupt::default(),
+        Value::String(name) if name.to_string_lossy() == "pointer" => Interrupt::Pointer,
+        Value::String(name) if name.to_string_lossy() == "picture" => Interrupt::Picture,
+        other => {
+            return Err(mlua::Error::runtime(format!(
+                "{caller}: `interrupt` is \"pointer\" or \"picture\", not {}",
+                describe(&other)
+            )));
+        }
+    };
+    Ok((at, motion, interrupt))
 }
 
 impl AnimationSpec {
@@ -15108,8 +15146,8 @@ impl Scripts {
 #[cfg(test)]
 mod directions {
     use super::{
-        AnimationSpec, Command, Drawn, FocusSource, MonitorInfo, Parentage, Rect, Scripts,
-        Snapshot, Warp, WarpTo, WindowInfo,
+        AnimationSpec, Command, Drawn, FocusSource, Interrupt, MonitorInfo, Parentage, Rect,
+        Scripts, Snapshot, Warp, WarpTo, WindowInfo,
     };
     use crate::present::Curve;
     use std::path::PathBuf;
@@ -17172,11 +17210,13 @@ mod directions {
             .collect()
     }
 
-    /// A warp to window `id`'s `at`, along `motion`.
+    /// A warp to window `id`'s `at`, along `motion`, that the mouse carries
+    /// on from where the pointer is.
     fn to_window(id: u64, at: (f64, f64), motion: Option<AnimationSpec>) -> Warp {
         Warp {
             to: WarpTo::Window { id, at },
             motion,
+            interrupt: Interrupt::Pointer,
         }
     }
 
@@ -17360,6 +17400,7 @@ mod directions {
                 vec![Warp {
                     to: middle(WIDE),
                     motion: shipped_motion(),
+                    interrupt: Interrupt::Pointer,
                 }]
             ),
             "onto an empty workspace: (focused, warped)"
@@ -17396,6 +17437,7 @@ mod directions {
             vec![Warp {
                 to: middle(TALL),
                 motion: shipped_motion(),
+                interrupt: Interrupt::Pointer,
             }],
             "two monitors: the middle of the one the pointer is on"
         );
@@ -17551,10 +17593,13 @@ mod directions {
 
     /// **`sol.warp` names a window or a point, and a bad one is an error**:
     /// a window's id is its centre unless `to` says, a point is a point with
-    /// a motion's duration and the default easing, a spring is a spring;
-    /// anything but an id or a point, half a point, `to` with a point, a
-    /// `to` that is neither `"center"` nor a share, half a share, a motion
-    /// that is not a table and a negative id are errors, and ask for nothing.
+    /// a motion's duration and the default easing, a spring is a spring, and
+    /// the mouse carries on from the pointer mid-flight unless `interrupt`
+    /// says `"picture"`; anything but an id or a point, half a point, `to`
+    /// with a point, a `to` that is neither `"center"` nor a share, half a
+    /// share, a motion that is not a table, a negative id and an `interrupt`
+    /// that is neither `"pointer"` nor `"picture"` are errors, and ask for
+    /// nothing.
     #[test]
     fn sol_warp_names_a_window_or_a_point_and_a_bad_one_is_an_error() {
         let mut scripts = plain(
@@ -17563,6 +17608,10 @@ mod directions {
             sol.bind("super+a", function() sol.warp(5) end)
             sol.bind("super+b", function() sol.warp({ x = 10, y = 20 }, { motion = { duration = 100 } }) end)
             sol.bind("super+c", function() sol.warp(5, { to = "center", motion = { easing = "spring" } }) end)
+            sol.bind("super+d", function()
+                sol.warp(5, { interrupt = "picture" })
+                sol.warp(6, { interrupt = "pointer" })
+            end)
             sol.bind("super+e", function()
                 local said = {}
                 for _, call in ipairs({
@@ -17573,6 +17622,7 @@ mod directions {
                     function() sol.warp(5, { to = { x = 0.5 } }) end,
                     function() sol.warp(5, { motion = 3 }) end,
                     function() sol.warp(-1) end,
+                    function() sol.warp(5, { interrupt = "wherever" }) end,
                 }) do
                     said[#said + 1] = tostring((pcall(call)))
                 end
@@ -17588,6 +17638,7 @@ mod directions {
                 warped(&mut scripts, "super+a"),
                 warped(&mut scripts, "super+b"),
                 warped(&mut scripts, "super+c"),
+                warped(&mut scripts, "super+d"),
             ],
             [
                 vec![to_window(5, CENTRE, None)],
@@ -17597,6 +17648,7 @@ mod directions {
                         duration: std::time::Duration::from_millis(100),
                         easing: Curve::OutCubic,
                     }),
+                    interrupt: Interrupt::Pointer,
                 }],
                 vec![to_window(
                     5,
@@ -17606,13 +17658,20 @@ mod directions {
                         ..AnimationSpec::default()
                     }),
                 )],
+                vec![
+                    Warp {
+                        interrupt: Interrupt::Picture,
+                        ..to_window(5, CENTRE, None)
+                    },
+                    to_window(6, CENTRE, None),
+                ],
             ]
         );
         let outcome = scripts.key("super+e", Snapshot::default());
         assert_eq!(
             (outcome.status.unwrap_or_default(), warps(&outcome.commands)),
             (
-                "false,false,false,false,false,false,false".to_owned(),
+                "false,false,false,false,false,false,false,false".to_owned(),
                 Vec::new()
             ),
             "every bad call is an error, and none asks for a warp"
