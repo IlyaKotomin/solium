@@ -754,32 +754,94 @@ local defaults = {
 
         -- Per mode (the names `modes.register` uses): `"click"` focuses a
         -- window only on a press; `"follow"` also focuses it when the
-        -- pointer moves over it, which is what every tiling compositor
-        -- people arrive from does, and the compositor's own default for the
-        -- machine ([#159](https://github.com/Lilium-Linux/solium/issues/159),
-        -- `SOLIUM_FORM_FACTOR`) when a mode says neither.
+        -- pointer moves over it. Applied the moment the mode changes, and
+        -- never carried over from the mode you switched from. Who decides,
+        -- highest first (#128):
         --
-        -- Floating -- the desktop, with no layout in charge and windows free
-        -- to overlap -- defaults to click-only here: a window you are not
-        -- using sits under the pointer on the way to the one you want, and
-        -- hovering it should not steal the keyboard from what you were
-        -- typing into. Every other mode keeps the machine's own default
-        -- unless you name it too:
+        --   1. an entry of yours here, for the mode;
+        --   2. your own `follow` below, for every mode at once;
+        --   3. the entries shipped here;
+        --   4. the machine's own answer
+        --      ([#159](https://github.com/Lilium-Linux/solium/issues/159),
+        --      `SOLIUM_FORM_FACTOR`): follow on a desktop or a laptop, not
+        --      on a tablet or a phone.
+        --
+        -- Shipped, tiling and scrolling follow the pointer, which is what
+        -- every tiling compositor people arrive from does: their windows
+        -- never overlap, so pointing at one is choosing it. A shipped
+        -- "follow" is the machine's own answer, though, so a tablet or a
+        -- phone, with no pointer to hover, stays click-only in them; an
+        -- entry of yours follows on any machine. Floating -- the desktop,
+        -- with no layout in charge and windows free to overlap -- is
+        -- click-only: a window you are not using sits under the pointer on
+        -- the way to the one you want, and hovering it should not steal the
+        -- keyboard from what you were typing into.
         --
         --     focus = { modes = { floating = "follow", scrolling = "click" } },
         --
+        -- An entry that is neither word counts as none.
+        -- `your_mode_entry_then_your_focus_follow_then_the_shipped_entry_then_the_machine`,
+        -- `the_shipped_focus_follows_the_pointer_in_tiling_and_scrolling_and_not_in_floating`,
+        -- `on_a_tablet_the_shipped_layouts_leave_hover_to_the_machine` and
+        -- `the_shipped_modes_each_hand_over_their_own_focus_model`.
         modes = {
             floating = "click",
+            tiling = "follow",
+            scrolling = "follow",
+        },
+
+        -- Where the keyboard goes when the window that has it closes (#128):
+        -- per mode, a list of these, tried in order until one finds a window
+        -- on screen. The keyboard moves when the close lands -- as the window
+        -- finishes fading, not while you can still see it -- and when a
+        -- window goes on its own.
+        --
+        --   "pointer"    the window under the pointer, where the windows are
+        --                going: what hovering would pick the moment the
+        --                pointer moved, so it comes first where hover focus
+        --                is on.
+        --   "neighbour"  the window that takes its place on its monitor --
+        --                the tile that grows into the space, the column that
+        --                slides into it -- or, where nothing does, the one
+        --                nearest to where it stood. Of several, the one you
+        --                used last.
+        --   "recent"     the window you used before it, still open on its
+        --                monitor.
+        --   "topmost"    the topmost window on screen, on any monitor: what
+        --                the compositor does with no configuration, after
+        --                the window under the pointer.
+        --
+        -- A word that is not one of these is named in the log and skipped.
+        -- An empty list, `{}`, leaves the keyboard on nothing until you
+        -- click or point at a window. A mode with no entry here gets the
+        -- compositor's own rule, `{ "pointer", "topmost" }`.
+        --
+        --     focus = { after_close = { tiling = { "recent", "topmost" } } },
+        --
+        -- `in_tiling_the_window_that_takes_the_space_takes_the_keyboard`,
+        -- `in_scrolling_the_column_that_takes_the_place_takes_the_keyboard`,
+        -- `in_floating_the_window_focused_before_it_on_that_monitor_takes_the_keyboard`,
+        -- `with_after_close_pointer_the_window_under_the_pointer_takes_the_keyboard`
+        -- and `with_after_close_recent_tiling_hands_the_keyboard_to_the_window_used_before`.
+        after_close = {
+            floating = { "recent", "topmost" },
+            tiling = { "pointer", "neighbour", "topmost" },
+            scrolling = { "pointer", "neighbour", "topmost" },
         },
 
         -- `click` and `follow` above, for every mode at once rather than one
-        -- at a time -- not here by default, so that `nil` can mean "whatever
-        -- this machine's form factor already answered" rather than a fixed
-        -- default that cannot know it:
+        -- at a time -- not here by default, so that leaving them out means
+        -- the shipped entries in `modes` and then this machine's own answer,
+        -- rather than a fixed default that cannot know it. Yours outrank
+        -- every shipped entry, and an entry of yours in `modes` outranks
+        -- your `follow`; `click` has no entries per mode, so it is yours or
+        -- the machine's:
         --
         --     focus = { follow = false },   -- never follow the pointer, in any mode
+        --     focus = { follow = false, modes = { tiling = "follow" } },   -- only in tiling
         --     focus = { click = false },    -- a mode must `sol.focus` its own clicks
         --
+        -- `your_focus_follow_false_keeps_every_mode_from_following_unless_you_name_one`.
 
         -- Where the pointer goes when the keyboard moves (#220).
         --
@@ -811,7 +873,7 @@ local defaults = {
                 surface = false, -- a bar's window chip, the dock, a shell's search
                 open = false, -- a window opening
                 activate = false, -- an application bringing its window forward
-                settle = false, -- the window you were in went, and another took over
+                settle = false, -- the window you were in went, and another took over (focus.after_close)
                 script = false, -- `sol.focus` from anything else
             },
             -- Where on the window: "center", or a share of its width and
@@ -1307,12 +1369,18 @@ local defaults = {
         -- is put back and then goes, so its neighbours grow, shrink back and
         -- grow again. "when_gone" moves them once.
         --
+        -- "when_landed": once the fade has played, as the application is
+        -- asked to quit -- the window goes out where it stood, and then the
+        -- others close up. A refusal puts it back as "immediate" does.
+        --
         -- "when_gone": once the application has actually quit. Its tile stays
         -- reserved for the length of the fade and for however long the
         -- application then takes, and a refusal has nothing to put back. This
         -- is how every close behaved before #128.
         --
-        -- Either way, only while tiling is the layout in charge.
+        -- Whichever, only while tiling is the layout in charge.
+        -- `with_reflow_on_close_when_landed_the_grid_waits_for_the_close_to_land`
+        -- and `a_window_that_asks_inside_itself_gets_its_tile_back`.
         --
         -- Anything else is read as "immediate".
         reflow_on_close = "immediate",
@@ -1364,8 +1432,9 @@ local defaults = {
         -- The shorter feel for bringing a column into view.
         snap = { duration = 200, easing = "outCubic" },
         -- When the strip closes the gap a window you close leaves: the moment
-        -- you close it ("immediate", the default), or once the application has
-        -- actually quit ("when_gone", how it was before #128).
+        -- you close it ("immediate", the default), once its fade has played
+        -- ("when_landed"), or once the application has actually quit
+        -- ("when_gone", how it was before #128).
         -- A window whose application refuses to go comes back in a column of
         -- its own after the window that was before it; one that was first
         -- comes back first. Anything else is read as "immediate". The same
@@ -1522,8 +1591,9 @@ local open_sections = {
     focus = { click = true, follow = true },
     -- Mode names are open-ended, the same as a key combination: a mode
     -- outside this file can register any name with `modes.register` and
-    -- give `focus.modes` an entry of its own.
+    -- give `focus.modes` and `focus.after_close` entries of its own.
     ["focus.modes"] = true,
+    ["focus.after_close"] = true,
     -- `true` rather than a set of names: everything is accepted.
     bindings = true,
 }
@@ -1637,6 +1707,16 @@ local function merge(base, over, path, accepted)
     return base
 end
 
+-- `focus.modes` keeps the shipped entries apart from yours (#128). Merged in
+-- place, the two could not be told apart, and a shipped entry outranked your
+-- own `focus.follow`: `focus = { follow = false }` still followed the pointer
+-- in tiling. So the shipped entries go behind an empty table, which your
+-- file's entries are merged into: a plain read finds either --
+-- `config.focus.modes.tiling` is "follow" until you say otherwise -- while
+-- `rawget`, and `pairs`, find only yours. `modes.lua`'s `follow_for` ranks
+-- them. `your_mode_entry_then_your_focus_follow_then_the_shipped_entry_then_the_machine`.
+defaults.focus.modes = setmetatable({}, { __index = defaults.focus.modes })
+
 -- `require` searches the user's directory first, so this finds
 -- ~/.config/solium/user.lua when there is one and nothing when there is not.
 --
@@ -1680,9 +1760,10 @@ end
 --   * `keyboard`, `cursor` and `bindings` are the sections above; the first
 --     two are checked against a list this file restates, the other two
 --     against nothing: `bindings` because any key combination is one, and
---     `focus.modes` because mode names are open-ended the same way (a mode
---     outside this file can register any name). `focus.modes.folating`
---     merges in silently, exactly like a misspelled binding.
+--     `focus.modes` and `focus.after_close` because mode names are
+--     open-ended the same way (a mode outside this file can register any
+--     name). `focus.modes.folating` merges in silently, exactly like a
+--     misspelled binding.
 --   * A value of the wrong *type* is not this check's business. `gap = "12"`
 --     is a recognised key and passes.
 for _, entry in ipairs(unrecognised) do

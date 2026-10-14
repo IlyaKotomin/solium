@@ -221,6 +221,7 @@ simply does not contain it. There is nothing to clean up.
 sol.on("open",   function(id) end)                 -- a window's life began
 sol.on("surface", function(surface, action, data) end) -- a hosted scene sent an action
 sol.on("closing", function(id) end)                -- a close was asked for
+sol.on("close_landed", function(id) end)           -- ...its animation has played
 sol.on("refused", function(id) end)                -- ...and declined: it is back
 sol.on("close",  function(id) end)                 -- it is gone
 sol.on("focus",  function(id, source, changed) end) -- the keyboard moved, what moved it, and from another window?
@@ -312,19 +313,21 @@ application with unsaved work puts up a dialog and stays. So:
 | event | sent | means |
 |---|---|---|
 | `closing(id)` | the moment a close is asked for -- the frame's button, `sol.close`, `super+q` -- as the window starts fading | reflow now, if you want to |
+| `close_landed(id)` | when the animation has played, the window has faded out, and the application has just been asked to go | reflow now, if you waited for the animation |
 | `refused(id)` | when the application declines -- it said nothing for a second, or answered with a dialog -- and the window is back on screen | put it back, if you took it out |
 | `close(id)` | when the window is gone | forget it |
 
-In that order. After `closing` exactly one of the other two follows, and
-**`refused` never follows `close`**: once a window has gone, nothing brings it
-back. A refused window is an ordinary window again, and closing it a second
-time starts over with a second `closing`. A window whose application quit on
-its own -- `exit`, its own Quit, a crash -- was never asked, so it gets `close`
-and nothing before it; it still fades out where it stood, from what the
-application last showed -- in front of the windows it was in front of and
-behind the rest -- while a layout that reflows at `close` grows its
-neighbours into the space, behind it. Its row is in `close`'s own snapshot, leaving, and
-in no snapshot after.
+In that order. `close_landed` follows `closing` unless the application went,
+or answered with a dialog, during the animation, and then exactly one of the
+other two follows, and **`refused` never follows `close`**: once a window has
+gone, nothing brings it back. A refused window is an ordinary window again,
+and closing it a second time starts over with a second `closing`. A window
+whose application quit on its own -- `exit`, its own Quit, a crash -- was
+never asked, so it gets `close` and nothing before it; it still fades out
+where it stood, from what the application last showed -- in front of the
+windows it was in front of and behind the rest -- while a layout that reflows
+at `close` grows its neighbours into the space, behind it. Its row is in
+`close`'s own snapshot, leaving, and in no snapshot after.
 
 `close` still means *gone*, and nothing else. Anything a script keeps about a
 window -- `dialogs.forget`, `tiling.exiled` -- is dropped there and not at
@@ -344,20 +347,38 @@ that is leaving waits, and takes effect if a refused close brings it back.
 `modes.use` counts on that, since it lets every window go.
 
 The shipped layouts close up at `closing`, while they are the layout in
-charge, and put the window back at `refused`; `reflow_on_close = "when_gone"`
-in their section of `config.lua` makes both events do nothing and leaves the
-reflow to `close`, which is how every close worked before #128. Closing up at
-once has one cost worth knowing: the compositor waits a second for an
-application to go before it takes the silence for a refusal, so one slower
-than that to quit is refused and then closes, and the layout moves three times
--- at the press, at `refused`, and at `close`.
+charge, and put the window back at `refused`. `reflow_on_close` in their
+section of `config.lua` chooses the moment: `"immediate"`, the default, at
+`closing`; `"when_landed"` at `close_landed`, once the window has faded out
+where it stood; and `"when_gone"` leaves the reflow to `close`, which is how
+every close worked before #128. Closing up before the application has gone has
+one cost worth knowing: the compositor waits a second for an application to go
+before it takes the silence for a refusal, so one slower than that to quit is
+refused and then closes, and the layout moves three times -- as it closes up,
+at `refused`, and at `close`.
+
+**Where the keyboard goes is the compositor's, not the layout's.** It stays on
+the window being closed until the close lands, so what you type during the
+fade goes where you are looking, and then moves by `config.focus.after_close`
+for the mode in charge: the window under the pointer, the window that took the
+closed one's place (or the one nearest to where it stood), the one used before
+it on that monitor, or the topmost -- in the order the mode lists them. A
+window that goes on its own while it has the keyboard hands it on the same
+way. A layout that wants a say focuses a window in its own handler; the
+compositor then leaves the keyboard where that put it. `focus` hears the
+hand-off with the source `"settle"`, which `focus.cursor.follows.settle`,
+`false` as shipped, keeps from taking the pointer along: a close never moves
+the pointer out from under your hand. While the session is locked, a key from
+the unlock is still down or a scene holds the keyboard, the hand-off waits,
+and when it comes it goes by the compositor's own rule -- the window under the
+pointer, then the topmost -- not by `after_close`.
 
 A layout that listens for neither event hears exactly what it always heard --
 `close`, once the window is gone -- so a mode written before these two existed
 keeps working unchanged, and keeps its slot for a closing window until the
-application has gone. To close up at once, handle `closing`, leave `leaving`
-windows out of any arrangement you build from `sol.windows()`, and put the
-window back on `refused`.
+application has gone. To close up at once, handle `closing` (or
+`close_landed`), leave `leaving` windows out of any arrangement you build from
+`sol.windows()`, and put the window back on `refused`.
 
 **`focus` is heard for a new window too**, in every mode and for an X11
 window as much as a Wayland one. The compositor gives a window the keyboard at
@@ -1109,7 +1130,8 @@ ends in `"allow"` regardless, with a line in the log, because a window has to
 go somewhere.
 
 "Empty" does not count a window that is being closed, unless
-`reflow_on_close = "when_gone"` is keeping its tile. With
+`reflow_on_close` is keeping its tile: `"when_gone"`, or `"when_landed"`,
+which keeps the workspace until the application has gone. With
 `workspaces.per_monitor` off it means empty on every screen, since that
 workspace is every screen at once. A window that belongs to no workspace in
 particular is on every one — the view carries it along — so it leaves none

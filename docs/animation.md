@@ -147,7 +147,8 @@ A window you close shrinks to 0.86 of its size and fades out over 190 ms, on
 `inOutQuad` (`present::CLOSING`). The compositor plays that before it tells the
 application to close, so the window can still paint while it goes, and by
 default the layout moves the other windows into its place at once
-(`reflow_on_close`; [modes.md](modes.md) has the events). A window whose own
+(`reflow_on_close`, which can also wait for the fade to land or for the
+application to go; [modes.md](modes.md) has the events). A window whose own
 application closes it fades the same way, from the last picture it drew
 (#126), and so does a loading window whose application never arrives, once
 `loading.patience` runs out.

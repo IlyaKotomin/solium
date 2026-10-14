@@ -272,6 +272,19 @@ pub(crate) struct Solium {
     /// `tests::real_client::reflow_on_close::hosted::a_closed_window_leaves_no_gap_in_focus_order`.
     pub(crate) focus_history: Vec<u64>,
 
+    /// Where the keyboard goes when the window that has it closes, word by
+    /// word until one finds a window: `config.focus.after_close` for the
+    /// mode in charge, handed over with `sol.focus_mode` (#128). With no
+    /// configuration, [`crate::successor::Successor::UNCONFIGURED`]. See
+    /// [`Self::settle_focus`].
+    pub(crate) after_close: Vec<crate::successor::Successor>,
+
+    /// The window that had the keyboard when it closed, and where it stood:
+    /// what `after_close`'s words are asked about. Set where a closing window
+    /// gives the keyboard up ([`Self::note_keyboard_left`]), taken by
+    /// [`Self::settle_focus`], and dropped by any focus that is not its own.
+    pub(crate) keyboard_left: Option<(crate::pane::PaneId, Rectangle<i32, Logical>)>,
+
     /// Windows that asked for attention where nobody could see them, until
     /// each is focused: `Windows`' `urgent` (Ruling 18).
     /// `tests::real_client::reflow_on_close::keyboard_at_open::a_refused_activation_marks_the_window_urgent_until_it_is_focused`.
@@ -1195,6 +1208,8 @@ impl Solium {
             surfaces: crate::scripted::Surfaces::default(),
             published: crate::models::Published::default(),
             focus_history: Vec::new(),
+            after_close: crate::successor::Successor::UNCONFIGURED.to_vec(),
+            keyboard_left: None,
             urgent: std::collections::HashSet::new(),
             workspaces: None,
             apps: Vec::new(),

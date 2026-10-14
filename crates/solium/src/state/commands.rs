@@ -443,19 +443,21 @@ impl Solium {
                     click,
                     follow,
                     clear_on_empty_click,
+                    after_close,
                 } => {
-                    // `None` leaves the profile's current answer alone --
-                    // see `Command::FocusMode`'s own doc for why there is no
-                    // fixed default to fall back to instead.
-                    if let Some(click) = click {
-                        self.profile.click_to_focus = click;
-                    }
-                    if let Some(follow) = follow {
-                        self.profile.focus_follows_mouse = follow;
-                    }
-                    if let Some(clear) = clear_on_empty_click {
-                        self.profile.clear_focus_on_empty_click = clear;
-                    }
+                    // `None` is the machine's own answer, the form factor's,
+                    // and never the answer the last call left: see
+                    // `Command::FocusMode`'s own doc, and
+                    // `a_mode_that_names_nothing_gets_the_machines_own_focus_not_the_last_modes`.
+                    let machine =
+                        crate::input::profile::Profile::for_form_factor(self.profile.form_factor);
+                    self.profile.click_to_focus = click.unwrap_or(machine.click_to_focus);
+                    self.profile.focus_follows_mouse =
+                        follow.unwrap_or(machine.focus_follows_mouse);
+                    self.profile.clear_focus_on_empty_click =
+                        clear_on_empty_click.unwrap_or(machine.clear_focus_on_empty_click);
+                    self.after_close = after_close
+                        .unwrap_or_else(|| crate::successor::Successor::UNCONFIGURED.to_vec());
                 }
                 Command::Power { monitor, on } => match monitor {
                     None => self.power_all(on),

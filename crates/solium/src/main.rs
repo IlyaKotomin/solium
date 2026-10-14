@@ -63,6 +63,7 @@ mod single_pixel;
 mod stack;
 mod state;
 mod style;
+mod successor;
 mod surface;
 mod synth;
 mod text_input;

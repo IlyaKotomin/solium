@@ -186,7 +186,7 @@
 ---| "surface" # A hosted scene's action: a bar's window chip, the dock, a search.
 ---| "open" # A window opening, or an `"open"` listener.
 ---| "activate" # An application bringing its window forward, or an `"activate"` listener.
----| "settle" # The window the keyboard was on went, and another took over.
+---| "settle" # The window the keyboard was on went, and another took over: as a close lands, the one `config.focus.after_close` chose.
 ---| "script" # `sol.focus` from anything else.
 
 ---A warp: where on a window the pointer goes, and how its picture flies
@@ -317,14 +317,22 @@
 ---@class sol.X11Options
 ---@field hidden? string[] WM_CLASS names to hide, matched case-insensitively against either field a client sets (`class` or `instance` on `sol.Window`). Replaces the whole default list rather than adding to it; default `{ "xwaylandvideobridge" }`.
 
----The input profile's focus policy (#219). A key left out keeps whatever it
----already answered -- there is no fixed default here the way `sol.idle` has
----one, since that would have to know the machine's own form factor
----(#159) and a mode calling this does not.
+---The input profile's focus policy (#219). A key left out is the machine's
+---own answer for it, the form factor's (#159) -- never what the call before
+---this one said, so a mode that names nothing does not inherit the mode before
+---it (#128).
 ---@class sol.FocusModeOptions
 ---@field click? boolean Whether a press focuses the window it lands on.
 ---@field follow? boolean Whether moving the pointer over a window focuses it.
+---@field after_close? sol.AfterClose|sol.AfterClose[] Where the keyboard goes when the window that has it closes, tried in order until one finds a window on screen; `{}` leaves it on nothing. Left out: `{ "pointer", "topmost" }`. An unknown word is logged and skipped.
 ---@field clear_on_empty_click? boolean Whether a press on empty desktop or the wallpaper clears keyboard focus. A press on a client's own shell surface (a bar, say) is not covered yet, even one that declines the keyboard: see #219.
+
+---One word of `sol.FocusModeOptions.after_close` (#128).
+---@alias sol.AfterClose
+---| "pointer" # The window under the pointer, where the windows are going.
+---| "neighbour" # The window that takes the closed one's place on its monitor -- one going into where it stood -- or the one nearest to it; of several, the one focused last.
+---| "recent" # The window focused most recently that is still open on its monitor.
+---| "topmost" # The topmost window on screen, on any monitor.
 
 ---The pointer's theme. A key left out, or no table, means the configuration
 ---did not say, and `XCURSOR_THEME` and `XCURSOR_SIZE` have their turn.
@@ -377,6 +385,7 @@
 ---| "focus" # The keyboard moved to a window: `(id, source, changed)`, `source` what moved it, a `sol.FocusSource`, and `changed` whether it came from another window or none -- `false` for the window that had it focused again. `lua/follow.lua` takes the pointer along by them.
 ---| "activate" # A window asked to be brought forward, after the compositor answered: `(id, why)`. `why` is `"launch"` when an application already running answered a launch with a window it had, and `"request"` for anything else.
 ---| "closing" # A close was asked for and the window is fading: `(id)`.
+---| "close_landed" # A close the compositor asked for has played its animation: the window has faded out of sight where it stood, and its application has just been asked to go -- or, an X11 one that let the last request go unanswered, been ended: `(id)`. Told after `closing` and before the `close` or `refused` that follows; not told for a window that went, or answered with a dialog, before its close landed, nor for one whose application never came, which is told `close` there and then.
 ---| "refused" # Its application declined, and the window is back: `(id)`.
 ---| "close" # The window is gone: `(id)`.
 ---| "fullscreen" # A window went fullscreen, or left it: `(id, entering)`. Told once the change is made: its client has been sent its new size and it lives at its new rectangle. Once every listener has run, the compositor moves its picture there from where it is drawn, as a layout's glide does, with the timing a listener set with `sol.animate`, and at once if none set one. Until the client answers at its new size the window is held there and its last picture stretched into it, for a quarter of a second past the landing at most; the transform is released when the glide lands. With no timing the change puts no transform on the window and holds nothing. A window a mode is presenting is left where the mode draws it. A change a listener makes is made at once and not told.
@@ -974,7 +983,7 @@ function sol.unknown(key, meant) end
 ---finalizer, and the `__close` of a to-be-closed variable in the function a
 ---stop interrupts, run where no hook does, so the deadline cannot stop a loop
 ---in either.
----@overload fun(event: "open"|"closing"|"refused"|"close", handler: fun(id: integer))
+---@overload fun(event: "open"|"closing"|"close_landed"|"refused"|"close", handler: fun(id: integer))
 ---@overload fun(event: "focus", handler: fun(id: integer, source: sol.FocusSource, changed: boolean))
 ---@overload fun(event: "activate", handler: fun(id: integer, why: "launch"|"request"))
 ---@overload fun(event: "drop", handler: fun(id: integer, x: number, y: number))

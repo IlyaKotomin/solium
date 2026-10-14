@@ -66,10 +66,18 @@ impl Solium {
     /// way out was to move the mouse over something. From the other side of the
     /// screen that is a session that broke when you closed a window.
     ///
-    /// The window under the pointer first, because with focus-follows-mouse
-    /// that is where focus would land the moment you moved; the topmost
-    /// otherwise. Called where a window went, and only when nothing has focus,
-    /// so it cannot argue with a script that has just chosen one.
+    /// **Where a window that had the keyboard closed, by
+    /// `config.focus.after_close`** for the mode in charge (#128): word by
+    /// word, the window under the pointer, the one that takes its place, the
+    /// one used before it on its monitor, or the topmost -- see
+    /// [`crate::successor`]. Only as the close hands the keyboard on: a
+    /// lock, a key still down from an unlock or a scene holding the keyboard
+    /// puts that off, and the settle that comes later is one of the others.
+    /// Anywhere else, and with no configuration, the window under the
+    /// pointer first, because with focus-follows-mouse that is where focus
+    /// would land the moment you moved; the topmost otherwise. Called where
+    /// a window went, and only when nothing has focus, so it cannot argue
+    /// with a script that has just chosen one.
     ///
     /// **While locked, the only place the keyboard can go is a lock surface**,
     /// so that is where this sends it: to the lock screen on the monitor the
@@ -126,6 +134,16 @@ impl Solium {
     /// question the pointer path already asks, put to the screens rather than
     /// to a point.
     pub(crate) fn settle_focus(&mut self) {
+        // The window that had the keyboard when its close landed, if one did,
+        // taken before anything returns: a close is answered here or not at
+        // all. A lock, a key still down from an unlock and a scene holding
+        // the keyboard each put the hand-off off, and the settle that comes
+        // later -- the unlock's, the key's, the scene's letting go -- goes by
+        // the rule there always was; left in place, the closed window and
+        // where it stood would steer that settle, or any later one, by a
+        // close it no longer answers.
+        // `a_settle_put_off_by_a_held_key_goes_by_the_compositors_own_rule`.
+        let left = self.keyboard_left.take();
         if self.lock.is_some() {
             self.settle_lock_focus();
             return;
@@ -138,6 +156,8 @@ impl Solium {
         if self.hosted_keyboard.is_some() {
             return;
         }
+        // Something already has it, so a window that closed has been
+        // answered for: nothing is left for `after_close` to decide.
         if self.focused_window().is_some() {
             return;
         }
@@ -150,17 +170,19 @@ impl Solium {
         // with. See `SETTLED`.
         let landed = self.settling();
         let screens = self.screens();
-        let next = at
-            .and_then(|at| self.window_under_at(at, landed))
-            .map(|(window, _)| window)
-            .or_else(|| {
-                self.panes
-                    .iter()
-                    .rev()
-                    .filter(|pane| !pane.leaving())
-                    .filter(|pane| self.on_stage(pane, &screens, landed))
-                    .find_map(|pane| pane.client().cloned())
-            });
+        // **`config.focus.after_close` when a window that had the keyboard
+        // closed, and the rule there always was otherwise** (#128): the
+        // window under the pointer, else the topmost on screen -- after an
+        // unlock, a shell letting go, a window moved off screen. Word by word
+        // until one finds a window, and with none the keyboard is left on
+        // nothing, as the configuration asked. See `crate::successor`.
+        let words = match left {
+            Some(_) => self.after_close.clone(),
+            None => crate::successor::Successor::UNCONFIGURED.to_vec(),
+        };
+        let next = words
+            .into_iter()
+            .find_map(|word| self.successor(word, left, at, landed, &screens));
         if let Some(window) = next {
             tracing::debug!("a window went and the keyboard had nowhere to be");
             self.focus_window(
@@ -169,6 +191,114 @@ impl Solium {
                 crate::script::FocusSource::Settle,
             );
         }
+    }
+
+    /// Remember that `pane`, which is closing, had the keyboard, and where it
+    /// stood: what [`Self::settle_focus`] asks `config.focus.after_close`'s
+    /// words about once the keyboard comes off it. Nothing if it does not have
+    /// the keyboard -- a window nobody was typing into hands nothing on.
+    ///
+    /// Called where a closing window gives the keyboard up: when its close
+    /// lands (`settle_closing`, before [`Self::hand_off_keyboard`]), and when
+    /// it goes on its own while it has it ([`Self::depart`]).
+    /// `a_window_that_closes_itself_hands_the_keyboard_to_the_window_that_takes_its_place`.
+    pub(super) fn note_keyboard_left(&mut self, pane: crate::pane::PaneId) {
+        if !self.looks_focused(pane) {
+            return;
+        }
+        // Where the layout had it, as every candidate is measured: the tile,
+        // not what its client last committed into it.
+        if let Some(held) = self.panes.get(pane) {
+            self.keyboard_left = Some((pane, self.laid_out_at(held)));
+        }
+    }
+
+    /// The window one word of `config.focus.after_close` picks, if it finds
+    /// one: see [`crate::successor::Successor`] for each. `left` is the window
+    /// that closed and where it stood, and `"neighbour"` and `"recent"` find
+    /// nothing without it.
+    ///
+    /// Every candidate is a window [`Self::settle_focus`] could always hand
+    /// the keyboard to: not on its way out, and headed somewhere on screen.
+    /// `"neighbour"` and `"recent"` keep to the monitor the closed window was
+    /// on -- the rectangle it stood in, by its centre, as every window is
+    /// placed on a monitor -- where the user was working.
+    fn successor(
+        &self,
+        word: crate::successor::Successor,
+        left: Option<(crate::pane::PaneId, Rectangle<i32, Logical>)>,
+        at: Option<Point<f64, Logical>>,
+        landed: Duration,
+        screens: &[Rectangle<i32, Logical>],
+    ) -> Option<Window> {
+        use crate::successor::Successor;
+        match word {
+            Successor::Pointer => at
+                .and_then(|at| self.window_under_at(at, landed))
+                .map(|(window, _)| window),
+            Successor::Topmost => self
+                .panes
+                .iter()
+                .rev()
+                .filter(|pane| !pane.leaving())
+                .filter(|pane| self.on_stage(pane, screens, landed))
+                .find_map(|pane| pane.client().cloned()),
+            Successor::Recent => {
+                let (gone, stood) = left?;
+                self.beside(gone, stood, screens, landed)
+                    .0
+                    .first()
+                    .and_then(|pane| pane.client().cloned())
+            }
+            Successor::Neighbour => {
+                let (gone, stood) = left?;
+                let (recent, rest) = self.beside(gone, stood, screens, landed);
+                let candidates: Vec<(crate::pane::PaneId, Rectangle<i32, Logical>)> = recent
+                    .into_iter()
+                    .chain(rest)
+                    .map(|pane| (pane.id(), self.laid_out_at(pane)))
+                    .collect();
+                crate::successor::neighbour(stood, &candidates)
+                    .and_then(|id| self.panes.get(id))
+                    .and_then(|pane| pane.client().cloned())
+            }
+        }
+    }
+
+    /// The windows that could take the keyboard from `gone`, on the monitor
+    /// it stood on: those focused before, most recently first, and then the
+    /// rest, topmost first. Where each is laid out is where it is going, so a
+    /// neighbour still growing into the space is judged by the tile it is
+    /// growing into.
+    fn beside(
+        &self,
+        gone: crate::pane::PaneId,
+        stood: Rectangle<i32, Logical>,
+        screens: &[Rectangle<i32, Logical>],
+        landed: Duration,
+    ) -> (Vec<&Pane>, Vec<&Pane>) {
+        let monitor = self.output_of(stood);
+        let eligible = |pane: &Pane| {
+            pane.id() != gone
+                && !pane.leaving()
+                && pane.client().is_some()
+                && self.on_stage(pane, screens, landed)
+                && self.output_of(self.laid_out_at(pane)) == monitor
+        };
+        let recent: Vec<&Pane> = self
+            .focus_history
+            .iter()
+            .filter_map(|id| self.panes.by_script_id(*id))
+            .filter(|pane| eligible(pane))
+            .collect();
+        let rest = self
+            .panes
+            .iter()
+            .rev()
+            .filter(|pane| eligible(pane))
+            .filter(|pane| !recent.iter().any(|seen| seen.id() == pane.id()))
+            .collect();
+        (recent, rest)
     }
 
     /// Take the keyboard off a window that is no longer on screen, and give it
@@ -264,6 +394,9 @@ impl Solium {
         // a policy can tell that from the keyboard moving (#220).
         // `tests::real_client::follow::the_focus_event_says_whether_the_keyboard_moved`.
         let changed = !self.is_focused(window);
+        // Whatever closed has been answered for: this is where the keyboard
+        // went, by `settle_focus`'s choice or by anyone else's.
+        self.keyboard_left = None;
         // Any explicit focus ends a scene's hold on the keyboard, a click on a
         // window and `sol.focus` among them (Ruling 14).
         // `tests::real_client::reflow_on_close::hosted::clicking_a_window_ends_the_shells_hold`,
@@ -351,6 +484,7 @@ impl Solium {
         if self.hosted_keyboard.is_some() || self.focused_window().is_none() {
             return;
         }
+        self.keyboard_left = None;
         self.redraw = true;
         self.give_keyboard(None, serial);
         crate::xwayland::activate(self, None);

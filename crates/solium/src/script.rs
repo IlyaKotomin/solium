@@ -566,16 +566,25 @@ pub(crate) enum Command {
     /// load, both from `config.focus` (#219).
     ///
     /// Every field is `Option`, and unlike [`Command::Idle`] a missing one is
-    /// not "the default" -- there is no fixed default a mode-aware call could
-    /// fall back to that would still know the machine's own form factor
-    /// (#159, `crate::input::profile::Profile::for_form_factor`). `None`
-    /// here means "leave the input profile's current answer alone", so a
-    /// mode that only has an opinion about `follow` cannot reset `click` out
-    /// from under whatever named it last.
+    /// not a fixed default -- there is none a mode-aware call could fall back
+    /// to that would still know the machine's own form factor (#159,
+    /// `crate::input::profile::Profile::for_form_factor`). **`None` is the
+    /// machine's own answer**, the form factor's, and never what the call
+    /// before it said. It used to mean "leave the current answer alone",
+    /// which made a mode that names nothing inherit the mode before it: the
+    /// shipped floating's click-only, so tiling never followed the pointer
+    /// (#128). `after_close`'s `None` is
+    /// [`crate::successor::Successor::UNCONFIGURED`].
+    /// `a_mode_that_names_nothing_gets_the_machines_own_focus_not_the_last_modes`
+    /// in `state/tests.rs`.
     FocusMode {
         click: Option<bool>,
         follow: Option<bool>,
         clear_on_empty_click: Option<bool>,
+        /// Where the keyboard goes when the window that has it closes, word
+        /// by word (#128): `config.focus.after_close` for the mode. See
+        /// `crate::successor`.
+        after_close: Option<Vec<crate::successor::Successor>>,
     },
     /// Turn one monitor, by name, or every one, on or off. See `power.rs`.
     Power {
@@ -962,6 +971,52 @@ impl Kept {
             Self::Tree(tree) => Value::UserData(lua.create_userdata(TilingTree(tree))?),
             Self::Strip(strip) => Value::UserData(lua.create_userdata(Scrolling(strip))?),
         })
+    }
+}
+
+/// `sol.focus_mode`'s `after_close`: one word of
+/// [`crate::successor::Successor`], or a list of them in order (#128).
+///
+/// A word it does not know is named in the log and left out, and the rest
+/// still count; what is left can be nothing at all, which leaves the keyboard
+/// on nothing when the window that has it closes, as asked. `nil` is `None`,
+/// the compositor's own rule, and anything else is named and read as `nil`.
+/// `sol_focus_mode_reads_after_close_word_by_word`.
+fn after_close_words(value: &Value) -> Option<Vec<crate::successor::Successor>> {
+    let word = |each: &Value| -> Option<crate::successor::Successor> {
+        let parsed = match each {
+            Value::String(text) => text
+                .to_str()
+                .ok()
+                .and_then(|text| crate::successor::Successor::parse(&text)),
+            _ => None,
+        };
+        if parsed.is_none() {
+            tracing::warn!(
+                word = describe(each),
+                known = ?crate::successor::Successor::WORDS,
+                "focus_mode: after_close names something that is not one of its words; \
+                 leaving it out"
+            );
+        }
+        parsed
+    };
+    match value {
+        Value::Nil => None,
+        Value::String(_) => Some(word(value).into_iter().collect()),
+        Value::Table(list) => Some(
+            list.sequence_values::<Value>()
+                .filter_map(Result::ok)
+                .filter_map(|each| word(&each))
+                .collect(),
+        ),
+        other => {
+            tracing::warn!(
+                value = describe(other),
+                "focus_mode: after_close is a word or a list of words; reading it as nil, the compositor's own rule"
+            );
+            None
+        }
     }
 }
 
@@ -1777,6 +1832,25 @@ impl Scripts {
     /// answer (#128).
     pub(crate) fn closing(&mut self, id: u64, snapshot: Snapshot) -> Outcome {
         self.dispatch(snapshot, move |lua, _| call_listeners(lua, "closing", id))
+    }
+
+    /// A close has landed: its animation has played, the window has faded
+    /// out of sight, and its client has just been asked to go (an X11 one
+    /// that let the last request go unanswered, ended). Between `closing` and
+    /// `close` or `refused`, once per close the compositor asked for; never
+    /// for a window that went, or answered with a dialog, before its close
+    /// landed, nor for one whose client never came.
+    ///
+    /// The moment a layout set to wait for the animation reflows
+    /// (`reflow_on_close = "when_landed"`, #128): later than `closing`, so the
+    /// other windows stay put while the window plays out, and earlier than
+    /// `close`, so they do not wait on the application.
+    /// `with_reflow_on_close_when_landed_the_grid_waits_for_the_close_to_land`
+    /// in `state/tests.rs`.
+    pub(crate) fn close_landed(&mut self, id: u64, snapshot: Snapshot) -> Outcome {
+        self.dispatch(snapshot, move |lua, _| {
+            call_listeners(lua, "close_landed", id)
+        })
     }
 
     /// A window that was closing is staying: its client declined, and the
@@ -3543,12 +3617,12 @@ fn build_api(lua: &Lua) -> mlua::Result<Table> {
     // The input profile's focus policy, overridden from Lua (#219):
     // `config.focus`, which `lua/modes.lua` hands over on every mode change
     // as well as at load, same as `sol.idle` above. Unlike `sol.idle`, a key
-    // left out -- or the whole table left out -- changes nothing rather than
-    // resetting to a fixed default: the profile already answered `click` and
-    // `follow` from the machine's own form factor before any script ran
-    // (`SOLIUM_FORM_FACTOR`, #159), and a mode that only has an opinion about
-    // one of the three must not clobber the other two.
-    // `sol_focus_mode_leaves_out_keys_unchanged`.
+    // left out -- or the whole table left out -- is not a fixed default but
+    // the machine's own answer, from its form factor (`SOLIUM_FORM_FACTOR`,
+    // #159), which the compositor works out when it applies the command. And
+    // never the answer the call before left, which is what a mode naming
+    // nothing used to inherit (#128): see `Command::FocusMode`.
+    // `sol_focus_mode_leaves_a_key_out_to_the_machine`.
     sol.set(
         "focus_mode",
         lua.create_function(|lua, options: Option<mlua::Table>| {
@@ -3574,11 +3648,16 @@ fn build_api(lua: &Lua) -> mlua::Result<Table> {
                 ),
                 None => (None, None, None),
             };
+            let after_close = options
+                .as_ref()
+                .and_then(|options| options.get::<Value>("after_close").ok())
+                .and_then(|value| after_close_words(&value));
             with_pending(lua, |pending| {
                 pending.commands.push(Command::FocusMode {
                     click,
                     follow,
                     clear_on_empty_click,
+                    after_close,
                 });
             })
         })?,
@@ -7271,18 +7350,182 @@ mod tests {
                     click,
                     follow,
                     clear_on_empty_click,
+                    ..
                 } => Some((click, follow, clear_on_empty_click)),
                 _ => None,
             })
             .collect()
     }
 
-    /// **A key `sol.focus_mode` is not given leaves the profile's answer for
-    /// it alone** (#219): unlike `sol.idle`, there is no fixed default to
-    /// fall back to, because a mode calling it knows nothing about the
-    /// machine's own form factor.
+    /// Every `Command::FocusMode`'s `after_close` a run of commands carries,
+    /// in order.
+    fn after_closes(commands: Vec<Command>) -> Vec<Option<Vec<crate::successor::Successor>>> {
+        commands
+            .into_iter()
+            .filter_map(|command| match command {
+                Command::FocusMode { after_close, .. } => Some(after_close),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// **`after_close` is read word by word** (#128): a word, a list in
+    /// order, a word it does not know left out with the rest kept, an empty
+    /// list kept empty -- the keyboard left on nothing -- and `nil` or
+    /// anything else read as `None`, the compositor's own rule.
     #[test]
-    fn sol_focus_mode_leaves_out_keys_unchanged() {
+    fn sol_focus_mode_reads_after_close_word_by_word() {
+        use crate::successor::Successor::{Neighbour, Pointer, Recent, Topmost};
+        let directory = std::env::temp_dir().join("solium-script-test-after-close-words");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("a temporary directory");
+        let config = directory.join("init.lua");
+        std::fs::write(
+            &config,
+            r#"
+            sol.focus_mode({ after_close = { "recent", "neighbor", "pointer", 7 } })
+            sol.focus_mode({ after_close = "topmost" })
+            sol.focus_mode({ after_close = { "neighbour" } })
+            sol.focus_mode({ after_close = {} })
+            sol.focus_mode({})
+            sol.focus_mode({ after_close = 42 })
+            "#,
+        )
+        .expect("writing the test script");
+        let mut scripts = Scripts::load(&config).expect("loading the test script");
+        let words = after_closes(scripts.startup().commands);
+        let _ = std::fs::remove_dir_all(&directory);
+        assert_eq!(
+            words,
+            [
+                Some(vec![Recent, Pointer]),
+                Some(vec![Topmost]),
+                Some(vec![Neighbour]),
+                Some(vec![]),
+                None,
+                None,
+            ]
+        );
+    }
+
+    /// **Each shipped mode hands over its own focus model** (#128): floating
+    /// click-only, tiling and scrolling following the pointer, each with its
+    /// own `focus.after_close` -- floating's at load, tiling's and
+    /// scrolling's as each is switched to. A shipped `"follow"` is handed
+    /// over as `None`, the machine's own answer, so a tablet or a phone,
+    /// with no pointer to hover, keeps its own (#159);
+    /// `on_a_tablet_the_shipped_layouts_leave_hover_to_the_machine` in
+    /// `state/tests.rs` is that half.
+    #[test]
+    fn the_shipped_modes_each_hand_over_their_own_focus_model() {
+        use crate::successor::Successor::{Neighbour, Pointer, Recent, Topmost};
+        let Some((directory, mut scripts)) =
+            shipped_init_with_user("solium-script-test-after-close-shipped", "return {}")
+        else {
+            return;
+        };
+        let commands = [
+            scripts.startup().commands,
+            scripts.key("super+t", empty_snapshot()).commands,
+            scripts.key("super+s", empty_snapshot()).commands,
+        ];
+        let _ = std::fs::remove_dir_all(&directory);
+        let [loaded, tiling, scrolling] =
+            commands.map(|commands| (focus_modes(commands.clone()), after_closes(commands)));
+        assert_eq!(
+            loaded,
+            (
+                vec![(None, Some(false), Some(true))],
+                vec![Some(vec![Recent, Topmost])]
+            ),
+            "floating, at load"
+        );
+        let layout = (
+            vec![(None, None, Some(true))],
+            vec![Some(vec![Pointer, Neighbour, Topmost])],
+        );
+        assert_eq!(tiling, layout, "tiling");
+        assert_eq!(scrolling, layout, "scrolling");
+    }
+
+    /// **Whether the pointer focuses what it moves over is your entry for
+    /// the mode, then your `focus.follow`, then the shipped entry, then the
+    /// machine's own answer** (#128 review, the ranking of 2026-10-14). So
+    /// `focus = { follow = false }` never follows, in any mode, unless you
+    /// also name a mode; merged over the shipped table, the shipped
+    /// `tiling = "follow"` used to win over it. Each mode is switched to in
+    /// turn, `custom` -- a mode no table names -- by a binding of the
+    /// user's own, and the `follow` each hands over is read; `None` is the
+    /// machine's own answer, which a shipped `"follow"` defers to.
+    /// An entry of yours that is neither word counts as none.
+    /// Against the ranking before it -- any entry in `focus.modes`, then
+    /// `focus.follow` -- it fails at `{ follow = false }`: tiling's shipped
+    /// `"follow"` won. With a shipped `"follow"` read as yours it fails at
+    /// the row whose `tiling` is no word, which falls through to the shipped
+    /// entry: tiling handed over `true`, which would override a tablet's own
+    /// answer.
+    #[test]
+    fn your_mode_entry_then_your_focus_follow_then_the_shipped_entry_then_the_machine() {
+        const CUSTOM: &str = r#"bindings = {
+            ["super+alt+F12"] = function()
+                local modes = require("modes")
+                modes.register("custom", {})
+                modes.use("custom")
+            end,
+        }"#;
+        // Floating, tiling, scrolling and `custom`, in the order switched to.
+        for (row, (focus, expected)) in [
+            ("{ follow = false }", [Some(false); 4]),
+            ("{ follow = true }", [Some(true); 4]),
+            (
+                r#"{ follow = false, modes = { tiling = "follow" } }"#,
+                [Some(false), Some(true), Some(false), Some(false)],
+            ),
+            (
+                r#"{ follow = true, modes = { floating = "click" } }"#,
+                [Some(false), Some(true), Some(true), Some(true)],
+            ),
+            (
+                r#"{ modes = { scrolling = "click", custom = "follow", tiling = "hover" } }"#,
+                [Some(false), None, Some(false), Some(true)],
+            ),
+            ("{}", [Some(false), None, None, None]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let Some((directory, mut scripts)) = shipped_init_with_user(
+                &format!("solium-script-test-focus-ranking-{row}"),
+                &format!("return {{ focus = {focus}, {CUSTOM} }}"),
+            ) else {
+                return;
+            };
+            let commands = [
+                scripts.startup().commands,
+                scripts.key("super+t", empty_snapshot()).commands,
+                scripts.key("super+s", empty_snapshot()).commands,
+                scripts.key("super+alt+F12", empty_snapshot()).commands,
+            ];
+            let _ = std::fs::remove_dir_all(&directory);
+            let follows = commands.map(|commands| {
+                let modes = focus_modes(commands);
+                assert_eq!(modes.len(), 1, "focus = {focus}: one hand-over per mode");
+                modes.first().and_then(|(_, follow, _)| *follow)
+            });
+            assert_eq!(
+                follows, expected,
+                "focus = {focus}: floating, tiling, scrolling and a mode no table names"
+            );
+        }
+    }
+
+    /// **A key `sol.focus_mode` is not given is left to the machine** (#219):
+    /// unlike `sol.idle`, there is no fixed default for the script to fill
+    /// in, because a mode calling it knows nothing about the machine's own
+    /// form factor. So the command says `None`, and the compositor reads
+    /// that as the form factor's answer (`Command::FocusMode`).
+    #[test]
+    fn sol_focus_mode_leaves_a_key_out_to_the_machine() {
         let directory = std::env::temp_dir().join("solium-script-test-focus-mode");
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).expect("a temporary directory");
@@ -7301,7 +7544,7 @@ mod tests {
             modes,
             [(None, Some(false), None)],
             "a table naming only `follow` must leave `click` and \
-             `clear_on_empty_click` as `None`, not reset them"
+             `clear_on_empty_click` as `None`, to the machine"
         );
     }
 
@@ -7353,13 +7596,9 @@ mod tests {
     /// for the mode itself: `modes.lua` runs fresh on every load, so without
     /// `sol.keep` this file could not tell a reload from a fresh start, and
     /// `super+shift+r` after switching to tiling would answer `follow =
-    /// false` -- floating's click-only override -- instead of `None`, every
-    /// time. `None` and not tiling's own `Some(true)` is the right answer
-    /// here on purpose: `config.focus.modes` names no entry for `"tiling"`,
-    /// so it defers to the input profile's own `follow` -- which is `true`
-    /// on this (Desktop) profile, but the command must say "ask the
-    /// profile", not bake today's machine's answer in, or a tablet's
-    /// `false` would be overridden back to `true` the moment it tiled.
+    /// false` -- floating's click-only override -- instead of tiling's own
+    /// `follow`, every time. Since #128 `config.focus.modes` names tiling's
+    /// `"follow"`, which as shipped is the machine's own answer: `None`.
     #[test]
     fn a_reload_keeps_the_focus_model_tiling_was_switched_to() {
         let Some((directory, mut scripts)) =
@@ -7376,8 +7615,7 @@ mod tests {
         assert_eq!(
             focus_modes(switched.commands),
             [(None, None, Some(true))],
-            "switching to tiling, which `config.focus.modes` does not name, did not defer to \
-             the input profile's own `follow`"
+            "switching to tiling did not hand over its own `follow`"
         );
 
         let config = directory.join("init.lua");
@@ -7389,7 +7627,7 @@ mod tests {
             modes,
             [(None, None, Some(true))],
             "a reload forgot tiling was in charge and fell back to floating's click-only \
-             override (`follow = false`) instead of leaving `follow` alone"
+             override (`follow = false`)"
         );
     }
 
@@ -13813,42 +14051,46 @@ mod dialogs {
             );
         }
 
-        /// **With `reflow_on_close = "when_gone"`, a window being closed
-        /// still takes its workspace.** That setting keeps a closing window's
-        /// tile until its application has gone, so a workspace whose only
-        /// window is closing is not empty to it: window 3 goes on to workspace
-        /// 3, rather than into a fresh tree on workspace 2 that has it cover
-        /// window 5 while window 5 fades (#134 review). Closing up at once, the
-        /// same workspace is empty -- that half is
-        /// `a_window_being_closed_is_room_for_the_next_one`.
+        /// **With `reflow_on_close = "when_gone"` or `"when_landed"`, a
+        /// window being closed still takes its workspace.** Those settings
+        /// keep a closing window's tile while it fades, and "when_gone" until
+        /// its application has gone, so a workspace whose only window is
+        /// closing is not empty to them: window 3 goes on to workspace 3,
+        /// rather than into a fresh tree on workspace 2 that has it cover
+        /// window 5 while window 5 fades (#134 review). Closing up at once,
+        /// the same workspace is empty -- that half is
+        /// `a_window_being_closed_is_room_for_the_next_one`. Against `0ce2ab8`
+        /// `"when_landed"` fails: it was read as "immediate" (#128).
         #[test]
-        fn with_reflow_when_gone_a_closing_window_still_takes_its_workspace() {
-            let (mut scripts, _) = tiling_with(&format!(
-                "{}\nrequire(\"config\").tiling.reflow_on_close = \"when_gone\"",
-                minimum(1300, 800)
-            ));
-            switched_on(&mut scripts);
-            let _ = scripts.evaluate("require(\"workspaces\").of[5] = 2\nreturn \"\"");
-            let _ = open(&mut scripts, 1, &[5, 1]);
-            let mut windows = vec![
-                window(5, 800.0, 600.0),
-                window(1, 800.0, 600.0),
-                window(3, 800.0, 600.0),
-            ];
-            windows[0].leaving = true;
-            let _ = scripts.opened(
-                3,
-                Snapshot {
-                    cursor: (500.0, 500.0),
-                    ..snapshot(windows)
-                },
-            );
-            assert_eq!(
-                workspace_of(&scripts, 3),
-                "3",
-                "a workspace whose only window keeps its tile while it closes was counted as \
-                 empty"
-            );
+        fn waiting_to_reflow_a_closing_window_still_takes_its_workspace() {
+            for setting in ["when_gone", "when_landed"] {
+                let (mut scripts, _) = tiling_with(&format!(
+                    "{}\nrequire(\"config\").tiling.reflow_on_close = {setting:?}",
+                    minimum(1300, 800)
+                ));
+                switched_on(&mut scripts);
+                let _ = scripts.evaluate("require(\"workspaces\").of[5] = 2\nreturn \"\"");
+                let _ = open(&mut scripts, 1, &[5, 1]);
+                let mut windows = vec![
+                    window(5, 800.0, 600.0),
+                    window(1, 800.0, 600.0),
+                    window(3, 800.0, 600.0),
+                ];
+                windows[0].leaving = true;
+                let _ = scripts.opened(
+                    3,
+                    Snapshot {
+                        cursor: (500.0, 500.0),
+                        ..snapshot(windows)
+                    },
+                );
+                assert_eq!(
+                    workspace_of(&scripts, 3),
+                    "3",
+                    "{setting}: a workspace whose only window keeps its tile while it closes was \
+                 counted as empty"
+                );
+            }
         }
 
         /// **With `follow_overflow` off, each window with no room takes

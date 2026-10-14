@@ -1423,20 +1423,45 @@ Whether moving the pointer over a window focuses it is a per-mode question,
 not a single on/off switch: floating -- the desktop, with no layout in charge
 and windows free to overlap -- focuses on click only by default, because a
 window you are not using sits under the pointer on the way to the one you
-want. Every other mode keeps this machine's own answer (`SOLIUM_FORM_FACTOR`,
-[#159](https://github.com/Lilium-Linux/solium/issues/159)), which on a
-desktop or a laptop is focus-follows-mouse, the same as every tiling
-compositor people arrive from. Name a mode to change its own answer:
+want. Tiling and scrolling follow the pointer, the same as every tiling
+compositor people arrive from: their windows never overlap, so pointing at one
+is choosing it. That shipped "follow" is this machine's own answer, though
+(`SOLIUM_FORM_FACTOR`, [#159](https://github.com/Lilium-Linux/solium/issues/159)):
+a tablet or a phone, with no pointer to hover, stays click-only in them.
+
+Who decides, highest first: your own entry for the mode in `focus.modes`, then
+your own `focus.follow` for every mode at once, then the shipped entries, then
+the machine. So `focus = { follow = false }` turns hover off in every mode,
+and an entry of yours turns it back on for one, on any machine. A mode named
+nowhere gets the machine's answer, never the answer of the mode you switched
+from:
 
 ```lua
 return {
     focus = { modes = { floating = "follow", scrolling = "click" } },
+    -- or: focus = { follow = false, modes = { tiling = "follow" } },
 }
 ```
 
-`lua/modes.lua` is what turns this into `sol.focus_mode`, on every mode
-change as well as at load, so a reload keeps whichever model the session was
-already in.
+When the window you are typing into closes, the keyboard moves on by itself
+as the close lands, and `focus.after_close` says where, per mode, as a list
+tried in order (#128): `"pointer"`, the window under the pointer;
+`"neighbour"`, the window that takes its place -- the tile that grows into
+the space, the column that slides into it -- or the nearest to where it
+stood; `"recent"`, the one you used before it on that monitor; `"topmost"`,
+the topmost window on any screen. Tiling and scrolling are
+`{ "pointer", "neighbour", "topmost" }` and floating is
+`{ "recent", "topmost" }`. An empty list leaves the keyboard on nothing:
+
+```lua
+return {
+    focus = { after_close = { tiling = { "recent", "topmost" } } },
+}
+```
+
+`lua/modes.lua` is what turns all of this into `sol.focus_mode`, on every mode
+change as well as at load, so a mode switch applies at once and a reload
+keeps whichever model the session was already in.
 
 ### Your own mode
 
