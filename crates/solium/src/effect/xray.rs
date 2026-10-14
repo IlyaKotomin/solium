@@ -170,14 +170,19 @@ pub(crate) fn parse(tree: &Tree) -> Result<XrayConfig, String> {
 }
 
 /// `effects.xray.layers`: a list of words, nothing named beside them, so a
-/// table of names is refused rather than read as no layers.
+/// table of names is refused rather than read as no layers; and
+/// `"background"` among them, since every cut holds the wallpaper: no
+/// layers would turn every T2 effect off unsaid (a rule's `effect = false`
+/// says it), and `"bottom"` alone would hand a window the wallpaper anyway
+/// and a part on `bottom` nothing.
 /// `tests::effects_xray_refuses_what_is_not_its_shape`.
 fn layers(value: &Tree) -> Result<Vec<XrayLayer>, String> {
     let list = match value {
         Tree::Table { list, fields } if fields.is_empty() => list,
         _ => return Err("`effects.xray.layers` is a list of words".to_owned()),
     };
-    list.iter()
+    let layers: Vec<XrayLayer> = list
+        .iter()
         .map(|word| match word {
             Tree::Text(word) if word == "background" => Ok(XrayLayer::Background),
             Tree::Text(word) if word == "bottom" => Ok(XrayLayer::Bottom),
@@ -186,7 +191,13 @@ fn layers(value: &Tree) -> Result<Vec<XrayLayer>, String> {
             )),
             _ => Err("`effects.xray.layers` is a list of words".to_owned()),
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+    if !layers.contains(&XrayLayer::Background) {
+        return Err(
+            "`effects.xray.layers` holds \"background\", alone or with \"bottom\"".to_owned(),
+        );
+    }
+    Ok(layers)
 }
 
 impl XrayConfig {
@@ -316,7 +327,7 @@ impl Xrays {
     /// xray (spec C14). `tests::a_cuts_generation_moves_only_when_it_is_redrawn`.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "Task 45's warm-up gate reads it")
+        expect(dead_code, reason = "Task 45's Solium::effects_ready reads it")
     )]
     pub(crate) fn ready(&self) -> bool {
         self.asked.iter().all(|key| self.built.contains(key))
@@ -482,7 +493,10 @@ mod tests {
     /// whole `keep_ms` Lua holds as a float (`1e4`) is read; anything else
     /// is refused naming the key, a number that is not finite included (as
     /// `settings::tree_of` keeps it), a `layers` table with names in it
-    /// rather than read as no layers, and a misspelt key with the nearest.
+    /// rather than read as no layers, a `layers` without `"background"`
+    /// (none at all would turn every T2 effect off unsaid, and `bottom`
+    /// alone would hand windows the wallpaper anyway and a part on `bottom`
+    /// nothing), and a misspelt key with the nearest.
     #[test]
     fn effects_xray_refuses_what_is_not_its_shape() {
         use crate::effect::tree::Tree;
@@ -525,6 +539,14 @@ mod tests {
             (
                 "{ layers = { 1 } }",
                 "`effects.xray.layers` is a list of words",
+            ),
+            (
+                "{ layers = {} }",
+                "`effects.xray.layers` holds \"background\"",
+            ),
+            (
+                "{ layers = { 'bottom' } }",
+                "`effects.xray.layers` holds \"background\"",
             ),
             ("{ scale = 'half' }", "`effects.xray.scale` is a number"),
             (
@@ -591,13 +613,20 @@ mod tests {
             None,
             "kept past keep_ms"
         );
-        // keep_ms = 0: gone at the next sweep; keep_ms = 5000: still held at 3 s.
+        // Each keeps a cut wanted in the very pass it sweeps, keep_ms = 0
+        // too, or its target would be given back and rebuilt every pass and
+        // every memo over it run again; then keep_ms = 0 gives it back at
+        // the next sweep, and keep_ms = 5000 still holds it at 3 s.
         for (keep_ms, held_at_3s) in [(0, false), (5000, true)] {
             let (mut xrays, mut pool) = (Xrays::default(), Pool::new(0));
             let idle = Duration::from_millis(keep_ms);
             xrays.want("DP-1", Cut::Background);
             xrays.drawn("DP-1", Cut::Background, true);
             xrays.sweep(Duration::ZERO, idle, &mut pool);
+            assert!(
+                xrays.generation("DP-1", Cut::Background).is_some(),
+                "keep_ms = {keep_ms}: swept in the pass that wants it"
+            );
             xrays.clear_wants();
             xrays.sweep(
                 Duration::from_millis(if keep_ms == 0 { 1 } else { 3000 }),

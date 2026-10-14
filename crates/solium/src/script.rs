@@ -9177,8 +9177,9 @@ mod tests {
     /// parsed; a word outside `split`'s words is the set's error, naming it;
     /// and a number that is not finite is refused by name rather than
     /// dropped for the default, as `effect::settings::tree_of` keeps it in
-    /// both tables, so `budget_mib = 1/0` is not "no cap" and `scale = 0/0`
-    /// is not 1.
+    /// both tables and in their lists, so `budget_mib = 1/0` is not "no
+    /// cap", `scale = 0/0` is not 1, and `layers = { "background", 0/0 }`
+    /// is not the wallpaper alone.
     #[test]
     fn sol_effects_reads_xray_and_memo() {
         let directory =
@@ -9192,7 +9193,9 @@ mod tests {
              sol.effects({ memo = { budget_mib = 1/0 } })\n\
              sol.effects({ xray = { scale = 0/0 } })\n\
              sol.effects({ xray = { keep_ms = -1/0 } })\n\
-             sol.effects({ xray = 1/0 })\n",
+             sol.effects({ xray = 1/0 })\n\
+             sol.effects({ xray = { layers = { 0/0 } } })\n\
+             sol.effects({ xray = { layers = { 'background', 0/0 } } })\n",
         )
         .expect("writing");
         let mut scripts = Scripts::load(&config).expect("loading");
@@ -9206,7 +9209,7 @@ mod tests {
             })
             .collect();
         let [read, refused @ ..] = sets.as_slice() else {
-            panic!("six sets: {sets:?}");
+            panic!("eight sets: {sets:?}");
         };
         let read = read.as_ref().expect("parsed");
         assert_eq!(
@@ -9224,6 +9227,8 @@ mod tests {
             "`effects.xray.scale`",
             "`effects.xray.keep_ms`",
             "`effects.xray` is a table",
+            "`effects.xray.layers` is a list of words",
+            "`effects.xray.layers` is a list of words",
         ];
         assert_eq!(refused.len(), says.len(), "{refused:?}");
         for (refused, says) in refused.iter().zip(says) {

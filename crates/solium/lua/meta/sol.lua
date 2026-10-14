@@ -496,7 +496,7 @@ function sol.problems() end
 ---in it changes. A part on `bottom` reads the wallpaper alone, one on
 ---`background` reads nothing, and every other one the layers named here.
 ---@class sol.XrayOptions
----@field layers? ("background"|"bottom")[] The layers T2 effects read as the backdrop. Default `{ "background" }`.
+---@field layers? ("background"|"bottom")[] The layers T2 effects read as the backdrop: `"background"`, alone or with `"bottom"`; a list without `"background"`, an empty one included, is refused (a rule's `effect = false` turns an effect off). Default `{ "background" }`.
 ---@field scale? number The picture's resolution as a share of the monitor's, 0.25 to 1. Default 1.
 ---@field keep_ms? integer How long a picture nothing reads is kept, 0 to 60000 ms. Default 2000.
 ---@field straddle? "each"|"own" A part across two monitors reads each monitor's picture, or only its own monitor's. Default `"each"`.
