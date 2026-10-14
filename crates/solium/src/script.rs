@@ -16637,6 +16637,255 @@ mod directions {
         );
     }
 
+    /// The work area #240 was measured on: the nested 1600x900 output.
+    const NESTED: Rect = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: 1600.0,
+        h: 900.0,
+    };
+
+    /// Window `id` opens on `DP-1` before its application has shown a frame
+    /// -- every window `sol.spawn` opens, `super+return`'s terminal among
+    /// them -- and has the keyboard once it is placed.
+    fn open_unshown(desk: &mut Desk, id: u64) {
+        let mut unshown = window(
+            id,
+            "DP-1",
+            Rect {
+                w: 0.0,
+                h: 0.0,
+                ..NESTED
+            },
+        );
+        unshown.shown = false;
+        desk.windows.insert(0, unshown);
+        let outcome = desk.scripts.opened(id, desk.snapshot());
+        desk.apply(&outcome.commands);
+        desk.focus(id);
+    }
+
+    /// Window `id` opens on `DP-1` already `w` by `h`: an application that
+    /// has shown a frame of its own size, which placement keeps.
+    fn open_shown(desk: &mut Desk, id: u64, w: f64, h: f64) {
+        desk.windows
+            .insert(0, window(id, "DP-1", Rect { w, h, ..NESTED }));
+        let outcome = desk.scripts.opened(id, desk.snapshot());
+        desk.apply(&outcome.commands);
+        desk.focus(id);
+    }
+
+    /// Fails unless every window on `desk` is inside `area` and no two share
+    /// a spot: top-left corners nearer than half the shipped `cascade` step
+    /// (16) on both axes, `floating.lua`'s `taken`.
+    fn spread_inside(desk: &Desk, area: Rect, why: &str) {
+        let rects = desk.rects();
+        for (at, (id, rect)) in rects.iter().enumerate() {
+            assert!(
+                inside(*rect, area),
+                "{why}: window {id} is not inside the work area: {rects:?}"
+            );
+            for (other, earlier) in &rects[..at] {
+                assert!(
+                    (rect.x - earlier.x).abs() >= 16.0 || (rect.y - earlier.y).abs() >= 16.0,
+                    "{why}: windows {other} and {id} share a spot: {rects:?}"
+                );
+            }
+        }
+    }
+
+    /// **Desktop mode: ten windows opened before their first frame, as
+    /// `super+return` opens them, land centred and then one `cascade` step
+    /// apart, each `placement.size` of the work area; the seventh, which one
+    /// more step would take past the bottom edge, starts a new diagonal at
+    /// the work area's top-left plus one step (`wrap = "corner"`).** #240,
+    /// measured nested on 1600x900: the second window landed on the work
+    /// area's bottom-right corner, and the third and fourth exactly on top of
+    /// it.
+    #[test]
+    fn desktop_mode_ten_spawned_windows_step_by_cascade_and_wrap_at_the_edge() {
+        let mut desk = Desk::new("", vec![screen("DP-1", NESTED)]);
+        for id in 1..=10 {
+            open_unshown(&mut desk, id);
+        }
+        let wanted = [
+            (320.0, 180.0),
+            (352.0, 212.0),
+            (384.0, 244.0),
+            (416.0, 276.0),
+            (448.0, 308.0),
+            (480.0, 340.0),
+            (32.0, 32.0),
+            (64.0, 64.0),
+            (96.0, 96.0),
+            (128.0, 128.0),
+        ];
+        for (id, (x, y)) in (1..=10).zip(wanted) {
+            let rect = desk.rect(id);
+            assert!(
+                about(rect.x, x)
+                    && about(rect.y, y)
+                    && about(rect.w, 960.0)
+                    && about(rect.h, 540.0),
+                "window {id} is not 960x540 at {x},{y}: {:?}",
+                desk.rects()
+            );
+        }
+    }
+
+    /// **Desktop mode: a spot a window was dragged a few pixels off is still
+    /// taken**: nearer than half a `cascade` step on both axes, the next
+    /// window steps on rather than landing all but on top of it. #240.
+    #[test]
+    fn desktop_mode_a_spot_a_window_was_nudged_off_is_still_taken() {
+        let mut desk = Desk::new("", vec![screen("DP-1", NESTED)]);
+        open_unshown(&mut desk, 1);
+        for each in &mut desk.windows {
+            each.rect.x += 5.0;
+            each.rect.y += 5.0;
+        }
+        open_unshown(&mut desk, 2);
+        let second = desk.rect(2);
+        assert!(
+            about(second.x, 352.0) && about(second.y, 212.0),
+            "window 2 did not step past the centre window 1 was nudged 5 pixels off: {:?}",
+            desk.rects()
+        );
+    }
+
+    /// **Desktop mode: a `cascade` that is not a step of a pixel or more on
+    /// each axis is read as the shipped (32, 32)**, rather than a step of
+    /// nothing that would stack every window on the first. #240.
+    #[test]
+    fn desktop_mode_a_cascade_of_no_step_is_read_as_the_shipped_one() {
+        let mut desk = Desk::new(
+            "local config = require(\"config\")\n\
+             config.floating.placement.cascade = { x = 0, y = \"far\" }\n",
+            vec![screen("DP-1", NESTED)],
+        );
+        open_unshown(&mut desk, 1);
+        open_unshown(&mut desk, 2);
+        let second = desk.rect(2);
+        assert!(
+            about(second.x, 352.0) && about(second.y, 212.0),
+            "a cascade of (0, \"far\") did not step by (32, 32): {:?}",
+            desk.rects()
+        );
+    }
+
+    /// **Desktop mode: with no spot free, a window lands where its policy
+    /// starts, inside the work area**: a window the size of the work area has
+    /// only the one spot, so the second lands on the first rather than the
+    /// walk looking for a spot that is not there. #240.
+    #[test]
+    fn desktop_mode_with_no_free_spot_a_window_lands_where_its_policy_starts() {
+        let mut desk = Desk::new(
+            "local config = require(\"config\")\n\
+             config.floating.placement.size = 1\n",
+            vec![screen("DP-1", NESTED)],
+        );
+        open_unshown(&mut desk, 1);
+        open_unshown(&mut desk, 2);
+        for id in [1, 2] {
+            assert!(
+                same(desk.rect(id), NESTED),
+                "window {id} is not the whole work area: {:?}",
+                desk.rects()
+            );
+        }
+    }
+
+    /// **Desktop mode: windows nearly as tall as the work area still get a
+    /// spot each**: with less room below the first than one `cascade` step,
+    /// the corner diagonals start as far down as the window leaves room for,
+    /// rather than not at all. #240's review: two 1200x880 windows on
+    /// 1600x900 both landed on the centre, since the corner's first spot,
+    /// (32, 32), did not fit and the walk gave up.
+    #[test]
+    fn desktop_mode_windows_nearly_the_work_area_tall_get_spots_of_their_own() {
+        let mut desk = Desk::new("", vec![screen("DP-1", NESTED)]);
+        for id in 1..=4 {
+            open_shown(&mut desk, id, 1200.0, 880.0);
+        }
+        spread_inside(&desk, NESTED, "1200x880, wrap = \"corner\"");
+        let wanted = [(200.0, 10.0), (32.0, 20.0), (64.0, 20.0), (96.0, 20.0)];
+        for (id, (x, y)) in (1..=4).zip(wanted) {
+            let rect = desk.rect(id);
+            assert!(
+                about(rect.x, x) && about(rect.y, y),
+                "window {id} is not at {x},{y}: {:?}",
+                desk.rects()
+            );
+        }
+    }
+
+    /// **Desktop mode: once every diagonal its `wrap` starts is spent, a new
+    /// window takes the first free spot of the `cascade` grid over the work
+    /// area rather than landing on another.** `wrap = "center"` with
+    /// 1200x880 windows on 1600x900 has room for seven diagonals of one spot
+    /// each, (200, 10) to (392, 10); the eighth and ninth windows used to
+    /// land on the first. #240's review.
+    #[test]
+    fn desktop_mode_once_every_diagonal_is_spent_a_window_takes_a_free_spot_of_the_grid() {
+        let mut desk = Desk::new(
+            "local config = require(\"config\")\n\
+             config.floating.placement.wrap = \"center\"\n",
+            vec![screen("DP-1", NESTED)],
+        );
+        for id in 1..=9 {
+            open_shown(&mut desk, id, 1200.0, 880.0);
+        }
+        spread_inside(&desk, NESTED, "1200x880, wrap = \"center\"");
+        let diagonals = [200.0, 232.0, 264.0, 296.0, 328.0, 360.0, 392.0];
+        for (id, x) in (1..=7).zip(diagonals) {
+            let rect = desk.rect(id);
+            assert!(
+                about(rect.x, x) && about(rect.y, 10.0),
+                "window {id} is not at {x},10: {:?}",
+                desk.rects()
+            );
+        }
+        for (id, (x, y)) in [(8, (0.0, 0.0)), (9, (32.0, 0.0))] {
+            let rect = desk.rect(id);
+            assert!(
+                about(rect.x, x) && about(rect.y, y),
+                "window {id} is not at {x},{y}: {:?}",
+                desk.rects()
+            );
+        }
+    }
+
+    /// **Desktop mode: windows nearly as wide as the work area get a spot
+    /// each, whichever `wrap`**: no diagonal has room for even its first
+    /// spot, so each window after the first takes the next free spot of the
+    /// `cascade` grid, down the work area's left edge. #240's review: 1590x400
+    /// windows on 1600x900 all landed on the centre under both wraps.
+    #[test]
+    fn desktop_mode_windows_nearly_the_work_area_wide_get_spots_of_their_own() {
+        for wrap in ["corner", "center"] {
+            let mut desk = Desk::new(
+                &format!(
+                    "local config = require(\"config\")\n\
+                     config.floating.placement.wrap = {wrap:?}\n"
+                ),
+                vec![screen("DP-1", NESTED)],
+            );
+            for id in 1..=4 {
+                open_shown(&mut desk, id, 1590.0, 400.0);
+            }
+            spread_inside(&desk, NESTED, &format!("1590x400, wrap = {wrap:?}"));
+            let wanted = [(5.0, 250.0), (0.0, 0.0), (0.0, 32.0), (0.0, 64.0)];
+            for (id, (x, y)) in (1..=4).zip(wanted) {
+                let rect = desk.rect(id);
+                assert!(
+                    about(rect.x, x) && about(rect.y, y),
+                    "wrap = {wrap:?}: window {id} is not at {x},{y}: {:?}",
+                    desk.rects()
+                );
+            }
+        }
+    }
+
     /// **Tiling keeps the plain arrows for focus by direction, and desktop
     /// mode gets them back the moment nothing else is in charge.** #222's
     /// whole reason for going through `modes.watch` rather than binding the

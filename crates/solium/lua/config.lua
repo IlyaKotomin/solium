@@ -1075,21 +1075,44 @@ local defaults = {
         -- `lua/floating.lua`; a dialog is never placed by this, since a modal
         -- is lifted out of any arrangement already (`dialogs.lua`).
         placement = {
-            -- "center", the default: the middle of the focused monitor's
-            -- work area, offset by `cascade` for every window already there
-            -- it would otherwise sit on top of -- so a second and third
-            -- window land in a row rather than in a stack nobody can
-            -- separate. "cascade": always offset from the last window
-            -- opened, centred or not. "pointer": centred on the pointer
-            -- instead of the monitor. Anything else is read as "center".
+            -- Where a new window goes. "center", the default: the middle
+            -- of the focused monitor's work area. "cascade": one `cascade`
+            -- step from the last window opened, wherever it is now; the
+            -- middle when there is none. "pointer": centred on the pointer,
+            -- kept inside the work area. Anything else is read as "center".
+            --
+            -- Whichever it is, a new window never lands on a spot another
+            -- window already holds -- its top-left corner nearer than half a
+            -- `cascade` step on both axes -- but steps on by `cascade` until
+            -- it finds a free one: a row of new windows steps down and right
+            -- rather than piling up (#240).
             policy = "center",
+            -- How far each step goes, right and down, in logical pixels: a
+            -- number of 1 or more on each axis; anything else is read as 32.
             cascade = { x = 32, y = 32 },
+            -- Where a new diagonal starts once the next step would take a
+            -- window past the edge of the work area, rather than clamping it
+            -- back onto the last spot that fit. "corner", the default: the
+            -- work area's top-left plus one `cascade` step -- down only as
+            -- far as a window nearly the work area's height leaves room
+            -- for -- and one `cascade.x` further right each time that
+            -- diagonal fills too. "center": back at the middle, one
+            -- `cascade.x` further right for each time it has wrapped, so it
+            -- never lands on the first window. Anything else is read as
+            -- "corner". Once those diagonals reach the right edge, or have no
+            -- room at all (a window nearly the work area's width), a new
+            -- window takes the first free spot of a `cascade` grid over the
+            -- work area, a row at a time from its top-left. Only when every
+            -- spot of that grid is taken -- a window as large as the work
+            -- area has only the one -- does a window land on another.
+            wrap = "corner",
             -- A new window's share of its monitor's work area on each axis,
             -- when its application asked for no size of its own -- one that
             -- has not shown its first frame yet, which is every window
             -- `sol.spawn` opens (see `open` in docs/modes.md). Capped by the
             -- work area either way, and by the application's own minimum and
-            -- maximum once it has one (#115, `sizes.lua`).
+            -- maximum once it has one (#115, `sizes.lua`). A number above 0
+            -- and at most 1; anything else is read as 0.6.
             size = 0.6,
         },
     },
