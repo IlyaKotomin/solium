@@ -11157,6 +11157,146 @@ end)"#,
         );
     }
 
+    /// A client's layer surface on `layer`, its namespace `namespace`, across
+    /// the top of the fixture's monitor and 30 px tall, with a buffer: a part
+    /// `layer_shell:<namespace>` names. Its layer object comes with it.
+    fn layer_surface(
+        fixture: &mut Fixture,
+        namespace: &str,
+        layer: zwlr_layer_shell_v1::Layer,
+    ) -> (
+        wl_surface::WlSurface,
+        zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+    ) {
+        use zwlr_layer_surface_v1::Anchor;
+        let compositor = fixture
+            .client
+            .compositor
+            .clone()
+            .expect("wl_compositor bound");
+        let shell = fixture
+            .client
+            .layer_shell
+            .clone()
+            .expect("zwlr_layer_shell_v1 bound");
+        let surface = compositor.create_surface(&fixture.qh, ());
+        let layered =
+            shell.get_layer_surface(&surface, None, layer, namespace.to_owned(), &fixture.qh, ());
+        layered.set_anchor(Anchor::Top | Anchor::Left | Anchor::Right);
+        layered.set_size(0, 30);
+        surface.commit();
+        pump_all(fixture);
+        commit_layer_again(fixture, &surface);
+        (surface, layered)
+    }
+
+    /// A fresh 1920 x 30 buffer on a layer surface [`layer_surface`] made,
+    /// committed by its client.
+    fn commit_layer_again(fixture: &mut Fixture, surface: &wl_surface::WlSurface) {
+        commit_buffer(&fixture.client, &fixture.qh, surface, 1920, 30);
+        pump_all(fixture);
+    }
+
+    /// The key of an xray cut on the fixture's monitor, built as
+    /// `offscreen::xray_job` builds it, on smithay's `DummyRenderer`:
+    /// `SessionLayers`' entries, a layer surface's tree at its place as
+    /// `render::stacked_elements` draws it, and a pane's client tree should
+    /// one be listed, which `xray_holds_the_cuts_bands_and_nothing_else`
+    /// says none is.
+    fn xray_key(fixture: &mut Fixture, cut: crate::effect::xray::Cut) -> crate::keyed::Inputs {
+        use crate::effect::xray::XraySource as _;
+        use crate::render::Stacked;
+        use smithay::backend::renderer::element::AsRenderElements as _;
+        use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+        use smithay::backend::renderer::test::DummyRenderer;
+        let output = fixture
+            .state
+            .space
+            .outputs()
+            .next()
+            .cloned()
+            .expect("the fixture's monitor");
+        let scale = smithay::utils::Scale::from(1.0);
+        let mut renderer = DummyRenderer;
+        let mut elements: Vec<WaylandSurfaceRenderElement<DummyRenderer>> = Vec::new();
+        for each in crate::effect::xray::SessionLayers.entries(&fixture.state, &output, cut) {
+            match each {
+                Stacked::Layer(surface, geometry) => elements.extend(surface.render_elements(
+                    &mut renderer,
+                    geometry.loc.to_physical_precise_round(1.0),
+                    scale,
+                    1.0,
+                )),
+                Stacked::Panes(nodes) => {
+                    for ((_, window, ..), _) in nodes {
+                        if let Some(window) = window {
+                            elements.extend(crate::render::toplevel_elements(
+                                &mut renderer,
+                                &window,
+                                (0, 0).into(),
+                                scale,
+                                1.0,
+                            ));
+                        }
+                    }
+                }
+                Stacked::Surface(..) => {}
+            }
+        }
+        let size = crate::offscreen::xray_size(&fixture.state, &output);
+        crate::keyed::Inputs::of(crate::keyed::Kind::Xray, size, 1.0, &elements)
+    }
+
+    /// **The xray capture is keyed**: a layer surface in the cut that
+    /// commits makes it stale; a window that commits does not.
+    #[test]
+    fn the_xray_capture_is_stale_only_when_its_cut_changes() {
+        fx2_fixture!(fixture, "xray-keyed");
+        let (wallpaper, _layered) = layer_surface(
+            &mut fixture,
+            "wallpaper",
+            zwlr_layer_shell_v1::Layer::Background,
+        );
+        let (_pane, window) = one_window(&mut fixture);
+        pump_all(&mut fixture);
+        let key = |fixture: &mut Fixture| xray_key(fixture, crate::effect::xray::Cut::Background);
+        let mut capture = crate::keyed::Capture::<u32>::default();
+        capture.drawn(1, key(&mut fixture));
+        commit_again(&mut fixture, &window);
+        pump_all(&mut fixture);
+        assert!(
+            !capture.stale(&key(&mut fixture)),
+            "a window's commit staled xray"
+        );
+        commit_layer_again(&mut fixture, &wallpaper);
+        pump_all(&mut fixture);
+        assert!(
+            capture.stale(&key(&mut fixture)),
+            "the wallpaper's commit did not stale xray"
+        );
+    }
+
+    /// **xray is drawn at the monitor's scale times `xray.scale`**: the
+    /// mode itself at `effects.xray.scale = 1`, half of it each way at 0.5.
+    #[test]
+    fn the_xray_target_is_the_monitor_at_its_scale_times_xray_scale() {
+        fx2_fixture!(fixture, "xray-size");
+        let output = fixture
+            .state
+            .space
+            .outputs()
+            .next()
+            .cloned()
+            .expect("an output");
+        let mode = output.current_mode().expect("a mode").size;
+        assert_eq!(crate::offscreen::xray_size(&fixture.state, &output), mode);
+        fixture.state.effect_settings.xray.scale = 0.5;
+        assert_eq!(
+            crate::offscreen::xray_size(&fixture.state, &output),
+            (mode.w / 2, mode.h / 2).into()
+        );
+    }
+
     /// **The self capture is padded by the effect's reach**: client pixels
     /// plus twice the reach, each way, the client's corner at the reach.
     #[test]
@@ -25923,6 +26063,97 @@ end)
                     (None, None, None, Some(script_bottom)),
                     "(on the client's bottom surface: the surface the pointer reaches, the \
                      script's surface offered the press; the same beside it)"
+                );
+            }
+
+            /// **xray holds the cut's bands and nothing else**: the
+            /// wallpaper and, with `bottom`, the desktop's widgets, the
+            /// client's over the script's, in `stacked`'s order; never a
+            /// pane, a `top` or `overlay` surface, or the pointer. And
+            /// `band_of` names each entry's band.
+            #[test]
+            fn xray_holds_the_cuts_bands_and_nothing_else() {
+                use crate::effect::xray::{Cut, SessionLayers, XraySource as _};
+                use crate::stack::{Band, Owner as Whose};
+                let mut desk = Desk::new();
+                let opened = desk.open_surface();
+                let window = window_of(&desk, opened.pane);
+                desk.state.space.map_element(window, (600, 500), false);
+                desk.state.space.refresh();
+                landed(&mut desk);
+                let _bar = scripted(&mut desk, "bar", Scripted::Top, strip(0, 1920));
+                let dock = scripted(&mut desk, "dock", Scripted::Bottom, strip(0, 1920));
+                let wallpaper = scripted(&mut desk, "wallpaper", Scripted::Background, screen());
+                let (_top, _top_layer) = layer_surface(&mut desk, Client::Top, None, 30, 0);
+                let (_overlay, _overlay_layer) =
+                    layer_surface(&mut desk, Client::Overlay, Some(200), 30, 0);
+                let (widgets, _widgets) =
+                    layer_surface(&mut desk, Client::Bottom, Some(200), 30, 0);
+                let (backdrop, _backdrop) =
+                    layer_surface(&mut desk, Client::Background, None, 30, 0);
+                let output = desk.state.output_for(screen()).expect("the desk's monitor");
+                let seen = |entries: &[Stacked]| -> Vec<Seen> {
+                    entries
+                        .iter()
+                        .flat_map(|each| match each {
+                            Stacked::Layer(surface, _) => {
+                                vec![Seen::Layer(surface.wl_surface().id().protocol_id())]
+                            }
+                            Stacked::Surface(id, ..) => vec![Seen::Script(*id)],
+                            Stacked::Panes(nodes) => nodes
+                                .iter()
+                                .map(|((pane, ..), _)| Seen::Pane(*pane))
+                                .collect(),
+                        })
+                        .collect()
+                };
+                let background = SessionLayers.entries(&desk.state, &output, Cut::Background);
+                let bottom = SessionLayers.entries(&desk.state, &output, Cut::Bottom);
+                assert_eq!(
+                    seen(&background),
+                    vec![Seen::Layer(id(&backdrop)), Seen::Script(wallpaper)],
+                    "the wallpaper alone, the client's over the script's"
+                );
+                assert_eq!(
+                    seen(&bottom),
+                    vec![
+                        Seen::Layer(id(&widgets)),
+                        Seen::Script(dock),
+                        Seen::Layer(id(&backdrop)),
+                        Seen::Script(wallpaper),
+                    ],
+                    "and the desktop's widgets over it"
+                );
+                assert!(background.iter().all(|each| matches!(
+                    crate::render::band_of(&desk.state, each),
+                    Band::Layer(Scripted::Background, _)
+                )));
+                assert!(bottom.iter().all(|each| !matches!(each, Stacked::Panes(_))));
+                let all = crate::render::stacked(&desk.state, screen(), desk.state.clock.now());
+                let order: Vec<&Stacked> =
+                    all.iter().filter(|each| bottom.contains(each)).collect();
+                assert_eq!(
+                    order,
+                    bottom.iter().collect::<Vec<_>>(),
+                    "not stacked's order"
+                );
+                let bands: Vec<Band> = all
+                    .iter()
+                    .map(|each| crate::render::band_of(&desk.state, each))
+                    .collect();
+                assert_eq!(
+                    bands,
+                    vec![
+                        Band::Layer(Scripted::Overlay, Whose::Client),
+                        Band::Layer(Scripted::Top, Whose::Client),
+                        Band::Layer(Scripted::Top, Whose::Script),
+                        Band::Windows,
+                        Band::Layer(Scripted::Bottom, Whose::Client),
+                        Band::Layer(Scripted::Bottom, Whose::Script),
+                        Band::Layer(Scripted::Background, Whose::Client),
+                        Band::Layer(Scripted::Background, Whose::Script),
+                    ],
+                    "the band of each of stacked's entries"
                 );
             }
 

@@ -101,13 +101,20 @@ pub(crate) enum PartSource<'a> {
     LayerShell(&'a smithay::desktop::LayerSurface),
 }
 
-/// Where a job's target is held: a pane's capture of a kind, or a slot's
-/// self input in the effect store (Ruling 16).
-/// `tests::a_slots_capture_is_held_in_the_store`.
+/// Where a job's target is held: a pane's capture of a kind, a slot's
+/// self input in the effect store (Ruling 16), or a monitor's xray cut,
+/// by the output's name (Ruling F29).
+/// `tests::a_slots_capture_is_held_in_the_store`,
+/// `tests::an_xrays_capture_is_held_in_xrays`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum HeldIn {
     Pane(PaneId, crate::keyed::Kind),
     Slot(crate::effect::plan::Owner, crate::effect::rules::Slot),
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Task 44's xray phase builds a cut's job")
+    )]
+    Xray(String, crate::effect::xray::Cut),
 }
 
 /// One part, padded by `pad` physical pixels on every side, for a slot's
@@ -399,6 +406,82 @@ pub(crate) fn over_job(
     ))
 }
 
+/// One monitor's xray cut: `source`'s entries drawn at their places, the
+/// monitor's corner at (0, 0), at its scale times `xray.scale`, keyed on
+/// what it is drawn from so it is redrawn only when that differs ([fx0]
+/// Ruling 9). Each entry is drawn by `render::stacked_elements`, as
+/// `render::elements` draws it; an xray holds no pane (Ruling F29), the
+/// one entry a pass's `Prepared` is read for, so none is handed in.
+/// `state::tests::real_client::the_xray_capture_is_stale_only_when_its_cut_changes`.
+#[expect(dead_code, reason = "Task 44's xray phase builds each wanted cut")]
+pub(crate) fn xray_job(
+    state: &mut Solium,
+    renderer: &mut GlesRenderer,
+    output: &smithay::output::Output,
+    cut: crate::effect::xray::Cut,
+    source: &dyn crate::effect::xray::XraySource,
+) -> Option<Job> {
+    let screen = state.space.output_geometry(output)?;
+    let scale = output.current_scale().fractional_scale() * state.effect_settings.xray.scale;
+    let size = xray_size(state, output);
+    let now = state.clock.now();
+    let none = crate::render::Prepared::default();
+    let mut elements: Vec<crate::render::Element> = Vec::new();
+    for each in source.entries(state, output, cut) {
+        crate::render::stacked_elements(
+            state,
+            renderer,
+            &none,
+            Some(output),
+            each,
+            screen,
+            now,
+            scale,
+            &mut elements,
+        );
+    }
+    let inputs = crate::keyed::Inputs::of(crate::keyed::Kind::Xray, size, scale, &elements);
+    Some(Job {
+        into: HeldIn::Xray(output.name(), cut),
+        size,
+        scale,
+        elements,
+        inputs,
+    })
+}
+
+/// The xray target's size: the monitor's mode, transformed as its elements
+/// are placed, times `effects.xray.scale`.
+/// `state::tests::real_client::the_xray_target_is_the_monitor_at_its_scale_times_xray_scale`.
+pub(crate) fn xray_size(state: &Solium, output: &smithay::output::Output) -> Size<i32, Physical> {
+    let mode = output
+        .current_mode()
+        .map_or_else(|| (1, 1).into(), |mode| mode.size);
+    xray_size_of(
+        mode,
+        output.current_transform(),
+        state.effect_settings.xray.scale,
+    )
+}
+
+/// A mode's pixels turned by the monitor's transform, as its elements are
+/// placed (smithay's `Transform::transform_size` swaps the sides at 90° and
+/// 270°, flipped or not), times `scale`, each side at least one pixel.
+/// `tests::the_xray_target_follows_the_monitors_transform`.
+pub(crate) fn xray_size_of(
+    mode: Size<i32, Physical>,
+    transform: Transform,
+    scale: f64,
+) -> Size<i32, Physical> {
+    let turned = transform.transform_size(mode);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a texture side, far below i32::MAX"
+    )]
+    let side = |n: i32| ((f64::from(n) * scale).ceil() as i32).max(1);
+    (side(turned.w), side(turned.h)).into()
+}
+
 /// Draw every job into its pane's capture: the carrier bound once, a frame per
 /// capture, every element list already built so nothing here runs Qt.
 ///
@@ -435,9 +518,13 @@ pub(crate) fn draw<T>(
                     let _frame = crate::qml::frame_in_flight();
                     for (job, then) in jobs {
                         let target = {
-                            let (panes, store, pool) =
-                                (&mut state.panes, &mut state.store, &mut state.pool);
-                            capture_in(panes, store, &job.into).and_then(|capture| {
+                            let (panes, store, xrays, pool) = (
+                                &mut state.panes,
+                                &mut state.store,
+                                &mut state.xrays,
+                                &mut state.pool,
+                            );
+                            capture_in(panes, store, xrays, &job.into).and_then(|capture| {
                                 capture.target_for(pool, &mut crate::pool::Gl(renderer), job.size)
                             })
                         };
@@ -473,9 +560,12 @@ pub(crate) fn draw<T>(
                         };
                         if drawn {
                             crate::pacing::captured();
-                            if let Some(capture) =
-                                capture_in(&mut state.panes, &mut state.store, &job.into)
-                            {
+                            if let Some(capture) = capture_in(
+                                &mut state.panes,
+                                &mut state.store,
+                                &mut state.xrays,
+                                &job.into,
+                            ) {
                                 capture.drawn(target.clone(), job.inputs);
                                 done.push((
                                     then,
@@ -507,7 +597,12 @@ pub(crate) fn kept(state: &mut Solium, job: &Job) -> Option<(GlesTexture, Id, Co
     if crate::dev::recapture_always() {
         return None;
     }
-    let capture = capture_in(&mut state.panes, &mut state.store, &job.into)?;
+    let capture = capture_in(
+        &mut state.panes,
+        &mut state.store,
+        &mut state.xrays,
+        &job.into,
+    )?;
     if capture.stale(&job.inputs) {
         return None;
     }
@@ -527,20 +622,25 @@ pub(crate) fn release(state: &mut Solium, pane: PaneId) {
     }
 }
 
-/// The capture a job is held in: a pane's of its kind, or a slot's self input
-/// in the effect store, made by `Store::slot_mut` before its job was built.
-/// `None` for a pane that has gone or a slot no longer in the store.
-/// `tests::a_slots_capture_is_held_in_the_store`.
+/// The capture a job is held in: a pane's of its kind, a slot's self input
+/// in the effect store, made by `Store::slot_mut` before its job was built,
+/// or a monitor's xray cut in `Xrays`, made when it is first asked for.
+/// `None` for a pane that has gone, a kind a pane does not hold, or a slot
+/// no longer in the store.
+/// `tests::a_slots_capture_is_held_in_the_store`,
+/// `tests::an_xrays_capture_is_held_in_xrays`.
 fn capture_in<'s>(
     panes: &'s mut crate::pane::Panes,
     store: &'s mut crate::effect::store::Store,
+    xrays: &'s mut crate::effect::xray::Xrays,
     into: &HeldIn,
 ) -> Option<&'s mut crate::keyed::Capture> {
     match into {
         HeldIn::Pane(pane, kind) => panes
             .get_mut(*pane)
-            .map(|held| held.captures_mut().get_mut(*kind)),
+            .and_then(|held| held.captures_mut().get_mut(*kind)),
         HeldIn::Slot(owner, slot) => store.get_mut(owner, *slot).map(|state| &mut state.input),
+        HeldIn::Xray(output, cut) => Some(xrays.capture_mut(output, *cut)),
     }
 }
 
@@ -812,12 +912,16 @@ mod tests {
         for scale in [1.0, 1.0, 2.0, 2.0] {
             let target = captures
                 .get_mut(kind)
+                .expect("a pane's capture")
                 .target_for(&mut pool, &mut made, pixels(outer, scale))
                 .expect("a counting allocator cannot fail");
             let inputs = crate::keyed::Inputs::of::<
                 smithay::backend::renderer::element::solid::SolidColorRenderElement,
             >(kind, pixels(outer, scale), scale, &[]);
-            captures.get_mut(kind).drawn(target, inputs);
+            captures
+                .get_mut(kind)
+                .expect("a pane's capture")
+                .drawn(target, inputs);
         }
         assert_eq!(
             made.0, 2,
@@ -896,20 +1000,88 @@ mod tests {
             index: 0,
             generation: 1,
         };
-        let (mut panes, mut store) = (crate::pane::Panes::default(), Store::default());
+        let (mut panes, mut store, mut xrays) = (
+            crate::pane::Panes::default(),
+            Store::default(),
+            crate::effect::xray::Xrays::default(),
+        );
         let into = super::HeldIn::Slot(owner.clone(), Slot::Replace);
-        assert!(super::capture_in(&mut panes, &mut store, &into).is_none());
+        assert!(super::capture_in(&mut panes, &mut store, &mut xrays, &into).is_none());
         let id = store
             .slot_mut(&owner, Slot::Replace, rule)
             .input
             .id()
             .clone();
         assert_eq!(
-            super::capture_in(&mut panes, &mut store, &into).map(|capture| capture.id().clone()),
+            super::capture_in(&mut panes, &mut store, &mut xrays, &into)
+                .map(|capture| capture.id().clone()),
             Some(id)
         );
         let pane = super::HeldIn::Pane(crate::pane::PaneId::from_raw(3), crate::keyed::Kind::Pane);
-        assert!(super::capture_in(&mut panes, &mut store, &pane).is_none());
+        assert!(super::capture_in(&mut panes, &mut store, &mut xrays, &pane).is_none());
+    }
+
+    /// **An xray's capture is held in `Xrays`**, by its monitor and cut,
+    /// the same one each time it is asked for (that a pane holds none is
+    /// `keyed::tests::a_pane_holds_no_xray_capture`).
+    #[test]
+    fn an_xrays_capture_is_held_in_xrays() {
+        use crate::effect::store::Store;
+        use crate::effect::xray::{Cut, Xrays};
+        let (mut panes, mut store, mut xrays) = (
+            crate::pane::Panes::default(),
+            Store::default(),
+            Xrays::default(),
+        );
+        let into = super::HeldIn::Xray("DP-1".to_owned(), Cut::Background);
+        let id = super::capture_in(&mut panes, &mut store, &mut xrays, &into)
+            .map(|capture| capture.id().clone());
+        assert!(id.is_some());
+        assert_eq!(
+            super::capture_in(&mut panes, &mut store, &mut xrays, &into)
+                .map(|capture| capture.id().clone()),
+            id
+        );
+        assert_eq!(
+            id.as_ref(),
+            Some(xrays.capture_mut("DP-1", Cut::Background).id())
+        );
+        assert_ne!(
+            super::capture_in(
+                &mut panes,
+                &mut store,
+                &mut xrays,
+                &super::HeldIn::Xray("DP-1".to_owned(), Cut::Bottom)
+            )
+            .map(|capture| capture.id().clone()),
+            id,
+            "the other cut is a capture of its own"
+        );
+    }
+
+    /// **A rotated monitor's xray has the rotated shape**: a 2560×1440 mode
+    /// turned 90°, or flipped and turned 270°, is a 1440×2560 target, the
+    /// space its elements are placed in; at `xray.scale` 0.5 half of that.
+    #[test]
+    fn the_xray_target_follows_the_monitors_transform() {
+        use smithay::utils::Transform;
+        let mode = (2560, 1440).into();
+        assert_eq!(
+            super::xray_size_of(mode, Transform::Normal, 1.0),
+            (2560, 1440).into()
+        );
+        assert_eq!(
+            super::xray_size_of(mode, Transform::_90, 1.0),
+            (1440, 2560).into()
+        );
+        assert_eq!(
+            super::xray_size_of(mode, Transform::Flipped270, 1.0),
+            (1440, 2560).into()
+        );
+        assert_eq!(
+            super::xray_size_of(mode, Transform::_90, 0.5),
+            (720, 1280).into()
+        );
     }
 
     /// A fence that counts how often it is waited on, and answers as told.

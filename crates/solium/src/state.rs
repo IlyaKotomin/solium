@@ -714,8 +714,10 @@ pub(crate) struct Solium {
     pub(crate) effects: crate::effect::host::Host,
     /// The engine's own keys, `effects.sandbox`, `limits` and `present`, as
     /// the last `sol.effects` gave them (Ruling 28): what binding a
-    /// `sol.present` geometry reads.
-    /// `tests::effects_sandbox_reaches_the_host_and_the_styles_reader`.
+    /// `sol.present` geometry reads; and `xray` and `memo` (Rulings F29,
+    /// F30), what the xray and the memos read.
+    /// `tests::effects_sandbox_reaches_the_host_and_the_styles_reader`,
+    /// `tests::real_client::the_xray_target_is_the_monitor_at_its_scale_times_xray_scale`.
     pub(crate) effect_settings: crate::effect::settings::Settings,
     /// The problems' generation the scripts were last told about, so `settle`
     /// fires `problems` once per change:
@@ -745,6 +747,11 @@ pub(crate) struct Solium {
     /// chain's targets (Ruling 16). Swept once a pass by `render::prepare`.
     /// `effect::store::tests::a_slot_no_rule_wanted_this_pass_is_dropped`.
     pub(crate) store: crate::effect::store::Store,
+    /// Every monitor's xray cuts, their captures and generations (Ruling
+    /// F29), held between passes like the store's and kept
+    /// `effects.xray.keep_ms` once nothing reads them.
+    /// `effect::xray::tests::a_cut_nobody_wants_is_kept_for_keep_ms`.
+    pub(crate) xrays: crate::effect::xray::Xrays,
 
     /// Hardware buffer sharing: `zwp_linux_dmabuf_v1`.
     ///
@@ -1285,6 +1292,7 @@ impl Solium {
             timer: None,
             pool: crate::pool::Pool::new(0),
             store: crate::effect::store::Store::default(),
+            xrays: crate::effect::xray::Xrays::default(),
             textures: None,
             focusing: false,
             closing: None,

@@ -85,6 +85,18 @@ const fn wlr(layer: crate::scripted::Layer) -> Layer {
     }
 }
 
+/// A protocol layer by Solium's name for it, [`wlr`] the other way: the
+/// band a client's layer surface is drawn in (`render::band_of`).
+/// `state::tests::real_client::reflow_on_close::stacking::xray_holds_the_cuts_bands_and_nothing_else`.
+pub(crate) const fn ours(layer: Layer) -> crate::scripted::Layer {
+    match layer {
+        Layer::Background => crate::scripted::Layer::Background,
+        Layer::Bottom => crate::scripted::Layer::Bottom,
+        Layer::Top => crate::scripted::Layer::Top,
+        Layer::Overlay => crate::scripted::Layer::Overlay,
+    }
+}
+
 /// The surface one layer has at a point, with its origin, topmost first.
 ///
 /// `point` is in the output's own coordinates and so is the origin that comes

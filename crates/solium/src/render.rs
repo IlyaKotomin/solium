@@ -3071,68 +3071,43 @@ pub(crate) fn elements(
     }
 
     // Everything else, in the one order there is: [`stacked`] lists it,
-    // topmost first, and this turns each entry into elements and nothing more,
-    // with the slots beside a surface when any slot is wanted ([`stacked_walk`]).
+    // topmost first, and [`stacked_elements`] turns each entry into elements
+    // and nothing more, with the slots beside a surface when any slot is
+    // wanted ([`stacked_walk`]).
     let output = state.output_for(screen);
     let listed = stacked(state, screen, now);
-    let mut draw = |each: Walked| {
-        match each {
-            Walked::Stacked(Stacked::Layer(surface, geometry)) => {
-                // A layer map's geometry is already in its own output's
-                // coordinates, so these are the one thing on this list that
-                // must *not* be shifted.
-                let origin = geometry.loc.to_physical_precise_round(scale);
-                let layer_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
-                    surface.render_elements(renderer, origin, output_scale, 1.0);
-                elements.extend(layer_elements.into_iter().map(|element| {
-                    Element::Window(RescaleRenderElement::from_element(
-                        element,
-                        origin,
-                        Scale::from(1.0),
-                    ))
-                }));
-            }
-            Walked::Stacked(Stacked::Surface(id, area, alpha)) => {
-                if let Some(output) = output.as_ref() {
-                    elements.extend(scripted(
-                        state, renderer, output, id, area, alpha, screen, now, scale,
-                    ));
+    let mut draw = |each: Walked| match each {
+        Walked::Stacked(each) => stacked_elements(
+            state,
+            renderer,
+            prepared,
+            output.as_ref(),
+            each,
+            screen,
+            now,
+            scale,
+            &mut elements,
+        ),
+        Walked::Slot(owner, slot, rect, alpha) => {
+            let rect = match owner {
+                crate::effect::plan::Owner::LayerShell(_) => rect,
+                crate::effect::plan::Owner::Surface(..) | crate::effect::plan::Owner::Pane(..) => {
+                    Rectangle::new(rect.loc - screen.loc, rect.size)
                 }
-            }
-            Walked::Stacked(Stacked::Panes(nodes)) => {
-                panes(
-                    state,
-                    renderer,
-                    prepared,
-                    &mut elements,
-                    nodes,
-                    screen,
-                    now,
-                    scale,
-                );
-            }
-            Walked::Slot(owner, slot, rect, alpha) => {
-                let rect = match owner {
-                    crate::effect::plan::Owner::LayerShell(_) => rect,
-                    crate::effect::plan::Owner::Surface(..)
-                    | crate::effect::plan::Owner::Pane(..) => {
-                        Rectangle::new(rect.loc - screen.loc, rect.size)
-                    }
-                };
-                let part = Mask::Rect {
-                    rect: rect.to_f64(),
-                    radii: Corners::all(0.0),
-                };
-                elements.extend(slot_element(
-                    state,
-                    &prepared.slots,
-                    &owner,
-                    slot,
-                    part,
-                    scale,
-                    alpha,
-                ));
-            }
+            };
+            let part = Mask::Rect {
+                rect: rect.to_f64(),
+                radii: Corners::all(0.0),
+            };
+            elements.extend(slot_element(
+                state,
+                &prepared.slots,
+                &owner,
+                slot,
+                part,
+                scale,
+                alpha,
+            ));
         }
     };
     match output.as_ref().filter(|_| !prepared.slots.is_empty()) {
@@ -3148,8 +3123,83 @@ pub(crate) fn elements(
     elements
 }
 
+/// One entry of [`stacked`] as elements, pushed onto `elements`:
+/// `elements`' arm for each entry, factored out so `elements` and an xray
+/// draw one the same way (Ruling F29). A client's layer surface through its
+/// own surface tree, at its place in its output's own coordinates; a
+/// script's surface through [`scripted`], on `output`, which holds its
+/// instance (none with no output, as before); panes through [`panes`], which
+/// reads the pass's `prepared`. Pushed onto the caller's list, as [`panes`]
+/// does, so the frame of an unstyled desktop allocates nothing it did not
+/// before.
+/// `state::tests::real_client::reflow_on_close::stacking`'s tests show
+/// `elements` unchanged; `offscreen::xray_job` draws a cut through it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the frame's own state, handed down from `elements` or an xray's job"
+)]
+pub(crate) fn stacked_elements(
+    state: &mut Solium,
+    renderer: &mut GlesRenderer,
+    prepared: &Prepared,
+    output: Option<&smithay::output::Output>,
+    each: Stacked,
+    screen: Rectangle<i32, Logical>,
+    now: std::time::Duration,
+    scale: f64,
+    elements: &mut Vec<Element>,
+) {
+    match each {
+        Stacked::Layer(surface, geometry) => {
+            // A layer map's geometry is already in its own output's
+            // coordinates, so these are the one thing on this list that
+            // must *not* be shifted.
+            let origin = geometry.loc.to_physical_precise_round(scale);
+            let layer_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+                surface.render_elements(renderer, origin, Scale::from(scale), 1.0);
+            elements.extend(layer_elements.into_iter().map(|element| {
+                Element::Window(RescaleRenderElement::from_element(
+                    element,
+                    origin,
+                    Scale::from(1.0),
+                ))
+            }));
+        }
+        Stacked::Surface(id, area, alpha) => {
+            if let Some(output) = output {
+                elements.extend(scripted(
+                    state, renderer, output, id, area, alpha, screen, now, scale,
+                ));
+            }
+        }
+        Stacked::Panes(nodes) => panes(
+            state, renderer, prepared, elements, nodes, screen, now, scale,
+        ),
+    }
+}
+
+/// The band an entry of [`stacked`] is drawn in: a client's layer surface
+/// at its layer, a script's surface at its declared one, and the windows'
+/// band for panes. What an xray's cut is chosen by
+/// (`effect::xray::XrayConfig::cut_below`) and its entries kept by
+/// (`effect::xray::SessionLayers`). A script's surface no longer declared
+/// is in no layer's band, so no cut holds it; [`stacked`] lists only
+/// declared ones.
+/// `state::tests::real_client::reflow_on_close::stacking::xray_holds_the_cuts_bands_and_nothing_else`.
+pub(crate) fn band_of(state: &Solium, each: &Stacked) -> Band {
+    match each {
+        Stacked::Layer(surface, _) => Band::Layer(layer::ours(surface.layer()), Owner::Client),
+        Stacked::Surface(id, ..) => state.surfaces.get(*id).map_or(Band::Windows, |surface| {
+            Band::Layer(surface.layer(), Owner::Script)
+        }),
+        Stacked::Panes(_) => Band::Windows,
+    }
+}
+
 /// One entry of a monitor's frame, before it is turned into elements.
-#[derive(Debug)]
+/// `Clone` and `PartialEq` so a test compares an xray's entries with
+/// [`stacked`]'s (`state::tests::real_client::reflow_on_close::stacking::xray_holds_the_cuts_bands_and_nothing_else`).
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Stacked {
     /// A client's layer surface, and where it is in its output's own
     /// coordinates.
