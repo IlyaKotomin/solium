@@ -18,7 +18,7 @@ use solium_effects::stage::{self, Binding, Depends, Format, Plan, Stage};
     dead_code,
     reason = "the compositor's effect programs, of which these cases need part"
 )]
-mod gl;
+pub(crate) mod gl;
 
 /// The compositor's executor, with `gl` and `pool` beside it as `super::`
 /// (Ruling 2): cases 12d to 12g and 12q run plans through it.
@@ -28,17 +28,18 @@ mod gl;
     unfulfilled_lint_expectations,
     reason = "the compositor's executor, of which these cases read what the compositor does not"
 )]
-mod run;
+pub(crate) mod run;
 
 /// The compositor's effect element (Smithay and `solium_effects` only): case
-/// 12h draws it, a crop included, which the compositor places from Task 44.
+/// 12h draws it, a crop included, which the compositor places from Task 44,
+/// and FX3's 13b a memo's crop.
 #[path = "../../../crates/solium/src/effect/element.rs"]
 #[allow(
     dead_code,
     unfulfilled_lint_expectations,
     reason = "the compositor's effect element, of which case 12h draws the element and a crop the compositor does not place yet"
 )]
-mod element;
+pub(crate) mod element;
 
 /// The compositor's pool, included once, by FX0's cases: case 12c probes
 /// its formats, and the executor draws into its targets.
@@ -230,7 +231,7 @@ fn read_float(renderer: &mut GlesRenderer, fbo: u32) -> Result<[f32; 4]> {
 /// A test effect folder of `crates/solium/tests/fixtures/effects/`, as its
 /// `effect.lua` binds at the params given: its inputs, its stages and its
 /// params, and its frags by file name.
-struct Fixture {
+pub(crate) struct Fixture {
     inputs: &'static [&'static str],
     stages: Vec<Stage>,
     params: Vec<(String, Value)>,
@@ -289,7 +290,7 @@ fn kawase(passes: u32, offset: f64) -> Fixture {
 /// The shipped `blur/` at `passes` and `offset`, as its `stages` make it
 /// (no Lua here): `passes` down at half scale and as many up at twice, its
 /// own frags, its input the backdrop.
-fn shipped_blur(passes: u32, offset: f64) -> Fixture {
+pub(crate) fn shipped_blur(passes: u32, offset: f64) -> Fixture {
     let mut stages: Vec<Stage> = (0..passes).map(|_| pass("down.frag", 0.5, &[])).collect();
     stages.extend((0..passes).map(|_| pass("up.frag", 2.0, &[])));
     Fixture {
@@ -385,7 +386,7 @@ fn tint(amount: f64) -> Fixture {
 
 /// A fixture flattened as the host flattens it, each step's key set as the
 /// host sets it, and every program compiled through `gl::Program::compile`.
-fn build(renderer: &mut GlesRenderer, fixture: Fixture) -> Result<(Plan, HashMap<u64, gl::Program>)> {
+pub(crate) fn build(renderer: &mut GlesRenderer, fixture: Fixture) -> Result<(Plan, HashMap<u64, gl::Program>)> {
     let Fixture {
         inputs,
         stages,
@@ -423,7 +424,7 @@ fn build(renderer: &mut GlesRenderer, fixture: Fixture) -> Result<(Plan, HashMap
     Ok((plan, programs))
 }
 
-fn free(renderer: &mut GlesRenderer, programs: HashMap<u64, gl::Program>) -> Result<()> {
+pub(crate) fn free(renderer: &mut GlesRenderer, programs: HashMap<u64, gl::Program>) -> Result<()> {
     // SAFETY: `with_context` makes the context current; every program was
     // made in it.
     renderer
@@ -437,7 +438,7 @@ fn free(renderer: &mut GlesRenderer, programs: HashMap<u64, gl::Program>) -> Res
 
 /// The compiled programs as the host answers for them: a key not compiled is
 /// pending.
-fn lookup(programs: &HashMap<u64, gl::Program>, key: u64) -> run::Lookup<'_> {
+pub(crate) fn lookup(programs: &HashMap<u64, gl::Program>, key: u64) -> run::Lookup<'_> {
     programs
         .get(&key)
         .map_or(run::Lookup::Pending, run::Lookup::Ready)
@@ -445,7 +446,7 @@ fn lookup(programs: &HashMap<u64, gl::Program>, key: u64) -> run::Lookup<'_> {
 
 /// What a run reads when its one input fills the box: the whole box is the
 /// part, square-cornered, at rest.
-fn whole<'a>(
+pub(crate) fn whole<'a>(
     size: (usize, usize),
     textures: &'a [(&'a str, GlesTexture, run::BoxMap)],
 ) -> run::Inputs<'a> {
@@ -465,7 +466,7 @@ fn whole<'a>(
 
 /// One run on a carrier bound for it, as `prepare` binds one, its result
 /// waited for so it can be read back; its states keyed on nothing moving.
-fn run_once<'p>(
+pub(crate) fn run_once<'p>(
     renderer: &mut GlesRenderer,
     pool: &mut pool::Pool,
     programs: &dyn Fn(u64) -> run::Lookup<'p>,
@@ -500,7 +501,7 @@ fn run_keyed<'p>(
 
 /// A picture of `size`, every pixel `pixel(x, y)` as RGBA bytes, top row
 /// first, uploaded as a texture: the texture and its bytes.
-fn upload(
+pub(crate) fn upload(
     renderer: &mut GlesRenderer,
     size: (usize, usize),
     pixel: impl Fn(usize, usize) -> [u8; 4],
@@ -519,7 +520,7 @@ fn upload(
 }
 
 /// A texture read back as RGBA bytes, its first row first.
-fn read_rgba(renderer: &mut GlesRenderer, texture: &GlesTexture) -> Result<Vec<u8>> {
+pub(crate) fn read_rgba(renderer: &mut GlesRenderer, texture: &GlesTexture) -> Result<Vec<u8>> {
     let mut texture = texture.clone();
     let region = Rectangle::from_size(texture.size());
     let framebuffer = renderer
@@ -600,9 +601,9 @@ fn an_identity_pass_returns_its_input(renderer: &mut GlesRenderer) -> Result<()>
 }
 
 /// One picture on the CPU, each channel 0 to 255, top row first.
-struct Cpu {
-    size: (usize, usize),
-    pixels: Vec<[f64; 4]>,
+pub(crate) struct Cpu {
+    pub(crate) size: (usize, usize),
+    pub(crate) pixels: Vec<[f64; 4]>,
 }
 
 impl Cpu {
@@ -669,6 +670,30 @@ impl Cpu {
     }
 }
 
+/// A dual Kawase on the CPU over `bytes` (RGBA, top row first, `size`): one
+/// [`Cpu::kawase`] for each of `plan`'s steps, `up.frag` up and any other
+/// down, at the size `Plan::sizes` gives that step for `size`. 12e's and
+/// 12i's reference, and FX3's 13a's over a whole monitor.
+pub(crate) fn cpu_kawase(plan: &Plan, bytes: &[u8], size: (usize, usize), offset: f64) -> Cpu {
+    let side = |n: usize| u32::try_from(n).unwrap_or(1);
+    let (sizes, _) = plan.sizes((side(size.0), side(size.1)));
+    let mut cpu = Cpu {
+        size,
+        pixels: bytes
+            .chunks_exact(4)
+            .map(|pixel| std::array::from_fn(|k| f64::from(pixel[k])))
+            .collect(),
+    };
+    for (step, size) in plan.steps.iter().zip(&sizes) {
+        let size = (
+            usize::try_from(size.0).unwrap_or(1),
+            usize::try_from(size.1).unwrap_or(1),
+        );
+        cpu = cpu.kawase(step.frag == "up.frag", offset, size);
+    }
+    cpu
+}
+
 /// **Case 12e: a dual Kawase built from `pass` matches a CPU reference
 /// within ±1.** The `kawase` fixture at `passes = 2, offset = 2` over a
 /// 257×129 checkerboard of 8-pixel squares, 0 and 255 at a different phase
@@ -726,22 +751,7 @@ fn kawase_against_the_cpu(
     };
     let (input, bytes) = upload(renderer, size, checker)?;
     let (plan, programs) = build(renderer, fixture)?;
-    let padded = (257, 129);
-    let (sizes, _) = plan.sizes(padded);
-    let mut cpu = Cpu {
-        size,
-        pixels: bytes
-            .chunks_exact(4)
-            .map(|pixel| std::array::from_fn(|k| f64::from(pixel[k])))
-            .collect(),
-    };
-    for (step, size) in plan.steps.iter().zip(&sizes) {
-        let size = (
-            usize::try_from(size.0).unwrap_or(1),
-            usize::try_from(size.1).unwrap_or(1),
-        );
-        cpu = cpu.kawase(step.frag == "up.frag", offset, size);
-    }
+    let cpu = cpu_kawase(&plan, &bytes, size, offset);
     if cpu.size != size {
         return Err(anyhow!("the plan came back to {:?}, not {size:?}", cpu.size));
     }

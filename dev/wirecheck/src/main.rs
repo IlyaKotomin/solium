@@ -55,6 +55,7 @@ mod uniforms;
 
 mod fx0;
 mod fx2;
+mod fx3;
 
 unsafe extern "C" {
     fn solium_qml_start_gpu(import_path: *const c_char) -> c_int;
@@ -1520,8 +1521,8 @@ fn main() -> Result<()> {
         if late { "after" } else { "before" },
         if separate { "its own" } else { "the buffers'" }
     );
-    // `WIRECHECK_ONLY=fx0` or `fx2`: those cases alone, with no Qt, so they
-    // can be run on a machine that has only this binary (the Surface Pro 7).
+    // `WIRECHECK_ONLY=fx0`, `fx2` or `fx3`: those cases alone, with no Qt, so
+    // they can be run on a machine that has only this binary (the Surface Pro 7).
     match std::env::var("WIRECHECK_ONLY").as_deref() {
         Ok("fx0") => {
             let mut renderer = make_renderer(&gbm)?;
@@ -1536,6 +1537,12 @@ fn main() -> Result<()> {
             let mut renderer = make_renderer(&gbm)?;
             fx2::all(&mut renderer)?;
             println!("\nFX2 cases passed");
+            return Ok(());
+        }
+        Ok("fx3") => {
+            let mut renderer = make_renderer(&gbm)?;
+            fx3::all(&mut renderer)?;
+            println!("\nFX3 cases passed");
             return Ok(());
         }
         _ => {}
@@ -2844,6 +2851,8 @@ fn main() -> Result<()> {
     fx0::all(&mut renderer)?;
     // Cases 12a and 12b: FX2's effect programs, in `fx2.rs`.
     fx2::all(&mut renderer)?;
+    // Cases 13a onwards: FX3's memo and its crop, in `fx3.rs`.
+    fx3::all(&mut renderer)?;
 
     // ------------------------------------------------------------------
     // The first rebind, on a scene that has never rendered.
