@@ -754,24 +754,36 @@ local defaults = {
 
         -- Per mode (the names `modes.register` uses): `"click"` focuses a
         -- window only on a press; `"follow"` also focuses it when the
-        -- pointer moves over it. A mode named neither here gets `follow`
-        -- below, and with that unset the machine's own default
-        -- ([#159](https://github.com/Lilium-Linux/solium/issues/159),
-        -- `SOLIUM_FORM_FACTOR`) -- never the mode you switched from. Applied
-        -- the moment the mode changes.
+        -- pointer moves over it. Applied the moment the mode changes, and
+        -- never carried over from the mode you switched from. Who decides,
+        -- highest first (#128):
         --
-        -- Tiling and scrolling follow the pointer (#128), which is what every
-        -- tiling compositor people arrive from does: their windows never
-        -- overlap, so pointing at one is choosing it. Floating -- the
-        -- desktop, with no layout in charge and windows free to overlap --
-        -- is click-only: a window you are not using sits under the pointer
-        -- on the way to the one you want, and hovering it should not steal
-        -- the keyboard from what you were typing into.
+        --   1. an entry of yours here, for the mode;
+        --   2. your own `follow` below, for every mode at once;
+        --   3. the entries shipped here;
+        --   4. the machine's own answer
+        --      ([#159](https://github.com/Lilium-Linux/solium/issues/159),
+        --      `SOLIUM_FORM_FACTOR`): follow on a desktop or a laptop, not
+        --      on a tablet or a phone.
+        --
+        -- Shipped, tiling and scrolling follow the pointer, which is what
+        -- every tiling compositor people arrive from does: their windows
+        -- never overlap, so pointing at one is choosing it. A shipped
+        -- "follow" is the machine's own answer, though, so a tablet or a
+        -- phone, with no pointer to hover, stays click-only in them; an
+        -- entry of yours follows on any machine. Floating -- the desktop,
+        -- with no layout in charge and windows free to overlap -- is
+        -- click-only: a window you are not using sits under the pointer on
+        -- the way to the one you want, and hovering it should not steal the
+        -- keyboard from what you were typing into.
         --
         --     focus = { modes = { floating = "follow", scrolling = "click" } },
         --
-        -- `the_shipped_focus_follows_the_pointer_in_tiling_and_scrolling_and_not_in_floating`
-        -- and `the_shipped_modes_each_hand_over_their_own_focus_model`.
+        -- An entry that is neither word counts as none.
+        -- `your_mode_entry_then_your_focus_follow_then_the_shipped_entry_then_the_machine`,
+        -- `the_shipped_focus_follows_the_pointer_in_tiling_and_scrolling_and_not_in_floating`,
+        -- `on_a_tablet_the_shipped_layouts_leave_hover_to_the_machine` and
+        -- `the_shipped_modes_each_hand_over_their_own_focus_model`.
         modes = {
             floating = "click",
             tiling = "follow",
@@ -818,13 +830,18 @@ local defaults = {
         },
 
         -- `click` and `follow` above, for every mode at once rather than one
-        -- at a time -- not here by default, so that `nil` can mean "whatever
-        -- this machine's form factor already answered" rather than a fixed
-        -- default that cannot know it:
+        -- at a time -- not here by default, so that leaving them out means
+        -- the shipped entries in `modes` and then this machine's own answer,
+        -- rather than a fixed default that cannot know it. Yours outrank
+        -- every shipped entry, and an entry of yours in `modes` outranks
+        -- your `follow`; `click` has no entries per mode, so it is yours or
+        -- the machine's:
         --
         --     focus = { follow = false },   -- never follow the pointer, in any mode
+        --     focus = { follow = false, modes = { tiling = "follow" } },   -- only in tiling
         --     focus = { click = false },    -- a mode must `sol.focus` its own clicks
         --
+        -- `your_focus_follow_false_keeps_every_mode_from_following_unless_you_name_one`.
 
         -- Where the pointer goes when the keyboard moves (#220).
         --
@@ -1689,6 +1706,16 @@ local function merge(base, over, path, accepted)
     end
     return base
 end
+
+-- `focus.modes` keeps the shipped entries apart from yours (#128). Merged in
+-- place, the two could not be told apart, and a shipped entry outranked your
+-- own `focus.follow`: `focus = { follow = false }` still followed the pointer
+-- in tiling. So the shipped entries go behind an empty table, which your
+-- file's entries are merged into: a plain read finds either --
+-- `config.focus.modes.tiling` is "follow" until you say otherwise -- while
+-- `rawget`, and `pairs`, find only yours. `modes.lua`'s `follow_for` ranks
+-- them. `your_mode_entry_then_your_focus_follow_then_the_shipped_entry_then_the_machine`.
+defaults.focus.modes = setmetatable({}, { __index = defaults.focus.modes })
 
 -- `require` searches the user's directory first, so this finds
 -- ~/.config/solium/user.lua when there is one and nothing when there is not.

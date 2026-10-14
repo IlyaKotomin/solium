@@ -7409,7 +7409,11 @@ mod tests {
     /// **Each shipped mode hands over its own focus model** (#128): floating
     /// click-only, tiling and scrolling following the pointer, each with its
     /// own `focus.after_close` -- floating's at load, tiling's and
-    /// scrolling's as each is switched to.
+    /// scrolling's as each is switched to. A shipped `"follow"` is handed
+    /// over as `None`, the machine's own answer, so a tablet or a phone,
+    /// with no pointer to hover, keeps its own (#159);
+    /// `on_a_tablet_the_shipped_layouts_leave_hover_to_the_machine` in
+    /// `state/tests.rs` is that half.
     #[test]
     fn the_shipped_modes_each_hand_over_their_own_focus_model() {
         use crate::successor::Successor::{Neighbour, Pointer, Recent, Topmost};
@@ -7435,11 +7439,82 @@ mod tests {
             "floating, at load"
         );
         let layout = (
-            vec![(None, Some(true), Some(true))],
+            vec![(None, None, Some(true))],
             vec![Some(vec![Pointer, Neighbour, Topmost])],
         );
         assert_eq!(tiling, layout, "tiling");
         assert_eq!(scrolling, layout, "scrolling");
+    }
+
+    /// **Whether the pointer focuses what it moves over is your entry for
+    /// the mode, then your `focus.follow`, then the shipped entry, then the
+    /// machine's own answer** (#128 review, the ranking of 2026-10-14). So
+    /// `focus = { follow = false }` never follows, in any mode, unless you
+    /// also name a mode; merged over the shipped table, the shipped
+    /// `tiling = "follow"` used to win over it. Each mode is switched to in
+    /// turn, `custom` -- a mode no table names -- by a binding of the
+    /// user's own, and the `follow` each hands over is read; `None` is the
+    /// machine's own answer, which a shipped `"follow"` defers to.
+    /// An entry of yours that is neither word counts as none.
+    /// Against the ranking before it -- any entry in `focus.modes`, then
+    /// `focus.follow` -- it fails at `{ follow = false }`: tiling's shipped
+    /// `"follow"` won. With a shipped `"follow"` read as yours it fails at
+    /// the row whose `tiling` is no word, which falls through to the shipped
+    /// entry: tiling handed over `true`, which would override a tablet's own
+    /// answer.
+    #[test]
+    fn your_mode_entry_then_your_focus_follow_then_the_shipped_entry_then_the_machine() {
+        const CUSTOM: &str = r#"bindings = {
+            ["super+alt+F12"] = function()
+                local modes = require("modes")
+                modes.register("custom", {})
+                modes.use("custom")
+            end,
+        }"#;
+        // Floating, tiling, scrolling and `custom`, in the order switched to.
+        for (row, (focus, expected)) in [
+            ("{ follow = false }", [Some(false); 4]),
+            ("{ follow = true }", [Some(true); 4]),
+            (
+                r#"{ follow = false, modes = { tiling = "follow" } }"#,
+                [Some(false), Some(true), Some(false), Some(false)],
+            ),
+            (
+                r#"{ follow = true, modes = { floating = "click" } }"#,
+                [Some(false), Some(true), Some(true), Some(true)],
+            ),
+            (
+                r#"{ modes = { scrolling = "click", custom = "follow", tiling = "hover" } }"#,
+                [Some(false), None, Some(false), Some(true)],
+            ),
+            ("{}", [Some(false), None, None, None]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let Some((directory, mut scripts)) = shipped_init_with_user(
+                &format!("solium-script-test-focus-ranking-{row}"),
+                &format!("return {{ focus = {focus}, {CUSTOM} }}"),
+            ) else {
+                return;
+            };
+            let commands = [
+                scripts.startup().commands,
+                scripts.key("super+t", empty_snapshot()).commands,
+                scripts.key("super+s", empty_snapshot()).commands,
+                scripts.key("super+alt+F12", empty_snapshot()).commands,
+            ];
+            let _ = std::fs::remove_dir_all(&directory);
+            let follows = commands.map(|commands| {
+                let modes = focus_modes(commands);
+                assert_eq!(modes.len(), 1, "focus = {focus}: one hand-over per mode");
+                modes.first().and_then(|(_, follow, _)| *follow)
+            });
+            assert_eq!(
+                follows, expected,
+                "focus = {focus}: floating, tiling, scrolling and a mode no table names"
+            );
+        }
     }
 
     /// **A key `sol.focus_mode` is not given is left to the machine** (#219):
@@ -7521,7 +7596,7 @@ mod tests {
     /// `super+shift+r` after switching to tiling would answer `follow =
     /// false` -- floating's click-only override -- instead of tiling's own
     /// `follow`, every time. Since #128 `config.focus.modes` names tiling's
-    /// `"follow"`, so that is `Some(true)`.
+    /// `"follow"`, which as shipped is the machine's own answer: `None`.
     #[test]
     fn a_reload_keeps_the_focus_model_tiling_was_switched_to() {
         let Some((directory, mut scripts)) =
@@ -7537,7 +7612,7 @@ mod tests {
         );
         assert_eq!(
             focus_modes(switched.commands),
-            [(None, Some(true), Some(true))],
+            [(None, None, Some(true))],
             "switching to tiling did not hand over its own `follow`"
         );
 
@@ -7548,7 +7623,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
         assert_eq!(
             modes,
-            [(None, Some(true), Some(true))],
+            [(None, None, Some(true))],
             "a reload forgot tiling was in charge and fell back to floating's click-only \
              override (`follow = false`)"
         );

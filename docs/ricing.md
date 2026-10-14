@@ -1425,14 +1425,21 @@ and windows free to overlap -- focuses on click only by default, because a
 window you are not using sits under the pointer on the way to the one you
 want. Tiling and scrolling follow the pointer, the same as every tiling
 compositor people arrive from: their windows never overlap, so pointing at one
-is choosing it. A mode you name nowhere gets this machine's own answer
-(`SOLIUM_FORM_FACTOR`, [#159](https://github.com/Lilium-Linux/solium/issues/159)),
-never the answer of the mode you switched from. Name a mode to change its own
-answer:
+is choosing it. That shipped "follow" is this machine's own answer, though
+(`SOLIUM_FORM_FACTOR`, [#159](https://github.com/Lilium-Linux/solium/issues/159)):
+a tablet or a phone, with no pointer to hover, stays click-only in them.
+
+Who decides, highest first: your own entry for the mode in `focus.modes`, then
+your own `focus.follow` for every mode at once, then the shipped entries, then
+the machine. So `focus = { follow = false }` turns hover off in every mode,
+and an entry of yours turns it back on for one, on any machine. A mode named
+nowhere gets the machine's answer, never the answer of the mode you switched
+from:
 
 ```lua
 return {
     focus = { modes = { floating = "follow", scrolling = "click" } },
+    -- or: focus = { follow = false, modes = { tiling = "follow" } },
 }
 ```
 

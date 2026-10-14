@@ -20698,22 +20698,20 @@ end)
 
             /// **Hovering a window focuses it in tiling and scrolling, and
             /// not in floating; a click on empty desktop still clears it**
-            /// (#219). The shipped `focus.modes`, as a session starts them:
-            /// floating's click-only is in force first, and switching to the
-            /// layout takes its own answer at once. On a machine whose own
-            /// answer is not to follow -- a tablet's profile -- so that it is
-            /// the configuration's `"follow"` that does it.
+            /// (#219). The shipped `focus.modes`, as a session starts them on
+            /// a desktop: floating's click-only is in force first, and
+            /// switching to the layout takes its own answer at once. A
+            /// tablet's half is
+            /// `on_a_tablet_the_shipped_layouts_leave_hover_to_the_machine`.
             /// Against `0ce2ab8` it fails at the first hover: tiling named
             /// nothing, and kept floating's click-only.
             #[test]
             fn the_shipped_focus_follows_the_pointer_in_tiling_and_scrolling_and_not_in_floating() {
-                use crate::input::profile::{FormFactor, Profile};
                 for layout in LAYOUTS {
                     let mut desk = Desk::new();
-                    desk.state.profile = Profile::for_form_factor(FormFactor::Tablet);
                     assert!(
-                        !desk.state.profile.focus_follows_mouse,
-                        "the premise: this machine's own answer is not to follow"
+                        desk.state.profile.focus_follows_mouse,
+                        "the premise: a desktop, whose own answer is to follow"
                     );
                     let (_, _, first) = desk.open();
                     let (_, _, second) = desk.open();
@@ -20826,6 +20824,85 @@ end)
                     Successor::UNCONFIGURED.to_vec(),
                     "a mode with no `after_close` kept the last mode's"
                 );
+            }
+
+            /// Two windows in `layout`, started with `before`, and whether the
+            /// pointer moving onto the one without the keyboard gives it the
+            /// keyboard. With `us,ru` and Russian active, as every input test.
+            fn hover_focuses(desk: &mut Desk, layout: &str, before: &str) -> bool {
+                let (_, _, first) = desk.open();
+                let (_, _, second) = desk.open();
+                start(desk, layout, before);
+                russian(&mut desk.state);
+                let focused = desk.focused();
+                let other = if focused == first { second } else { first };
+                // Over the window itself: this client never answers a
+                // configure, so it is the size it opened at, at the corner of
+                // its tile.
+                let over = centre(
+                    desk.state
+                        .pane_outer_of(other)
+                        .expect("a mapped pane has a rectangle"),
+                );
+                move_pointer(&mut desk.state, over, 10);
+                desk.focused() == other
+            }
+
+            /// **Your own `focus.follow = false` keeps every mode from
+            /// following the pointer, unless you name a mode** (#128 review,
+            /// the ranking of 2026-10-14). Yours outranks the shipped
+            /// `tiling = "follow"` and `scrolling = "follow"`, which a merge
+            /// had left winning over it, and an entry of yours for the mode
+            /// outranks your `follow`.
+            /// Against the ranking before it -- any entry in `focus.modes`,
+            /// then `focus.follow` -- it fails at the first hover: the shipped
+            /// "follow" won.
+            #[test]
+            fn your_focus_follow_false_keeps_every_mode_from_following_unless_you_name_one() {
+                for layout in LAYOUTS {
+                    for (named, follows) in [(false, false), (true, true)] {
+                        let mut before = String::from("require(\"config\").focus.follow = false");
+                        if named {
+                            before.push_str(&format!(
+                                "\nrequire(\"config\").focus.modes.{layout} = \"follow\""
+                            ));
+                        }
+                        let mut desk = Desk::new();
+                        assert_eq!(
+                            hover_focuses(&mut desk, layout, &before),
+                            follows,
+                            "{layout}, `focus.follow = false`, the mode named by you: {named}"
+                        );
+                    }
+                }
+            }
+
+            /// **On a tablet the shipped layouts leave hover to the machine**
+            /// (#128 review, with #159): a shipped `"follow"` is the
+            /// machine's own answer, and a tablet's, with no pointer to
+            /// hover, is not to follow. An entry of your own still follows,
+            /// on any machine.
+            /// With a shipped `"follow"` read as yours, it fails at the first
+            /// hover: the tablet followed the pointer.
+            #[test]
+            fn on_a_tablet_the_shipped_layouts_leave_hover_to_the_machine() {
+                use crate::input::profile::{FormFactor, Profile};
+                for layout in LAYOUTS {
+                    for (yours, follows) in [(false, false), (true, true)] {
+                        let before = if yours {
+                            format!("require(\"config\").focus.modes.{layout} = \"follow\"")
+                        } else {
+                            String::new()
+                        };
+                        let mut desk = Desk::new();
+                        desk.state.profile = Profile::for_form_factor(FormFactor::Tablet);
+                        assert_eq!(
+                            hover_focuses(&mut desk, layout, &before),
+                            follows,
+                            "{layout} on a tablet, `follow` named by you: {yours}"
+                        );
+                    }
+                }
             }
         }
 
