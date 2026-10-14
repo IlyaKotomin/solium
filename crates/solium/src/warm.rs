@@ -126,8 +126,8 @@ pub(crate) fn startup(options: &mlua::Table) -> mlua::Result<Result<FirstFrame, 
     Ok(read)
 }
 
-/// When the hold began, how many passes it has held, and whether it is over
-/// for good.
+/// When the hold began, how many passes it has held, whether it is over for
+/// good, and whether the cap ended it.
 /// `tests::the_first_frame_is_held_until_ready_then_never_again`.
 #[derive(Debug, Default)]
 pub(crate) struct Warm {
@@ -135,6 +135,7 @@ pub(crate) struct Warm {
     since: Option<Duration>,
     done: bool,
     held: u64,
+    capped: bool,
 }
 
 impl Warm {
@@ -152,27 +153,43 @@ impl Warm {
             self.done = false;
             self.since = None;
             self.held = 0;
+            self.capped = false;
         }
     }
 
     /// The gate has let a frame through and holds no more (until a reload
-    /// arms it, with `on_reload`): what `render::hold_first_frame` reads to
-    /// name what was late at the cap.
+    /// arms it, with `on_reload`).
     /// `tests::the_hold_is_capped_at_max_ms`.
     pub(crate) fn released(&self) -> bool {
         self.done
     }
 
+    /// The gate let its frame through at `max_ms` with what it waited for
+    /// still not ready: what `render::hold_first_frame` names in the log.
+    /// Not after a frame drawn ready, nor under `hold = false` or
+    /// `max_ms = 0`, which wait for nothing.
+    /// `tests::the_hold_is_capped_at_max_ms`,
+    /// `tests::the_first_frame_is_held_until_ready_then_never_again`.
+    pub(crate) fn capped(&self) -> bool {
+        self.capped
+    }
+
     /// Whether this pass draws only the clear colour: until `ready`, at most
     /// `max_ms` from the first pass asked, never with `hold = false` or
     /// `max_ms = 0`, and never once released (until a reload arms it, with
-    /// `on_reload`).
+    /// `on_reload`). A frame drawn unheld under `hold = false` or
+    /// `max_ms = 0` releases it too: it was the first frame, so a reload
+    /// that turns the hold on holds nothing unless `on_reload` arms it.
     /// `tests::the_first_frame_is_held_until_ready_then_never_again`,
     /// `tests::the_hold_is_capped_at_max_ms`,
     /// `tests::hold_and_on_reload_are_obeyed`,
     /// `tests::with_nothing_pending_nothing_is_held`.
     pub(crate) fn holding(&mut self, now: Duration, ready: bool) -> bool {
-        if self.done || !self.config.hold || self.config.max_ms == 0 {
+        if self.done {
+            return false;
+        }
+        if !self.config.hold || self.config.max_ms == 0 {
+            self.done = true;
             return false;
         }
         let since = *self.since.get_or_insert(now);
@@ -185,6 +202,7 @@ impl Warm {
                 self.held
             );
             self.done = true;
+            self.capped = !ready;
             return false;
         }
         self.held = self.held.saturating_add(1);
@@ -210,6 +228,7 @@ mod tests {
         assert!(!warm.released());
         assert!(!warm.holding(ms(32), true));
         assert!(warm.released());
+        assert!(!warm.capped(), "released when ready, and called capped");
         assert!(
             !warm.holding(ms(48), false),
             "held again after it was released"
@@ -235,6 +254,10 @@ mod tests {
             );
             assert!(!warm.holding(cap, false), "max_ms = {max_ms}");
             assert!(warm.released(), "max_ms = {max_ms}");
+            assert!(
+                warm.capped(),
+                "max_ms = {max_ms}: let through at the cap, not called capped"
+            );
         }
         let mut never = Warm::default();
         never.configure(FirstFrame {
@@ -242,10 +265,25 @@ mod tests {
             ..FirstFrame::default()
         });
         assert!(!never.holding(Duration::ZERO, false), "max_ms = 0 held");
+        assert!(
+            never.released(),
+            "a first frame drawn at max_ms = 0 left the gate open"
+        );
+        assert!(
+            !never.capped(),
+            "max_ms = 0 called capped, so the log blames the effects"
+        );
+        never.configure(FirstFrame::default());
+        assert!(
+            !never.holding(Duration::from_millis(16), false),
+            "a reload's max_ms held a session already drawn"
+        );
     }
 
     /// **`hold = false` never holds, and `on_reload = true` holds again
-    /// after a reload that is not ready.**
+    /// after a reload that is not ready.** The first frame drawn unheld is
+    /// the first frame: a reload that turns `hold` on holds nothing, unless
+    /// `on_reload` arms the gate.
     #[test]
     fn hold_and_on_reload_are_obeyed() {
         let ms = Duration::from_millis;
@@ -255,6 +293,16 @@ mod tests {
             ..FirstFrame::default()
         });
         assert!(!off.holding(ms(0), false));
+        assert!(
+            !off.capped(),
+            "hold = false called capped, so the log blames the effects"
+        );
+        off.configure(FirstFrame::default());
+        off.reloaded();
+        assert!(
+            !off.holding(ms(16), false),
+            "a reload's hold = true held a session already drawn"
+        );
         let mut again = Warm::default();
         again.configure(FirstFrame {
             on_reload: true,
@@ -285,9 +333,7 @@ mod tests {
     fn startup_first_frame_is_read_and_checked() {
         let tree = |lua: &str| crate::effect::tree::tests::tree(lua).expect("a table");
         assert_eq!(
-            super::parse(&tree(
-                "{ hold = false, max_ms = 500, on_reload = true }"
-            )),
+            super::parse(&tree("{ hold = false, max_ms = 500, on_reload = true }")),
             Ok(FirstFrame {
                 hold: false,
                 max_ms: 500,

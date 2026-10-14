@@ -253,7 +253,10 @@ fn sol_startup_configures_the_gate_and_a_refusal_keeps_what_ran() {
     assert!(said(&state).is_empty(), "{:?}", said(&state));
     assert!(state.warm.holding(ms(1000), false));
     assert!(state.warm.holding(ms(1499), false));
-    assert!(!state.warm.holding(ms(1500), false), "max_ms = 500 not obeyed");
+    assert!(
+        !state.warm.holding(ms(1500), false),
+        "max_ms = 500 not obeyed"
+    );
     write("sol.pane('none')\nsol.startup({ first_frame = { max_ms = -1 } })\n");
     state.reload_from(&entry);
     let refused = said(&state);
@@ -261,8 +264,14 @@ fn sol_startup_configures_the_gate_and_a_refusal_keeps_what_ran() {
         refused.len() == 1 && refused[0].contains("max_ms"),
         "{refused:?}"
     );
-    assert!(state.warm.holding(ms(2000), false), "the refusal dropped on_reload");
-    assert!(!state.warm.holding(ms(2500), false), "the refusal dropped max_ms = 500");
+    assert!(
+        state.warm.holding(ms(2000), false),
+        "the refusal dropped on_reload"
+    );
+    assert!(
+        !state.warm.holding(ms(2500), false),
+        "the refusal dropped max_ms = 500"
+    );
     write("sol.pane('none')\nsol.startup({ first_frame = { max_ms = 500 } })\n");
     state.reload_from(&entry);
     let _ = std::fs::remove_dir_all(directory);
@@ -11554,8 +11563,9 @@ end)"#,
     }
 
     /// **The first frame waits for its xray** (spec C14): with a T2 rule
-    /// wanted, the effects are not ready until every wanted cut has been
-    /// built once; with none wanted they are ready as the host is.
+    /// wanted and every program compiled, the effects are not ready until
+    /// every wanted cut has been built once; with none wanted they are ready
+    /// as the host is.
     #[test]
     fn the_first_frame_waits_for_its_xray() {
         fx2_fixture!(fixture, "xray-warmup");
@@ -11569,6 +11579,15 @@ end)"#,
             &mut fixture,
             r#"{ { match = "*", part = "client", slot = "behind", effect = "blur" } }"#,
         );
+        // Every program asked compiled, so the xray is all that is waited for.
+        fixture
+            .state
+            .effects
+            .compile_pending(&mut crate::effect::host::tests::Refusing);
+        assert!(
+            fixture.state.effects.ready(),
+            "the premise: nothing to compile"
+        );
         let _slots = resolved(&mut fixture);
         assert!(
             !fixture.state.effects_ready(),
@@ -11579,9 +11598,9 @@ end)"#,
             .state
             .xrays
             .drawn(&monitor, crate::effect::xray::Cut::Background, true);
-        assert_eq!(
+        assert!(
             fixture.state.effects_ready(),
-            fixture.state.effects.ready()
+            "not ready once its xray was built"
         );
         assert_eq!(
             fixture.state.first_frame_ready(),
@@ -11591,12 +11610,12 @@ end)"#,
     }
 
     /// **A held first frame asks for the next pass, and the cap lets it
-    /// through**: with a T2 slot's cut not built, the end of `prepare`
-    /// holds (so `elements` draws only the clear colour) and asks for
-    /// another pass, since nothing else may damage the screen to release
-    /// it; at `startup.first_frame.max_ms` it is drawn whatever is late,
-    /// asking for nothing. With no rule nothing is held and nothing is
-    /// asked (spec §8.4).
+    /// through**: with every program compiled and a T2 slot's cut not
+    /// built, the end of `prepare` holds (so `elements` draws only the
+    /// clear colour) and asks for another pass, since nothing else may
+    /// damage the screen to release it; at `startup.first_frame.max_ms` it
+    /// is drawn whatever is late, asking for nothing. With no rule nothing
+    /// is held and nothing is asked (spec §8.4).
     #[test]
     fn a_held_first_frame_asks_for_the_next_pass() {
         fx2_fixture!(fixture, "warm-hold");
@@ -11613,14 +11632,22 @@ end)"#,
             &mut fixture,
             r#"{ { match = "*", part = "client", slot = "behind", effect = "blur" } }"#,
         );
+        // Every program asked compiled, so only the cut holds the frame.
+        fixture
+            .state
+            .effects
+            .compile_pending(&mut crate::effect::host::tests::Refusing);
         let _slots = resolved(&mut fixture);
         fixture.state.redraw = false;
         assert!(crate::render::hold_first_frame(&mut fixture.state));
         assert!(fixture.state.redraw, "a held pass asked for no next one");
         fixture.state.redraw = false;
-        fixture.state.clock.advance(std::time::Duration::from_millis(
-            crate::warm::FirstFrame::default().max_ms,
-        ));
+        fixture
+            .state
+            .clock
+            .advance(std::time::Duration::from_millis(
+                crate::warm::FirstFrame::default().max_ms,
+            ));
         assert!(
             !crate::render::hold_first_frame(&mut fixture.state),
             "held past max_ms"

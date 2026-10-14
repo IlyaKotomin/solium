@@ -9265,8 +9265,7 @@ mod tests {
     /// `Err` naming what is wrong.
     #[test]
     fn sol_startup_reaches_the_compositor() {
-        let directory =
-            std::env::temp_dir().join(format!("solium-startup-{}", std::process::id()));
+        let directory = std::env::temp_dir().join(format!("solium-startup-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&directory);
         let config = directory.join("init.lua");
         std::fs::write(

@@ -822,7 +822,7 @@ pub(crate) fn prepare(state: &mut Solium, renderer: &mut GlesRenderer) -> Prepar
 /// clear colour. A held pass asks for the next one, since a frame of the
 /// clear colour damaged nothing and nothing else may come along to draw
 /// the frame that releases it; what is still not ready when `max_ms` lets
-/// the frame through is named in the log.
+/// the frame through is named in the log (`warm::Warm::capped`).
 /// `state::tests::real_client::a_held_first_frame_asks_for_the_next_pass`,
 /// `warm::tests::the_hold_is_capped_at_max_ms`.
 pub(crate) fn hold_first_frame(state: &mut Solium) -> bool {
@@ -831,7 +831,7 @@ pub(crate) fn hold_first_frame(state: &mut Solium) -> bool {
     let held = state.warm.holding(state.clock.now(), ready);
     if held {
         state.redraw = true;
-    } else if !ready && !released && state.warm.released() {
+    } else if !released && state.warm.capped() {
         tracing::warn!(
             compiling = !state.effects.ready(),
             xray = !state.xrays.ready(),
