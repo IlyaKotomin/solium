@@ -97,7 +97,7 @@ pub(crate) fn handle<B: InputBackend>(
         InputEvent::Keyboard { event } => keyboard(state, event),
         InputEvent::PointerMotion { event } => pointer_relative(state, event),
         InputEvent::PointerMotionAbsolute { event } => pointer_motion(state, region, event),
-        InputEvent::PointerButton { event } => pointer_button(state, event),
+        InputEvent::PointerButton { event } => pointer_button_event(state, event),
         InputEvent::PointerAxis { event } => pointer_axis(state, event),
         InputEvent::TouchDown { event } => touch_down(state, region, event),
         InputEvent::TouchMotion { event } => touch_motion(state, region, event),
@@ -1011,6 +1011,25 @@ fn hover_frame(state: &mut Solium, location: Point<f64, Logical>) {
         && let Some(decoration) = state.panes.get_mut(id).and_then(Pane::decoration_mut)
     {
         decoration.pointer(local.x, local.y, None);
+    }
+}
+
+/// A button, pressed or let go: [`pointer_button`], with what a warp asked
+/// for in between does.
+///
+/// A warp asked for while a press is being handled -- a click on a window
+/// whose focus takes the pointer along, with `focus.cursor.follows.click` on
+/// -- would move the pointer before the press is delivered, and the click
+/// would land on the window's centre instead of where it was aimed. So it
+/// waits, and is carried out once the button is up (#220).
+/// `state::tests::real_client::follow::a_click_that_takes_the_pointer_along_lands_where_it_was_aimed`.
+fn pointer_button_event<B: InputBackend>(state: &mut Solium, event: impl PointerButtonEvent<B>) {
+    let pressed = event.state() == ButtonState::Pressed;
+    state.pressing = pressed;
+    pointer_button(state, event);
+    state.pressing = false;
+    if !pressed {
+        warp::released(state);
     }
 }
 

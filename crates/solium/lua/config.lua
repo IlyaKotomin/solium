@@ -789,8 +789,10 @@ local defaults = {
         -- glides there along `motion`. The pointer itself is there at once,
         -- so what it is over -- a hover, a click, the cursor's shape -- is
         -- the new window's from the first instant. Moving the mouse while it
-        -- glides carries on as `interrupt` says. `lua/follow.lua` is the
-        -- whole of the policy, and `sol.warp` the compositor's part.
+        -- glides carries on as `interrupt` says, and a click that takes the
+        -- pointer along waits for the button to come up, so the click lands
+        -- where it was aimed. `lua/follow.lua` is the whole of the policy,
+        -- and `sol.warp` the compositor's part.
         cursor = {
             -- Which focus changes take the pointer along, by what moved the
             -- keyboard: the `source` the `focus` event is told

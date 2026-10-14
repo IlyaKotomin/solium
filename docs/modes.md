@@ -646,7 +646,10 @@ window the warp went to keeps the keyboard; `interrupt = "picture"` carries on
 from where the picture is drawn instead. The jump is no motion of the mouse's,
 so the velocity `Solium.cursor` says after it is the mouse's own. A press lands
 the flight where the pointer is, and a second warp starts from wherever the
-first had got to. Nothing is warped while a button holds the
+first had got to. A warp asked for while a press is being handled -- a click
+whose `focus` takes the pointer along -- waits for the buttons to come up, so
+the click goes where it was aimed, and is refused then if a menu the click
+opened holds the pointer. Nothing is warped while a button holds the
 pointer, while a client holds it (a game's locked pointer), or behind the lock.
 When the picture lands, what the pointer is over is asked again, so a window
 that slid in under it since has it and says its cursor (#229)
@@ -654,6 +657,8 @@ that slid in under it since has it and says its cursor (#229)
 `state::tests::real_client::follow::with_focus_following_the_mouse_a_nudge_mid_flight_keeps_the_keyboard_where_the_key_put_it`,
 `state::tests::real_client::follow::real_motion_after_a_warp_reports_only_its_own_speed`,
 `state::tests::real_client::follow::a_press_mid_flight_lands_it`,
+`state::tests::real_client::follow::a_click_that_takes_the_pointer_along_lands_where_it_was_aimed`,
+`state::tests::real_client::follow::a_click_that_opened_a_menu_takes_the_pointer_nowhere_later`,
 `state::tests::real_client::follow::a_second_warp_mid_flight_starts_from_where_the_picture_is`,
 `state::tests::real_client::follow::a_held_pointer_is_not_warped`,
 `state::tests::real_client::lock_focus::no_warp_moves_the_pointer_behind_the_lock`,

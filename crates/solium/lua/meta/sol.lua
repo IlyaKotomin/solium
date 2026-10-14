@@ -770,8 +770,10 @@ function sol.focus(id, options) end
 ---is drawn, along `warp.motion`; `Solium.cursor` says so while it does
 ---(`moving`, `from`, `to`, `velocity`). Moving the mouse mid-flight carries on
 ---from where the pointer is, or from the picture as `warp.interrupt` says; the
----jump is never measured as the mouse's speed; and a press lands it. Carried
----out once every
+---jump is never measured as the mouse's speed; a press lands it; and a warp
+---asked for while a press is handled waits for the buttons to come up, so the
+---click goes where it was aimed, and is refused then if a menu the click opened
+---holds the pointer. Carried out once every
 ---command of this handler is applied, so a window it has just moved is warped
 ---to where it was moved; the last warp asked for wins. Kept on a screen.
 ---Refused while a button or a client holds the pointer, and while the session

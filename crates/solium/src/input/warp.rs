@@ -17,13 +17,17 @@
 //! whose `interrupt` says so, from where the picture is drawn -- and a press
 //! lands it, so the click and the picture agree. The jump a warp makes is no
 //! motion of the mouse's, so it is never measured as the pointer's speed. A
-//! warp is refused while a button holds the pointer (a drag, a menu, a scene's
-//! press or grab), while a client holds it (a locked or confined pointer), and
-//! while the session is locked.
+//! warp asked for while a press is being handled -- a click whose focus takes
+//! the pointer along -- waits for the buttons to come up, so the click goes
+//! where it was aimed. A warp is refused while a button holds the pointer (a
+//! drag, a menu, a scene's press or grab), while a client holds it (a locked
+//! or confined pointer), and while the session is locked.
 //! `tests::real_client::follow::real_motion_mid_flight_wins_at_once`,
 //! `tests::real_client::follow::with_focus_following_the_mouse_a_nudge_mid_flight_keeps_the_keyboard_where_the_key_put_it`,
 //! `tests::real_client::follow::real_motion_after_a_warp_reports_only_its_own_speed`,
 //! `tests::real_client::follow::a_press_mid_flight_lands_it`,
+//! `tests::real_client::follow::a_click_that_takes_the_pointer_along_lands_where_it_was_aimed`,
+//! `tests::real_client::follow::a_click_that_opened_a_menu_takes_the_pointer_nowhere_later`,
 //! `tests::real_client::follow::a_held_pointer_is_not_warped`,
 //! `tests::real_client::lock_focus::no_warp_moves_the_pointer_behind_the_lock`.
 //!
@@ -53,8 +57,14 @@ use crate::{
 };
 
 /// Carry out a warp a script asked for. Called once the dispatch that asked
-/// is applied whole; see `Solium::apply`.
+/// is applied whole; see `Solium::apply`. One asked for while a press is
+/// being handled waits for the button to come up, [`released`].
 pub(crate) fn warp(state: &mut Solium, warp: Warp) {
+    if state.pressing {
+        tracing::debug!("a warp during a press waits for the button to come up");
+        state.warp_after_press = Some(warp);
+        return;
+    }
     if state.lock.is_some() {
         tracing::debug!("a warp behind the lock was refused");
         return;
@@ -102,6 +112,20 @@ pub(crate) fn interrupt(state: &mut Solium) -> Option<Point<f64, Logical>> {
     match flight.interrupt() {
         Interrupt::Pointer => None,
         Interrupt::Picture => Some(flight.at(state.clock.now())),
+    }
+}
+
+/// A button came up: a warp that waited for it is carried out once every
+/// button is up, as any warp is -- so it is refused, and forgotten, if
+/// something still holds the pointer then, such as a menu the press opened.
+/// `tests::real_client::follow::a_click_that_takes_the_pointer_along_lands_where_it_was_aimed`,
+/// `tests::real_client::follow::a_click_that_opened_a_menu_takes_the_pointer_nowhere_later`.
+pub(crate) fn released(state: &mut Solium) {
+    if state.pointer_buttons != 0 {
+        return;
+    }
+    if let Some(waited) = state.warp_after_press.take() {
+        warp(state, waited);
     }
 }
 

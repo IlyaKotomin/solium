@@ -29812,12 +29812,13 @@ end)"#,
             time: u64,
         }
 
-        /// A window [`Desk::open`] opened: the client's surface, and the
-        /// server's.
+        /// A window [`Desk::open`] opened: the client's surface, its
+        /// `xdg_surface` for a menu to hang from, and the server's.
         struct Opened {
             window: Window,
             pane: crate::pane::PaneId,
             surface: wl_surface::WlSurface,
+            xdg: xdg_surface::XdgSurface,
             server: WlSurface,
         }
 
@@ -29877,7 +29878,7 @@ end)"#,
             }
 
             fn open(&mut self) -> Opened {
-                let (window, _toplevel, surface, _xdg) = open_xdg(
+                let (window, _toplevel, surface, xdg) = open_xdg(
                     &mut self.display,
                     &mut self.state,
                     &self.conn,
@@ -29899,8 +29900,28 @@ end)"#,
                     window,
                     pane,
                     surface,
+                    xdg,
                     server,
                 }
+            }
+
+            /// The client opens a menu on `parent` that grabs the pointer,
+            /// as a context menu opened by a press does: the grab before the
+            /// first commit, with the serial of the keyboard's last enter.
+            fn menu(&mut self, parent: &Opened) -> xdg_popup::XdgPopup {
+                let compositor = self.client.compositor.clone().expect("wl_compositor bound");
+                let wm_base = self.client.wm_base.clone().expect("xdg_wm_base bound");
+                let seat = self.client.seat.clone().expect("wl_seat bound");
+                let surface = compositor.create_surface(&self.qh, ());
+                let xdg = wm_base.get_xdg_surface(&surface, &self.qh, ());
+                let positioner = wm_base.create_positioner(&self.qh, ());
+                positioner.set_size(32, 32);
+                positioner.set_anchor_rect(0, 0, 1, 1);
+                let popup = xdg.get_popup(Some(&parent.xdg), &positioner, &self.qh, ());
+                popup.grab(&seat, self.client.serial);
+                surface.commit();
+                self.pump();
+                popup
             }
 
             fn pump(&mut self) {
@@ -30519,6 +30540,102 @@ end)"#,
                 "(landed, drawn, where the pointer is)"
             );
             desk.button(false);
+        }
+
+        /// **A click that takes the pointer along lands where it was
+        /// aimed**: with `focus.cursor.follows.click` on, a press off the
+        /// centre of another window focuses it, and the pointer stays where
+        /// the hand put it until the button is up -- so the press, and the
+        /// client's whole click, go where they were aimed -- and only then
+        /// goes to the window's centre.
+        #[test]
+        fn a_click_that_takes_the_pointer_along_lands_where_it_was_aimed() {
+            let mut desk = Desk::new(1);
+            desk.install(
+                "require(\"follow\")\n\
+                 require(\"config\").focus.cursor.follows.click = true",
+            );
+            let first = desk.open();
+            let second = desk.open();
+            desk.apply(vec![
+                floated(desk.id(&first), 100.0, 100.0, 0),
+                floated(desk.id(&second), 1000.0, 100.0, 0),
+            ]);
+            desk.rest();
+            desk.state.focus_window(
+                &first.window,
+                SERIAL_COUNTER.next_serial(),
+                FocusSource::Script,
+            );
+            let aimed: Point<f64, Logical> = (1010.0, 110.0).into();
+            desk.mouse_to(aimed);
+            desk.button(true);
+            let pressed = (
+                desk.focused().as_ref() == Some(&second.window),
+                desk.at(),
+                desk.under().as_ref() == Some(&second.server),
+            );
+            desk.button(false);
+            assert_eq!(
+                (pressed, desk.at()),
+                ((true, aimed, true), (1032.0, 132.0).into()),
+                "((the press focused the second window, where the pointer was, on the second \
+                 window), and once the button is up, where the pointer is)"
+            );
+        }
+
+        /// **A click that opened a menu takes the pointer nowhere later**:
+        /// with `focus.cursor.follows.click` on, a press on another window
+        /// focuses it, and the client answers with a menu that grabs the
+        /// pointer. When the button comes up the menu still holds the
+        /// pointer, so the warp the press asked for is refused, as any warp
+        /// is while the pointer is held -- and forgotten: a click on the
+        /// desktop that dismisses the menu leaves the pointer where that
+        /// click was, and does not send it to the window's centre then.
+        #[test]
+        fn a_click_that_opened_a_menu_takes_the_pointer_nowhere_later() {
+            let mut desk = Desk::new(1);
+            desk.install(
+                "require(\"follow\")\n\
+                 require(\"config\").focus.cursor.follows.click = true",
+            );
+            let first = desk.open();
+            let second = desk.open();
+            desk.apply(vec![
+                floated(desk.id(&first), 100.0, 100.0, 0),
+                floated(desk.id(&second), 1000.0, 100.0, 0),
+            ]);
+            desk.rest();
+            desk.state.focus_window(
+                &first.window,
+                SERIAL_COUNTER.next_serial(),
+                FocusSource::Script,
+            );
+            let aimed: Point<f64, Logical> = (1010.0, 110.0).into();
+            desk.mouse_to(aimed);
+            desk.button(true);
+            let _menu = desk.menu(&second);
+            desk.button(false);
+            let held = desk
+                .state
+                .seat
+                .get_pointer()
+                .is_some_and(|pointer| pointer.is_grabbed());
+            assert!(
+                held && desk.focused().as_ref() == Some(&second.window) && desk.at() == aimed,
+                "the premise: the press focused the second window, and its menu holds the \
+                 pointer where it was aimed: held {held}, at {:?}",
+                desk.at()
+            );
+            let elsewhere: Point<f64, Logical> = (500.0, 700.0).into();
+            desk.mouse_to(elsewhere);
+            desk.button(true);
+            desk.button(false);
+            assert_eq!(
+                (desk.at(), desk.state.warp_after_press.is_none()),
+                (elsewhere, true),
+                "(where the pointer is after the click that dismissed the menu, nothing waits)"
+            );
         }
 
         /// **A second warp mid-flight starts from where the picture is**, not

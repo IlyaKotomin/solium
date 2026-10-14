@@ -709,6 +709,17 @@ pub(crate) struct Solium {
     /// wins. See `Solium::apply`.
     pub(crate) warp_asked: Option<crate::script::Warp>,
 
+    /// Whether a press is being handled now, from the moment it arrives to
+    /// the moment it is delivered: a warp asked for in between -- a click
+    /// whose focus takes the pointer along -- waits in `warp_after_press`
+    /// until the button is up, so the press goes where it was aimed (#220).
+    /// See `crate::input::warp`.
+    pub(crate) pressing: bool,
+
+    /// The warp that waits for the buttons to come up, and no longer. See
+    /// `pressing`.
+    pub(crate) warp_after_press: Option<crate::script::Warp>,
+
     /// Fragment programs, compiled on first use and kept for the life of the
     /// renderer.
     ///
@@ -1229,6 +1240,8 @@ impl Solium {
             pointer: crate::cursor::Pointer::default(),
             flight: None,
             warp_asked: None,
+            pressing: false,
+            warp_after_press: None,
             programs: crate::pass::Programs::default(),
             timer: None,
             pool: crate::pool::Pool::new(0),
