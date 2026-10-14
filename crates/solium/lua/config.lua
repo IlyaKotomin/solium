@@ -800,7 +800,7 @@ local defaults = {
             follows = {
                 binding = true, -- any key binding: a workspace key, the overview's keys
                 direction = true, -- super+arrows and super+h/j/k/l
-                move = true, -- super+shift+arrows: to where the window was moved
+                move = true, -- super+shift+arrows, scrolling's column moves: to where the window was moved
                 click = false, -- a press on a window, or on one in the overview
                 scroll = false, -- the wheel with super held
                 drop = false, -- a dragged window let go
@@ -826,6 +826,12 @@ local defaults = {
             -- where you see the picture, which may be over the window you
             -- left.
             interrupt = "pointer",
+            -- A key that focuses again the window that already has the
+            -- keyboard -- scrolling does after every key it binds, `super+r`
+            -- that only widens the column included -- takes the pointer to
+            -- it too when true. The keys that move the focused window take
+            -- it along by `follows.move` either way.
+            refocus = false,
             -- A workspace switch that leaves no window to take the keyboard,
             -- from a source above that takes the pointer along: "center" puts
             -- the pointer in the middle of the monitor that switched, "stay"

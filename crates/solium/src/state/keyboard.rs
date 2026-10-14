@@ -258,6 +258,12 @@ impl Solium {
             tracing::debug!("refused to focus a window: the session is locked");
             return;
         }
+        // Whether the keyboard comes from another window, or from none, asked
+        // before anything moves: a layout focusing again the window that has
+        // it, after a key that only resized it, is told `changed = false`, so
+        // a policy can tell that from the keyboard moving (#220).
+        // `tests::real_client::follow::the_focus_event_says_whether_the_keyboard_moved`.
+        let changed = !self.is_focused(window);
         // Any explicit focus ends a scene's hold on the keyboard, a click on a
         // window and `sol.focus` among them (Ruling 14).
         // `tests::real_client::reflow_on_close::hosted::clicking_a_window_ends_the_shells_hold`,
@@ -303,19 +309,24 @@ impl Solium {
         // half off the edge and being able to use it.
         if !self.focusing {
             self.focusing = true;
-            self.trigger_focus(window, source);
+            self.trigger_focus(window, source, changed);
             self.focusing = false;
         }
     }
 
-    /// Tell scripts focus moved, and what moved it.
-    fn trigger_focus(&mut self, window: &Window, source: crate::script::FocusSource) {
+    /// Tell scripts focus moved, what moved it, and whether it `changed`.
+    fn trigger_focus(
+        &mut self,
+        window: &Window,
+        source: crate::script::FocusSource,
+        changed: bool,
+    ) {
         let id = self.window_id(window);
         let snapshot = self.snapshot();
         let Some(mut scripts) = self.scripts.take() else {
             return;
         };
-        let outcome = scripts.focused(id, source, snapshot);
+        let outcome = scripts.focused(id, source, changed, snapshot);
         self.scripts = Some(scripts);
         self.apply(outcome);
     }

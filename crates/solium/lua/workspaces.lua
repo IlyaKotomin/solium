@@ -287,6 +287,14 @@ function workspaces.go(index, monitor)
             and workspaces.on_active(window.id, window.monitor)
         then
             sol.focus(window.id)
+            -- A switch away to an empty workspace leaves the keyboard on the
+            -- window it hid, so coming back focuses the window that already
+            -- has it, and its `focus` says the keyboard did not move. The
+            -- view did, so the pointer is taken to it here instead (#220).
+            -- `a_switch_to_an_empty_workspace_takes_the_pointer_to_the_middle_or_leaves_it`.
+            if window.focused then
+                follow.window(window.id, sol.focus_source())
+            end
             return
         end
     end

@@ -223,7 +223,7 @@ sol.on("surface", function(surface, action, data) end) -- a hosted scene sent an
 sol.on("closing", function(id) end)                -- a close was asked for
 sol.on("refused", function(id) end)                -- ...and declined: it is back
 sol.on("close",  function(id) end)                 -- it is gone
-sol.on("focus",  function(id, source) end)         -- the keyboard moved, and what moved it
+sol.on("focus",  function(id, source, changed) end) -- the keyboard moved, what moved it, and from another window?
 sol.on("activate", function(id, why) end)          -- a window asked to come forward: "launch" or "request"
 sol.on("drop",   function(id, x, y) end)           -- a drag finished
 sol.on("resize", function(id, edge_x, edge_y, horizontal_side, vertical_side) end)
@@ -370,7 +370,10 @@ for it during `open` finds no application yet to give it to.
 
 **`focus` says what moved the keyboard** (#220), as its second argument, and
 `sol.focus_source()` says the same inside any handler: what a `sol.focus` made
-there is told with.
+there is told with. Its third, `changed`, is whether the keyboard came from
+another window or from none: a layout focusing again the window that already
+has it -- scrolling does after every key it binds -- is told `false`
+(`state::tests::real_client::follow::the_focus_event_says_whether_the_keyboard_moved`).
 
 | `source` | the keyboard moved because of |
 |---|---|
@@ -388,19 +391,25 @@ there is told with.
 | `"script"` | `sol.focus` from anything else |
 
 `lua/follow.lua` is the listener that ships: it takes the pointer to the window
-that took the keyboard for a key and not for a click, by `focus.cursor` in
-`config.lua` -- which sources follow, where on the window, the motion, and
-what a switch to an empty workspace does
+that took the keyboard for a key and not for a click, and only when the
+keyboard moved, by `focus.cursor` in `config.lua` -- which sources follow,
+where on the window, the motion, where the mouse carries on from mid-flight,
+whether a window focused again takes it too, and what a switch to an empty
+workspace does
 (`script::directions::the_pointer_follows_a_key_and_not_a_click`,
 `script::directions::which_focus_changes_take_the_pointer_along_where_to_and_how_is_configured`,
 `script::directions::the_focus_event_says_what_moved_the_keyboard`,
 `state::tests::real_client::follow::the_compositors_own_focus_changes_say_what_they_are`).
-Two keyboard changes tell no `focus`, so the shipped files ask for those by
-name: a move keeps the keyboard on the window that moved, and `direction.lua`
-takes the pointer after it, to where it went; a workspace switch that leaves no
-window to take the keyboard has `workspaces.lua` take it to the middle of the
-monitor, or leave it, as `focus.cursor.empty_workspace` says
+Two kinds of change tell no `focus` that moved the keyboard, so the shipped
+files ask for those by name: a move keeps the keyboard on the window that
+moved, and `direction.lua` takes the pointer after it, to where it went, as
+`scrolling.lua` does for its keys that move a column or push a window out of
+one; a workspace switch that leaves no window to take the keyboard has
+`workspaces.lua` take it to the middle of the monitor, or leave it, as
+`focus.cursor.empty_workspace` says, and one back to the window the keyboard
+stayed on while it was hidden takes it to that window
 (`script::directions::a_move_takes_the_pointer_to_where_the_window_went`,
+`script::directions::in_scrolling_a_key_takes_the_pointer_along_only_if_it_moves_the_keyboard_or_its_window`,
 `script::directions::a_switch_to_an_empty_workspace_takes_the_pointer_to_the_middle_or_leaves_it`).
 
 **`activate` says a window asked to be brought forward**, with an activation

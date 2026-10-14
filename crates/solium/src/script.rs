@@ -1644,11 +1644,20 @@ impl Scripts {
         }
     }
 
-    /// Focus moved to a window: `(id, source)`, `source` the word for what
-    /// moved it (#220). `tests::the_focus_event_says_what_moved_the_keyboard`.
-    pub(crate) fn focused(&mut self, id: u64, source: FocusSource, snapshot: Snapshot) -> Outcome {
+    /// Focus moved to a window: `(id, source, changed)`, `source` the word
+    /// for what moved it, and `changed` whether the keyboard came from
+    /// another window or none, `false` for the window that had it focused
+    /// again (#220). `tests::the_focus_event_says_what_moved_the_keyboard`,
+    /// `state::tests::real_client::follow::the_focus_event_says_whether_the_keyboard_moved`.
+    pub(crate) fn focused(
+        &mut self,
+        id: u64,
+        source: FocusSource,
+        changed: bool,
+        snapshot: Snapshot,
+    ) -> Outcome {
         self.dispatch(snapshot, move |lua, _| {
-            call_listeners(lua, "focus", (id, source.name()))
+            call_listeners(lua, "focus", (id, source.name(), changed))
         })
     }
 
@@ -17234,26 +17243,43 @@ mod directions {
         /// Press a bound key, and tell `focus` for every window it focused,
         /// with what it was answering, as the compositor does once the window
         /// has the keyboard. Everything asked for, in order.
+        ///
+        /// Each `focus` says whether the keyboard came from another window,
+        /// as `Solium::focus_window` does: a layout focusing again the window
+        /// that has it is told `changed = false`.
         fn press_told(&mut self, combo: &str) -> Vec<Command> {
+            let mut had = self
+                .windows
+                .iter()
+                .find(|window| window.focused)
+                .map(|window| window.id);
             let mut commands = self.press(combo);
-            let focused: Vec<(u64, FocusSource)> = commands
+            let focused: Vec<(u64, FocusSource, bool)> = commands
                 .iter()
                 .filter_map(|command| match command {
-                    Command::Focus { id, source, .. } => Some((*id, *source)),
+                    Command::Focus { id, source, .. } => {
+                        let changed = had != Some(*id);
+                        had = Some(*id);
+                        Some((*id, *source, changed))
+                    }
                     _ => None,
                 })
                 .collect();
-            for (id, source) in focused {
-                commands.extend(self.told(id, source));
+            for (id, source, changed) in focused {
+                commands.extend(self.told(id, source, changed));
             }
             commands
         }
 
-        /// Window `id` takes the keyboard, moved by `source`, and `focus` is
-        /// told. What its listeners asked for.
-        fn told(&mut self, id: u64, source: FocusSource) -> Vec<Command> {
+        /// Window `id` takes the keyboard, moved by `source`, from another
+        /// window if `changed`, and `focus` is told. What its listeners asked
+        /// for.
+        fn told(&mut self, id: u64, source: FocusSource, changed: bool) -> Vec<Command> {
             self.focus(id);
-            let commands = self.scripts.focused(id, source, self.snapshot()).commands;
+            let commands = self
+                .scripts
+                .focused(id, source, changed, self.snapshot())
+                .commands;
             self.apply(&commands);
             commands
         }
@@ -17276,7 +17302,7 @@ mod directions {
             "(focused, warped): {commands:?}"
         );
         assert_eq!(
-            warps(&desk.told(1, FocusSource::Binding)),
+            warps(&desk.told(1, FocusSource::Binding, true)),
             vec![to_window(1, CENTRE, shipped_motion())],
             "a key binding's focus"
         );
@@ -17292,22 +17318,24 @@ mod directions {
             FocusSource::Activate,
             FocusSource::Settle,
         ] {
-            assert_eq!(warps(&desk.told(2, source)), Vec::new(), "{source:?}");
+            assert_eq!(warps(&desk.told(2, source, true)), Vec::new(), "{source:?}");
         }
     }
 
     /// **Which focus changes take the pointer along, where to and how is
     /// configured**: with `focus.cursor.follows.direction` off and `click`
     /// on, `super+left` asks for no warp and a click does; `to` is where on
-    /// the window, `motion` how the picture flies, and `motion = false` puts
-    /// it there at once.
+    /// the window, `motion` how the picture flies, `interrupt` where the
+    /// mouse carries on from mid-flight, and `motion = false` puts it there
+    /// at once.
     #[test]
     fn which_focus_changes_take_the_pointer_along_where_to_and_how_is_configured() {
         let configured = "local cursor = require(\"config\").focus.cursor\n\
                           cursor.follows.direction = false\n\
                           cursor.follows.click = true\n\
                           cursor.to = { x = 0.5, y = 0.25 }\n\
-                          cursor.motion = { duration = 100, easing = \"linear\" }";
+                          cursor.motion = { duration = 100, easing = \"linear\" }\n\
+                          cursor.interrupt = \"picture\"";
         let mut desk = grid(configured, one_screen());
         desk.focus(4);
         let commands = desk.press_told("super+left");
@@ -17317,16 +17345,19 @@ mod directions {
             "direction off: (focused, warped)"
         );
         assert_eq!(
-            warps(&desk.told(2, FocusSource::Click)),
-            vec![to_window(
-                2,
-                (0.5, 0.25),
-                Some(AnimationSpec {
-                    duration: std::time::Duration::from_millis(100),
-                    easing: Curve::Linear,
-                }),
-            )],
-            "click on, to the top quarter, in 100 ms linear"
+            warps(&desk.told(2, FocusSource::Click, true)),
+            vec![Warp {
+                interrupt: Interrupt::Picture,
+                ..to_window(
+                    2,
+                    (0.5, 0.25),
+                    Some(AnimationSpec {
+                        duration: std::time::Duration::from_millis(100),
+                        easing: Curve::Linear,
+                    }),
+                )
+            }],
+            "click on, to the top quarter, in 100 ms linear, the mouse going on from the picture"
         );
 
         let mut desk = grid(
@@ -17379,11 +17410,104 @@ mod directions {
         );
     }
 
+    /// **In scrolling, a key takes the pointer along only if it moves the
+    /// keyboard or the window that has it**: every key the strip binds ends
+    /// with the strip focusing its window again, and `focus` says
+    /// `changed = false` for the window that already had the keyboard. From
+    /// the first of three columns, `super+r`, which only widens the column,
+    /// asks for no warp; `super+comma` stacks the next column's window under
+    /// the first and focuses it, which takes the pointer to it;
+    /// `super+period` pushes it back out into a column of its own and
+    /// `super+ctrl+bracketleft` moves a column, and each takes the pointer
+    /// after the window it moved, as a move by direction does, unless
+    /// `focus.cursor.follows.move` is off; `focus.cursor.refocus = true`
+    /// takes the pointer along for `super+r` too.
+    #[test]
+    fn in_scrolling_a_key_takes_the_pointer_along_only_if_it_moves_the_keyboard_or_its_window() {
+        let strip = |before: &str| {
+            let mut desk = Desk::new(before, one_screen());
+            for id in [1, 2, 3] {
+                desk.windows.push(window(
+                    id,
+                    "DP-1",
+                    Rect {
+                        w: 400.0,
+                        h: 300.0,
+                        ..WIDE
+                    },
+                ));
+            }
+            desk.press("super+s");
+            desk.press("super+bracketleft");
+            desk.press("super+bracketleft");
+            let x = |desk: &Desk, id| desk.rect(id).x;
+            assert!(
+                x(&desk, 1) < x(&desk, 2)
+                    && x(&desk, 2) < x(&desk, 3)
+                    && desk
+                        .windows
+                        .iter()
+                        .any(|window| window.id == 1 && window.focused),
+                "the premise: columns 1, 2, 3, and the first has the keyboard: {:?}",
+                desk.rects()
+            );
+            desk
+        };
+        let to = |id| vec![to_window(id, CENTRE, shipped_motion())];
+
+        let mut desk = strip("");
+        let widened = desk.press_told("super+r");
+        assert_eq!(
+            (focuses(&widened), warps(&widened)),
+            (vec![1], Vec::new()),
+            "super+r: (focused again, warped)"
+        );
+        assert_eq!(warps(&desk.press_told("super+comma")), to(2), "super+comma");
+        assert_eq!(
+            warps(&desk.press_told("super+period")),
+            to(2),
+            "super+period"
+        );
+        assert_eq!(
+            warps(&desk.press_told("super+bracketright")),
+            to(3),
+            "super+bracketright"
+        );
+        assert_eq!(
+            warps(&desk.press_told("super+ctrl+bracketleft")),
+            to(3),
+            "super+ctrl+bracketleft"
+        );
+
+        let mut desk = strip("require(\"config\").focus.cursor.follows.move = false");
+        assert_eq!(
+            warps(&desk.press_told("super+comma")),
+            to(2),
+            "move off: super+comma"
+        );
+        assert_eq!(
+            [
+                warps(&desk.press_told("super+period")),
+                warps(&desk.press_told("super+ctrl+bracketleft")),
+            ],
+            [Vec::new(), Vec::new()],
+            "move off: [super+period, super+ctrl+bracketleft]"
+        );
+
+        let mut desk = strip("require(\"config\").focus.cursor.refocus = true");
+        assert_eq!(
+            warps(&desk.press_told("super+r")),
+            to(1),
+            "refocus on: super+r"
+        );
+    }
+
     /// **A switch to an empty workspace takes the pointer to the middle, or
     /// leaves it**: `super+2` onto a workspace with no window asks for a warp
     /// to the middle of the monitor that switched -- the one the pointer is
-    /// on, with two -- and `super+1` back focuses a window there, whose
-    /// `focus` takes the pointer to it. `focus.cursor.empty_workspace =
+    /// on, with two -- and `super+1` back focuses the window the keyboard
+    /// stayed on, and takes the pointer to it although its `focus` says the
+    /// keyboard did not move. `focus.cursor.empty_workspace =
     /// "stay"` leaves it, and so does a key binding no longer taking it along.
     #[test]
     fn a_switch_to_an_empty_workspace_takes_the_pointer_to_the_middle_or_leaves_it() {
@@ -17510,8 +17634,8 @@ mod directions {
             ],
             "what each `sol.focus` was asked with"
         );
-        let _ = scripts.focused(7, FocusSource::Hover, none());
-        let _ = scripts.focused(7, FocusSource::Settle, none());
+        let _ = scripts.focused(7, FocusSource::Hover, true, none());
+        let _ = scripts.focused(7, FocusSource::Settle, false, none());
         assert_eq!(
             scripts.evaluate("return table.concat(heard, \",\")"),
             "binding,direction,binding,move,surface,click,open,activate,scroll,drop,script,\

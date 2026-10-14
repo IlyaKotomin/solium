@@ -1379,8 +1379,9 @@ pointer to the window that took the keyboard, and its picture glides there.
 The pointer itself is there at once, so whatever it is over is the new
 window's from the first instant; moving the mouse while it glides carries on
 from there, or from where you see the picture with `interrupt = "picture"`. A
-click, a bar's window chip, a window opening or focus following the mouse
-leaves it where your hand put it. All of it is
+key that leaves the keyboard where it was, such as scrolling's `super+r`,
+takes it nowhere. A click, a bar's window chip, a window opening or focus
+following the mouse leaves it where your hand put it. All of it is
 `focus.cursor`, by what moved the keyboard
 ([modes.md](modes.md#what-a-mode-is-told) lists every source):
 
@@ -1392,6 +1393,7 @@ return {
             to = { x = 0.5, y = 0.25 },                    -- a quarter of the way down the window
             motion = { easing = "spring" },                -- or false, to be there at once
             interrupt = "picture",                         -- the mouse mid-flight goes on from the picture
+            refocus = true,                                -- super+r in scrolling recentres it too
             empty_workspace = "stay",                      -- a key onto an empty workspace leaves it
         },
     },

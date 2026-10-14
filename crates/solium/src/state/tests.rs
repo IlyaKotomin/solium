@@ -30843,6 +30843,44 @@ end)"#,
                 "(what the second window opening was told as, what came after it)"
             );
         }
+
+        /// **The `focus` event says whether the keyboard moved**: a window
+        /// focused from another is told `changed = true`, and the window that
+        /// has the keyboard focused again `false` -- a layout focusing its
+        /// window again after a key that only resized it, which is how the
+        /// shipped policy knows to leave the pointer alone.
+        #[test]
+        fn the_focus_event_says_whether_the_keyboard_moved() {
+            let mut desk = Desk::new(1);
+            desk.install(
+                "heard = {}\n\
+                 sol.on(\"focus\", function(_, _, changed) heard[#heard + 1] = tostring(changed) end)",
+            );
+            let first = desk.open();
+            let second = desk.open();
+            let focus = |opened: &Opened| Command::Focus {
+                id: opened.pane.get(),
+                source: FocusSource::Script,
+                warp: None,
+            };
+            desk.apply(vec![focus(&second)]);
+            let evaluate = |desk: &Desk, code: &str| {
+                desk.state
+                    .scripts
+                    .as_ref()
+                    .map(|scripts| scripts.evaluate(code))
+                    .unwrap_or_default()
+            };
+            assert_eq!(evaluate(&desk, "heard = {} return \"\""), "");
+            desk.apply(vec![focus(&first)]);
+            desk.apply(vec![focus(&first)]);
+            desk.apply(vec![focus(&second)]);
+            assert_eq!(
+                evaluate(&desk, "return table.concat(heard, \",\")"),
+                "true,false,true",
+                "(the first from the second, the first again, the second from the first)"
+            );
+        }
     }
 }
 

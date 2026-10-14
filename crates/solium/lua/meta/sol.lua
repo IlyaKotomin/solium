@@ -374,7 +374,7 @@
 ---What `sol.on` can listen for.
 ---@alias sol.Event
 ---| "open" # A window's life began: `(id)`.
----| "focus" # The keyboard moved to a window: `(id, source)`, `source` what moved it, a `sol.FocusSource`. `lua/follow.lua` takes the pointer along by it.
+---| "focus" # The keyboard moved to a window: `(id, source, changed)`, `source` what moved it, a `sol.FocusSource`, and `changed` whether it came from another window or none -- `false` for the window that had it focused again. `lua/follow.lua` takes the pointer along by them.
 ---| "activate" # A window asked to be brought forward, after the compositor answered: `(id, why)`. `why` is `"launch"` when an application already running answered a launch with a window it had, and `"request"` for anything else.
 ---| "closing" # A close was asked for and the window is fading: `(id)`.
 ---| "refused" # Its application declined, and the window is back: `(id)`.
@@ -973,7 +973,7 @@ function sol.unknown(key, meant) end
 ---stop interrupts, run where no hook does, so the deadline cannot stop a loop
 ---in either.
 ---@overload fun(event: "open"|"closing"|"refused"|"close", handler: fun(id: integer))
----@overload fun(event: "focus", handler: fun(id: integer, source: sol.FocusSource))
+---@overload fun(event: "focus", handler: fun(id: integer, source: sol.FocusSource, changed: boolean))
 ---@overload fun(event: "activate", handler: fun(id: integer, why: "launch"|"request"))
 ---@overload fun(event: "drop", handler: fun(id: integer, x: number, y: number))
 ---@overload fun(event: "resize", handler: fun(id: integer, edge_x: number, edge_y: number, horizontal_side: "left"|"right"|nil, vertical_side: "top"|"bottom"|nil))

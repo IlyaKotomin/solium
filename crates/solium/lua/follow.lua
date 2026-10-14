@@ -7,13 +7,22 @@
 -- pointer there at once and flies its picture along `motion`, so what the
 -- pointer is over is the new window's from the first instant.
 --
--- Two focus changes tell no `focus` and are asked for here by name: a move,
--- which keeps the keyboard on the window that moved (`direction.lua` calls
--- `follow.window` once the layout has moved it), and a workspace switch that
--- leaves no window to take the keyboard (`workspaces.lua` calls
--- `follow.monitor`).
+-- Only when the keyboard actually moved: a layout focusing again the window
+-- that has it -- scrolling does after every key it binds, `super+r` that only
+-- widens a column included -- is told `changed = false`, and takes the pointer
+-- nowhere unless `focus.cursor.refocus` says so.
+--
+-- Two kinds of change tell no `focus` that moved the keyboard, and are asked
+-- for here by name: a move, which keeps the keyboard on the window that moved
+-- (`direction.lua` calls `follow.window` once the layout has moved it, and
+-- `scrolling.lua` does for its keys that move a column, or a window out of
+-- one), and a workspace switch that leaves no window to take the keyboard
+-- (`workspaces.lua` calls `follow.monitor`) -- or that comes back to the
+-- window the keyboard stayed on while it was hidden, which `workspaces.lua`
+-- asks for with `follow.window`.
 -- `the_pointer_follows_a_key_and_not_a_click`,
 -- `a_move_takes_the_pointer_to_where_the_window_went`,
+-- `in_scrolling_a_key_takes_the_pointer_along_only_if_it_moves_the_keyboard_or_its_window`,
 -- `a_switch_to_an_empty_workspace_takes_the_pointer_to_the_middle_or_leaves_it`
 -- and their neighbours in `script.rs`'s `follow` tests.
 
@@ -107,6 +116,13 @@ function follow.monitor(name, source)
     end
 end
 
-sol.on("focus", follow.window)
+-- The keyboard moved, or a window that had it was focused again, which takes
+-- the pointer along only if `focus.cursor.refocus` says so.
+-- `in_scrolling_a_key_takes_the_pointer_along_only_if_it_moves_the_keyboard_or_its_window`.
+sol.on("focus", function(id, source, changed)
+    if changed or settings().refocus == true then
+        follow.window(id, source)
+    end
+end)
 
 return follow
