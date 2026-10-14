@@ -175,9 +175,9 @@ named or not, and every effect your configuration's rules name, and then
 binds each rule as the compositor would, so a rule it would refuse fails
 there too. Rules that do not parse fail by their number and key, and are not
 bound; nor are the rules of a `sol.effects` whose own keys (`sandbox`,
-`limits`, `present`) are refused, which fails naming the key, since the
-session refuses that whole call: it says `rules not checked: they did not
-parse, or their sol.effects was refused`. A folder with no `effect.lua`
+`limits`, `present`, `xray`, `memo`) are refused, which fails naming the
+key, since the session refuses that whole call: it says `rules not checked:
+they did not parse, or their sol.effects was refused`. A folder with no `effect.lua`
 fails, and so does one whose name cannot name an effect, such as `Blur`,
 since nothing could use it. The `effects.lua` of each pane style of your
 own is read too, and fails on what the overlay would name. Every effect and

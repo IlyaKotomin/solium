@@ -10,16 +10,24 @@ use super::tree::Tree;
 
 /// What `sol.effects` reads: an unknown key is refused by name, so a typo
 /// never means "the default". Task 30 adds `timing`, Task 27b `geometry` (and
-/// `mesh_ms` and `revive` to `sandbox`'s list in [`parse`]), Task 31 `on`.
+/// `mesh_ms` and `revive` to `sandbox`'s list in [`parse`]), Task 31 `on`;
+/// FX3's Task 43 adds `xray` and `memo` ([`OWN_TABLES`]).
 /// `tests::the_engines_keys_read_with_their_defaults_and_bounds`.
-pub(crate) const KEYS: &[&str] = &["rules", "sandbox", "limits", "present"];
+pub(crate) const KEYS: &[&str] = &["rules", "sandbox", "limits", "present", "xray", "memo"];
 
 /// Everything under `effects` that is not a rule or a transition.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Settings {
     pub(crate) sandbox: Caps,
     pub(crate) limits: Limits,
     pub(crate) present: Present,
+    /// `effects.xray` (Ruling F29): what T2 effects read as the backdrop.
+    /// `script::tests::sol_effects_reads_xray_and_memo`.
+    pub(crate) xray: crate::effect::xray::XrayConfig,
+    /// `effects.memo` (Ruling F30): how far a memo's prefix runs, how long
+    /// an unwanted one is kept and what they may hold.
+    /// `script::tests::sol_effects_reads_xray_and_memo`.
+    pub(crate) memo: crate::effect::memo::MemoConfig,
 }
 
 /// `effects.sandbox`: what one effect's Lua may spend as it loads.
@@ -209,11 +217,19 @@ const TABLES: [(&str, &[&str]); 3] = [
     ("present", &["failed", "on_reload"]),
 ];
 
+/// The tables under `effects` a module of their own reads and checks key
+/// by key: `xray` (`effect::xray::parse`, Ruling F29) and `memo`
+/// (`effect::memo::parse`, Ruling F30).
+/// `script::tests::sol_effects_reads_xray_and_memo`.
+const OWN_TABLES: [&str; 2] = ["xray", "memo"];
+
 /// `sol.effects`' options as a [`Tree`], a number that is not finite kept
-/// where [`Tree::from_lua`] drops it (directly under `effects`, and in
-/// [`TABLES`]), so `load_ms = 1/0` is refused for its bounds rather than
-/// read as the default.
-/// `tests::the_engines_keys_read_with_their_defaults_and_bounds`.
+/// where [`Tree::from_lua`] drops it (directly under `effects`, in
+/// [`TABLES`] and in [`OWN_TABLES`]), so `load_ms = 1/0` is refused for its
+/// bounds rather than read as the default, and `memo = { budget_mib = 1/0 }`
+/// is refused rather than read as no cap.
+/// `tests::the_engines_keys_read_with_their_defaults_and_bounds`,
+/// `script::tests::sol_effects_reads_xray_and_memo`.
 pub(crate) fn tree_of(options: &mlua::Table) -> mlua::Result<Tree> {
     let mut tree =
         Tree::from_lua(&mlua::Value::Table(options.clone()))?.unwrap_or_else(|| Tree::Table {
@@ -222,7 +238,7 @@ pub(crate) fn tree_of(options: &mlua::Table) -> mlua::Result<Tree> {
         });
     if let Tree::Table { fields, .. } = &mut tree {
         keep_non_finite(options, fields)?;
-        for (table, _) in TABLES {
+        for table in TABLES.iter().map(|(table, _)| *table).chain(OWN_TABLES) {
             if let Ok(mlua::Value::Table(inner)) = options.raw_get::<mlua::Value>(table)
                 && let Some(Tree::Table { fields, .. }) = fields.get_mut(table)
             {
@@ -250,8 +266,10 @@ fn keep_non_finite(
 
 /// `sol.effects`' options, beside `rules`: every key checked, each table's
 /// key a table, each number within its bounds and each word one of its
-/// words, or the whole set refused naming the key.
-/// `tests::the_engines_keys_read_with_their_defaults_and_bounds`.
+/// words, or the whole set refused naming the key; `xray` and `memo` read
+/// by their own modules' `parse`.
+/// `tests::the_engines_keys_read_with_their_defaults_and_bounds`,
+/// `script::tests::sol_effects_reads_xray_and_memo`.
 pub(crate) fn parse(options: &Tree) -> Result<Settings, String> {
     known(options, "", KEYS)?;
     for (table, keys) in TABLES {
@@ -288,6 +306,12 @@ pub(crate) fn parse(options: &Tree) -> Result<Settings, String> {
         reason = "validated above: within bounds, and a fraction is cut"
     )]
     let (memory, params) = ((memory as usize) << 20, params as usize);
+    let xray = options
+        .field("xray")
+        .map_or_else(|| Ok(Default::default()), crate::effect::xray::parse)?;
+    let memo = options
+        .field("memo")
+        .map_or_else(|| Ok(Default::default()), crate::effect::memo::parse)?;
     Ok(Settings {
         sandbox: Caps {
             load: Duration::from_secs_f64(load / 1000.0),
@@ -295,6 +319,8 @@ pub(crate) fn parse(options: &Tree) -> Result<Settings, String> {
         },
         limits: Limits { params },
         present: Present { failed, on_reload },
+        xray,
+        memo,
     })
 }
 

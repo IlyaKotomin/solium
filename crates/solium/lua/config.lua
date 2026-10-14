@@ -1391,6 +1391,25 @@ local defaults = {
         -- reload that leaves the folder as it was changes nothing, even one
         -- that changes `sandbox`. A deform may say either for itself.
         present = { failed = "flat", on_reload = "flat" },
+        -- What T2 effects read as the backdrop: a sharp picture of these
+        -- layers, per monitor, rebuilt only when it changes. "bottom" adds
+        -- desktop widgets, at the cost of a rebuild each time one repaints.
+        -- `scale = 0.5` builds it at half resolution for good (0.25 to 1). A
+        -- picture nothing reads is kept `keep_ms` (0 to 60000) before it is
+        -- given back. A window across two monitors reads each monitor's
+        -- picture (`straddle = "each"`, a seam at the edge) or its own
+        -- monitor's ("own"). A tilted or genied window reads it where it
+        -- rests (`warped = "rest"`) or where it is drawn ("drawn").
+        xray = { layers = { "background" }, scale = 1, keep_ms = 2000, straddle = "each", warped = "rest" },
+        -- The part of an effect that reads only the backdrop (a blur) runs
+        -- once per monitor and is shared: `split = "resize"` shares it up to
+        -- its last pass that changes size (a tint after it stays per
+        -- window), "longest" shares the tint too, "off" shares nothing.
+        -- A shared result nobody reads is kept `keep_passes` passes (0 to
+        -- 3600); `budget_mib` caps what they hold (0 is no cap; 0 to 4096),
+        -- past which a window runs its whole effect itself, and a held one
+        -- past a lowered cap is given back.
+        memo = { split = "resize", keep_passes = 0, budget_mib = 0 },
     },
 
     -- How much of a window trails behind it in the genie, for the Developer

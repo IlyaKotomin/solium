@@ -489,17 +489,39 @@ function sol.problems() end
 ---@field source? "self"|"xray"|"live"|"auto" What the chain's first input reads in place of its own: `"self"`, the part's own pixels. On the rule or in its first link. Reading the backdrop from xray waits for X2.1 and the live backdrop for X4.1, both refused when the rules are applied.
 ---@field mask? "shape"|"alpha" How the result is cut: the part's shape (the default), or the alpha of the part's own pixels, which needs `source = "self"`.
 
+---What T2 effects read as the backdrop, `sol.effects`' `xray`: a sharp
+---picture of the layers below a part, per monitor, rebuilt only when what is
+---in it changes. A part on `bottom` reads the wallpaper alone, one on
+---`background` reads nothing, and every other one the layers named here.
+---@class sol.XrayOptions
+---@field layers? ("background"|"bottom")[] The layers T2 effects read as the backdrop. Default `{ "background" }`.
+---@field scale? number The picture's resolution as a share of the monitor's, 0.25 to 1. Default 1.
+---@field keep_ms? integer How long a picture nothing reads is kept, 0 to 60000 ms. Default 2000.
+---@field straddle? "each"|"own" A part across two monitors reads each monitor's picture, or only its own monitor's. Default `"each"`.
+---@field warped? "rest"|"drawn" A warped window reads the picture where it rests, or where it is drawn. Default `"rest"`.
+
+---How the part of a chain that reads only the backdrop is shared, `sol.effects`'
+---`memo`: run once per monitor and read by every part whose chain begins the
+---same way.
+---@class sol.MemoOptions
+---@field split? "resize"|"longest"|"off" How far the part of a chain that reads only the backdrop is shared per monitor: to its last step that changes size, as far as it reads only the backdrop, or not at all. Default `"resize"`.
+---@field keep_passes? integer Passes a shared result nobody reads is kept, 0 to 3600. Default 0.
+---@field budget_mib? integer The most memory shared results may hold, 0 (no cap) to 4096 MiB; past it a part runs its whole chain, and a held result past a lowered cap is given back. Default 0.
+
 ---What `sol.effects` takes: the rules, and the engine's own numbers and
 ---policies beside them, each with its default. A key it does not know,
----`sandbox`, `limits` or `present` given anything but a table, a number
----outside its bounds (`1/0` and `0/0` included) or a word outside its words
----refuses the whole set, its rules too, named by `sol.problems()` under
----`"settings"`, and what ran stays; `solium --check` fails on it.
+---`sandbox`, `limits`, `present`, `xray` or `memo` given anything but a
+---table, a number outside its bounds (`1/0` and `0/0` included) or a word
+---outside its words refuses the whole set, its rules too, named by
+---`sol.problems()` under `"settings"`, and what ran stays; `solium --check`
+---fails on it.
 ---@class sol.EffectsOptions
 ---@field rules? sol.Rule[] The rules; left out, none.
 ---@field sandbox? { load_ms?: number, memory_mib?: integer } What an effect's own Lua may spend as it loads: `load_ms` for each call, shared by the checks a `mesh` is put through at load (100 by default, 10 to 5000), and `memory_mib` of memory (16 by default, 1 to 512). A folder past either is named by `sol.problems()` and not loaded; changing either loads every effect again.
 ---@field limits? { params?: integer } How many numbers a geometry or a pixels effect's params may be once packed (8 by default, 1 to 64); one with more is named by `sol.problems()`, never cut.
 ---@field present? { failed?: "flat"|"hide", on_reload?: "flat"|"keep" } What a `sol.present` deform draws when its mesh is refused or its folder is missing (`failed`: `"flat"`, the default, the window undeformed; `"hide"`, nothing of it), and when a reload finds its folder changed while it plays (`on_reload`: `"flat"`, the default, or `"keep"`, the version it began with; a reload that leaves the folder as it was changes nothing, even one that changes `sandbox`). A deform may say either for itself.
+---@field xray? sol.XrayOptions What T2 effects read as the backdrop.
+---@field memo? sol.MemoOptions How a chain's backdrop-only part is shared per monitor.
 
 ---Which effects go where, all at once: a set with a broken rule is refused
 ---whole, its errors listed by `sol.problems()`, and the rules that ran stay.

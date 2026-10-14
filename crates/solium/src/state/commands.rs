@@ -1169,14 +1169,15 @@ impl Solium {
     }
 
     /// The engine's own keys, `effects.sandbox`, `limits` and `present`
-    /// (Ruling 28): kept for what reads them, and the caps handed to the
-    /// host and to the reader of a style's `effects.lua`, which read again
-    /// what new caps may change.
+    /// (Ruling 28), and `xray` and `memo` (Rulings F29, F30): kept for what
+    /// reads them, and the caps handed to the host and to the reader of a
+    /// style's `effects.lua`, which read again what new caps may change.
     /// `tests::effects_sandbox_reaches_the_host_and_the_styles_reader`.
     pub(crate) fn apply_settings(&mut self, settings: crate::effect::settings::Settings) {
+        let caps = settings.sandbox;
         self.effect_settings = settings;
-        if self.effects.set_caps(settings.sandbox) {
-            crate::style::set_caps(settings.sandbox);
+        if self.effects.set_caps(caps) {
+            crate::style::set_caps(caps);
             self.apply_style_rules();
         }
     }

@@ -621,8 +621,9 @@ pub(crate) enum Command {
     /// `sol.effects{ rules = … }`: the user's rules, parsed, or every error
     /// in them, applied whole or not at all
     /// (`state::tests::a_broken_rule_keeps_the_rules_that_ran`); and the
-    /// engine's own keys beside them, `sandbox`, `limits` and `present`
-    /// (`tests::sol_effects_reaches_the_compositor_with_its_settings`).
+    /// engine's own keys beside them, `sandbox`, `limits`, `present`, `xray`
+    /// and `memo` (`tests::sol_effects_reaches_the_compositor_with_its_settings`,
+    /// `tests::sol_effects_reads_xray_and_memo`).
     Effects {
         rules: Result<Vec<crate::effect::rules::Rule>, Vec<crate::effect::rules::RuleError>>,
         settings: Result<crate::effect::settings::Settings, String>,
@@ -9169,6 +9170,68 @@ mod tests {
             "{refused:?}"
         );
         assert_eq!(none, &Ok(crate::effect::settings::Settings::default()));
+    }
+
+    /// **`sol.effects` reads `xray` and `memo`** (Rulings F29, F30; amended
+    /// 2026-10-08, configurable): both reach the compositor in its settings,
+    /// parsed; a word outside `split`'s words is the set's error, naming it;
+    /// and a number that is not finite is refused by name rather than
+    /// dropped for the default, as `effect::settings::tree_of` keeps it in
+    /// both tables, so `budget_mib = 1/0` is not "no cap" and `scale = 0/0`
+    /// is not 1.
+    #[test]
+    fn sol_effects_reads_xray_and_memo() {
+        let directory =
+            std::env::temp_dir().join(format!("solium-effects-xray-memo-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&directory);
+        let config = directory.join("init.lua");
+        std::fs::write(
+            &config,
+            "sol.effects({ xray = { keep_ms = 0 }, memo = { split = 'off' } })\n\
+             sol.effects({ memo = { split = 'short' } })\n\
+             sol.effects({ memo = { budget_mib = 1/0 } })\n\
+             sol.effects({ xray = { scale = 0/0 } })\n\
+             sol.effects({ xray = { keep_ms = -1/0 } })\n\
+             sol.effects({ xray = 1/0 })\n",
+        )
+        .expect("writing");
+        let mut scripts = Scripts::load(&config).expect("loading");
+        let commands = scripts.startup().commands;
+        let _ = std::fs::remove_dir_all(&directory);
+        let sets: Vec<_> = commands
+            .into_iter()
+            .filter_map(|command| match command {
+                Command::Effects { settings, .. } => Some(settings),
+                _ => None,
+            })
+            .collect();
+        let [read, refused @ ..] = sets.as_slice() else {
+            panic!("six sets: {sets:?}");
+        };
+        let read = read.as_ref().expect("parsed");
+        assert_eq!(
+            (read.xray.keep_ms, read.memo.split),
+            (0, solium_effects::stage::Split::Off)
+        );
+        assert_eq!(
+            (read.xray.scale, read.memo.budget_mib),
+            (1.0, 0),
+            "what was not said is the default"
+        );
+        let says = [
+            "`effects.memo.split`",
+            "`effects.memo.budget_mib`",
+            "`effects.xray.scale`",
+            "`effects.xray.keep_ms`",
+            "`effects.xray` is a table",
+        ];
+        assert_eq!(refused.len(), says.len(), "{refused:?}");
+        for (refused, says) in refused.iter().zip(says) {
+            assert!(
+                refused.as_ref().is_err_and(|error| error.contains(says)),
+                "{says}: {refused:?}"
+            );
+        }
     }
 
     /// **A broken rule reaches the compositor as its errors**, so the
