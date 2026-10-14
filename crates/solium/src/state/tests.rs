@@ -3953,7 +3953,11 @@ end)"#,
         state.space.refresh();
         let before = state.real_geometry(&window).expect("the window is mapped");
         let id = state.panes.id_of(&window).expect("the window has a pane");
-        state.focus_window(&window, SERIAL_COUNTER.next_serial());
+        state.focus_window(
+            &window,
+            SERIAL_COUNTER.next_serial(),
+            crate::script::FocusSource::Script,
+        );
 
         assert!(state.trigger("super+f"), "super+f is bound");
         assert!(
@@ -4029,7 +4033,11 @@ end)"#,
         state.space.map_element(window.clone(), (400, 300), false);
         state.space.refresh();
         let before = state.real_geometry(&window).expect("the window is mapped");
-        state.focus_window(&window, SERIAL_COUNTER.next_serial());
+        state.focus_window(
+            &window,
+            SERIAL_COUNTER.next_serial(),
+            crate::script::FocusSource::Script,
+        );
         macro_rules! press {
             ($combo:expr) => {
                 assert!(state.trigger($combo), "{} is bound", $combo);
@@ -4159,7 +4167,11 @@ end)"#,
             &mut event_queue,
             &mut client,
         );
-        state.focus_window(&window, SERIAL_COUNTER.next_serial());
+        state.focus_window(
+            &window,
+            SERIAL_COUNTER.next_serial(),
+            crate::script::FocusSource::Script,
+        );
 
         assert!(state.trigger("super+shift+m"), "super+shift+m is bound");
         pump(
@@ -5074,7 +5086,11 @@ end)"#,
                 state.space.map_element(window.clone(), at, false);
                 state.space.refresh();
                 let pane = state.panes.id_of(&window).expect("the window has a pane");
-                state.focus_window(&window, SERIAL_COUNTER.next_serial());
+                state.focus_window(
+                    &window,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 let mut desk = Self {
                     display,
                     state,
@@ -5868,7 +5884,11 @@ end)"#,
         );
 
         // One click on the parent. This is the whole of the bug.
-        state.focus_window(&parent, SERIAL_COUNTER.next_serial());
+        state.focus_window(
+            &parent,
+            SERIAL_COUNTER.next_serial(),
+            crate::script::FocusSource::Script,
+        );
 
         assert!(
             depth(&state, &parent) > depth(&state, &other),
@@ -7061,7 +7081,11 @@ end)"#,
             "the premise: two tiles side by side: {left:?} and {right:?}"
         );
         let pane = state.panes.id_of(window).expect("the window has a pane");
-        state.focus_window(window, SERIAL_COUNTER.next_serial());
+        state.focus_window(
+            window,
+            SERIAL_COUNTER.next_serial(),
+            crate::script::FocusSource::Script,
+        );
 
         // Over the layout while it is fullscreen or maximised, and at the
         // size it was told for that; and the tile it goes back to is `tile`.
@@ -7225,7 +7249,11 @@ end)"#,
             ] {
                 let tile = tile_of(&state, window);
                 let pane = state.panes.id_of(window).expect("pane");
-                state.focus_window(window, SERIAL_COUNTER.next_serial());
+                state.focus_window(
+                    window,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 assert!(state.trigger(key));
                 round_trip!();
                 let (w, h) = last_configured(&client, toplevel).expect("told a size");
@@ -7403,7 +7431,11 @@ end)"#,
             pointer_to(&mut state, (2500.0, 500.0));
             press!("super+2");
             pointer_to(&mut state, (500.0, 500.0));
-            state.focus_window(&window, SERIAL_COUNTER.next_serial());
+            state.focus_window(
+                &window,
+                SERIAL_COUNTER.next_serial(),
+                crate::script::FocusSource::Script,
+            );
             rest!();
             let before = state.real_geometry(&window).expect("the window is mapped");
             assert_eq!(
@@ -7736,7 +7768,11 @@ end)"#,
         }
         round_trip!();
         rest!();
-        state.focus_window(&window, SERIAL_COUNTER.next_serial());
+        state.focus_window(
+            &window,
+            SERIAL_COUNTER.next_serial(),
+            crate::script::FocusSource::Script,
+        );
         press!("super+shift+space");
         rest!();
         let floated = state.real_geometry(&window).expect("the window is mapped");
@@ -11533,9 +11569,11 @@ end)"#,
             session.state.space.refresh();
             session.state.sync_panes();
             let pane = session.state.panes.id_of(&window).expect("a pane");
-            session
-                .state
-                .focus_window(&window, SERIAL_COUNTER.next_serial());
+            session.state.focus_window(
+                &window,
+                SERIAL_COUNTER.next_serial(),
+                crate::script::FocusSource::Script,
+            );
             let land = |session: &mut Session, after: Duration| {
                 session.state.clock.advance(after);
                 let now = session.state.clock.now();
@@ -11827,9 +11865,11 @@ end)"#,
             let lock = session.lock();
             let selections = session.app.client.selections;
 
-            session
-                .state
-                .focus_window(&window, SERIAL_COUNTER.next_serial());
+            session.state.focus_window(
+                &window,
+                SERIAL_COUNTER.next_serial(),
+                crate::script::FocusSource::Script,
+            );
             session.app.pump(&mut session.display, &mut session.state);
 
             session.assert_sealed("focus_window while locked", selections);
@@ -15502,6 +15542,62 @@ end)"#,
                 }
             }
         }
+
+        /// **No warp moves the pointer behind the lock** (#220): neither
+        /// `sol.warp` nor the warp of a `sol.focus` the lock refused takes
+        /// the pointer anywhere while the session is locked, so nothing of the
+        /// session's moves what the lock screen is being used with.
+        #[test]
+        fn no_warp_moves_the_pointer_behind_the_lock() {
+            use crate::script::{FocusSource, Warp, WarpTo};
+            let mut session = Session::new();
+            let (window, _toplevel, _surface, _xdg) =
+                session.app.open(&mut session.display, &mut session.state);
+            let id = session
+                .state
+                .panes
+                .id_of(&window)
+                .expect("a client in the space has a pane")
+                .get();
+            session.lock();
+            let at = |session: &Session| {
+                session
+                    .state
+                    .seat
+                    .get_pointer()
+                    .map(|pointer| pointer.current_location())
+                    .unwrap_or_default()
+            };
+            let before = at(&session);
+            session.state.apply(Outcome {
+                commands: vec![Command::Warp(Warp {
+                    to: WarpTo::Point {
+                        x: 1500.0,
+                        y: 800.0,
+                    },
+                    motion: None,
+                })],
+                ..Outcome::default()
+            });
+            let warped = at(&session);
+            session.state.apply(Outcome {
+                commands: vec![Command::Focus {
+                    id,
+                    source: FocusSource::Script,
+                    warp: Some(Warp {
+                        to: WarpTo::Window { id, at: (0.5, 0.5) },
+                        motion: None,
+                    }),
+                }],
+                ..Outcome::default()
+            });
+            assert_eq!(
+                (warped, at(&session), session.state.flight.is_none()),
+                (before, before, true),
+                "(after `sol.warp`, after `sol.focus` with a warp, nothing flying): the pointer \
+                 moved behind the lock"
+            );
+        }
     }
 
     /// **#115: what a client says about its own size**, read from the real
@@ -17245,8 +17341,11 @@ end)
                     .and_then(Pane::client)
                     .cloned()
                     .expect("the pane has its client");
-                desk.state
-                    .focus_window(&elsewhere, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &elsewhere,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 desk.state.clock.advance(Duration::from_secs(1));
                 let now = desk.state.clock.now();
                 desk.state.settle(now);
@@ -19746,8 +19845,11 @@ end)
                 .and_then(Pane::client)
                 .cloned()
                 .expect("a window");
-            desk.state
-                .focus_window(&window, smithay::utils::SERIAL_COUNTER.next_serial());
+            desk.state.focus_window(
+                &window,
+                smithay::utils::SERIAL_COUNTER.next_serial(),
+                crate::script::FocusSource::Script,
+            );
             // Somewhere the pointer is over the bottom window alone, so the
             // keyboard goes to the one furthest down, and has the most to
             // be raised past.
@@ -20556,8 +20658,11 @@ end)
             fn a_genuine_activation_of_a_window_being_closed_does_not_keep_the_keyboard() {
                 let (mut desk, working) = working_in(SHIPPED_HEARING_FOCUS, None);
                 let closing = desk.open_surface();
-                desk.state
-                    .focus_window(&working, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &working,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 typed_into(
                     &mut desk,
                     &working,
@@ -20598,8 +20703,11 @@ end)
             fn a_genuine_activation_of_a_window_its_own_frame_hides_does_not_keep_the_keyboard() {
                 let (mut desk, working) = working_in(SHIPPED_HEARING_FOCUS, None);
                 let hidden = desk.open_surface();
-                desk.state
-                    .focus_window(&working, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &working,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 typed_into(
                     &mut desk,
                     &working,
@@ -20675,8 +20783,11 @@ end)
             fn a_client_can_mint_itself_an_activation_token_and_take_the_keyboard_with_it() {
                 let (mut desk, working) = working_in(SHIPPED_HEARING_FOCUS, None);
                 let asking = desk.open_surface();
-                desk.state
-                    .focus_window(&working, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &working,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 typed_into(
                     &mut desk,
                     &working,
@@ -20862,7 +20973,11 @@ end)
                     ),
                 );
                 let left = window_of(&desk, left.pane);
-                desk.state.focus_window(&left, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &left,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 typed_into(&mut desk, &left, "the premise: typing reaches `left`");
                 LeftBehind {
                     desk,
@@ -20998,7 +21113,11 @@ end)
                             && !desk.state.carried_by_a_selection(*pane)),
                     "the premise: three tiles on the desk in view"
                 );
-                desk.state.focus_window(&left, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &left,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 ThreeTiles {
                     desk,
                     left,
@@ -21024,7 +21143,11 @@ end)
                     f64::from(over_right.loc.y + over_right.size.h / 2),
                 ));
                 point_at(&mut desk.state, (at.x, at.y));
-                desk.state.focus_window(left, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    left,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 typed_into(desk, left, "the premise: typing reaches `left`");
                 let right = window_of(desk, right.pane);
                 assert_eq!(
@@ -21419,7 +21542,11 @@ end)
                     ),
                 );
                 let left = window_of(&desk, left.pane);
-                desk.state.focus_window(&left, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &left,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 typed_into(&mut desk, &left, "the premise: typing reaches `left`");
                 UnderAPanel {
                     desk,
@@ -21662,8 +21789,11 @@ end)
                         f64::from(over_right.loc.y + over_right.size.h / 2),
                     ),
                 );
-                desk.state
-                    .focus_window(&left_window, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &left_window,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 typed_into(
                     &mut desk,
                     &left_window,
@@ -21743,8 +21873,11 @@ end)
                         f64::from(over_right.loc.y + over_right.size.h / 2),
                     ),
                 );
-                desk.state
-                    .focus_window(&left_window, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &left_window,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 typed_into(
                     &mut desk,
                     &left_window,
@@ -21781,8 +21914,11 @@ end)
                      until something unrelated redrew"
                 );
                 let parked_window = window_of(&desk, parked.pane);
-                desk.state
-                    .focus_window(&parked_window, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &parked_window,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 assert!(
                     !desk.state.urgent.contains(&id),
                     "focusing it did not clear urgent"
@@ -22494,8 +22630,11 @@ end)
                 );
 
                 point_at(&mut desk.state, (2500.0, 500.0));
-                desk.state
-                    .focus_window(&window_of(&desk, right.pane), SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &window_of(&desk, right.pane),
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 assert!(desk.state.trigger("super+2"), "super+2 was not handled");
                 desk.state.clock.advance(Duration::from_secs(1));
                 let now = desk.state.clock.now();
@@ -22812,8 +22951,11 @@ end)
                     desk.state.map_stacked(window.clone(), (2020, 100), false);
                     frame(&mut desk);
                     point_at(&mut desk.state, (500.0, 500.0));
-                    desk.state
-                        .focus_window(&window, SERIAL_COUNTER.next_serial());
+                    desk.state.focus_window(
+                        &window,
+                        SERIAL_COUNTER.next_serial(),
+                        crate::script::FocusSource::Script,
+                    );
                     assert!(desk.state.trigger("super+shift+2"));
                     settled(&mut desk);
                     let right =
@@ -23082,8 +23224,11 @@ end)
                             }
                             settled(&mut desk);
                             let other_window = window_of(&desk, other.pane);
-                            desk.state
-                                .focus_window(&other_window, SERIAL_COUNTER.next_serial());
+                            desk.state.focus_window(
+                                &other_window,
+                                SERIAL_COUNTER.next_serial(),
+                                crate::script::FocusSource::Script,
+                            );
                             desk.state.close_pane(app.pane);
                             frame(&mut desk);
                             assert!(
@@ -23871,8 +24016,11 @@ end)
                 desk.state.space.refresh();
                 landed(&mut desk);
                 let (_bar, _layered) = layer_surface(&mut desk, Client::Top, None, 30, 30);
-                desk.state
-                    .focus_window(&other_window, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &other_window,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 desk.state.profile.focus_follows_mouse = true;
                 let on_the_bar = Point::<f64, Logical>::from((532.0, 15.0));
                 assert!(
@@ -23928,8 +24076,11 @@ end)
                     .map_element(window.clone(), (100, 100), false);
                 desk.state.space.refresh();
                 landed(&mut desk);
-                desk.state
-                    .focus_window(&window, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &window,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 let empty = (1700.0, 950.0);
                 assert!(
                     desk.focused() == opened.pane
@@ -23988,8 +24139,11 @@ end)
                     .map_element(other_window.clone(), (800, 300), false);
                 desk.state.space.refresh();
                 landed(&mut desk);
-                desk.state
-                    .focus_window(&other_window, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &other_window,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 desk.state.profile.click_to_focus = false;
                 desk.state.profile.focus_follows_mouse = false;
                 let on_under = (150.0, 150.0);
@@ -24026,8 +24180,11 @@ end)
                 desk.state.space.refresh();
                 landed(&mut desk);
                 let (_bar, _layered) = layer_surface(&mut desk, Client::Top, None, 30, 30);
-                desk.state
-                    .focus_window(&window, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &window,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 let on_the_bar = (960.0, 15.0);
                 assert!(
                     desk.focused() == opened.pane && desk.state.client_above(on_the_bar.into()),
@@ -24083,8 +24240,11 @@ end)
                         hit: |_| crate::qml::hosted::Hit::Nothing,
                         ..crate::scripted::Stand::solid()
                     });
-                desk.state
-                    .focus_window(&window, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &window,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 let empty = (1700.0, 950.0);
                 assert!(
                     desk.focused() == opened.pane
@@ -24647,8 +24807,11 @@ end)
                     .space
                     .map_element(other_window.clone(), (100, 100), false);
                 desk.state.space.refresh();
-                desk.state
-                    .focus_window(&other_window, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &other_window,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 desk.state.profile.focus_follows_mouse = true;
 
                 move_pointer(&mut desk.state, (630.0, 520.0), 10);
@@ -24695,8 +24858,11 @@ end)
                     .space
                     .map_element(other_window.clone(), (100, 100), false);
                 desk.state.space.refresh();
-                desk.state
-                    .focus_window(&other_window, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &other_window,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 desk.state.profile.touch_to_focus = true;
                 let region = region(&desk);
                 let lands = |desk: &Desk, at: (f64, f64)| {
@@ -24891,8 +25057,11 @@ end)
                     .space
                     .map_element(other_window.clone(), (100, 100), false);
                 desk.state.space.refresh();
-                desk.state
-                    .focus_window(&other_window, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &other_window,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 desk.state.profile.click_to_focus = true;
                 desk.state.profile.focus_follows_mouse = false;
                 (desk, opened, other, shell)
@@ -25693,8 +25862,11 @@ end)
             fn the_window_gets_the_keyboard_back_when_the_shell_lets_go() {
                 let (mut desk, opened, shell) = window_under_a_scene(button_over_the_window);
                 let window = window(&desk, &opened);
-                desk.state
-                    .focus_window(&window, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &window,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 want(
                     &mut desk,
                     shell,
@@ -25760,8 +25932,11 @@ end)
                     .space
                     .map_element(other_window.clone(), (100, 100), false);
                 desk.state.space.refresh();
-                desk.state
-                    .focus_window(&other_window, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &other_window,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 desk.state.profile.focus_follows_mouse = true;
                 want(
                     &mut desk,
@@ -25814,8 +25989,11 @@ end)
             fn a_hold_another_scene_takes_returns_to_the_window_the_first_took_it_from() {
                 let (mut desk, opened, menu) = window_under_a_scene(button_over_the_window);
                 let window = window(&desk, &opened);
-                desk.state
-                    .focus_window(&window, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &window,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 let search = stand_in(
                     &mut desk.state,
                     "search",
@@ -25876,8 +26054,11 @@ end)
             fn a_surface_taken_away_gives_the_keyboard_back() {
                 let (mut desk, opened, shell) = window_under_a_scene(button_over_the_window);
                 let window = window(&desk, &opened);
-                desk.state
-                    .focus_window(&window, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &window,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 want(
                     &mut desk,
                     shell,
@@ -25898,8 +26079,11 @@ end)
             fn a_surface_the_pointer_does_not_reach_holds_no_keyboard() {
                 let (mut desk, opened, _) = window_under_a_scene(button_over_the_window);
                 let window = window(&desk, &opened);
-                desk.state
-                    .focus_window(&window, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &window,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 let mut declared = crate::scripted::Declaration::for_test(
                     "osd",
                     std::path::PathBuf::from("/nonexistent/hosted-test.qml"),
@@ -25936,8 +26120,11 @@ end)
             fn a_surface_declared_again_out_of_the_pointers_reach_gives_the_keyboard_back() {
                 let (mut desk, opened, shell) = window_under_a_scene(button_over_the_window);
                 let window = window(&desk, &opened);
-                desk.state
-                    .focus_window(&window, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &window,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 want(
                     &mut desk,
                     shell,
@@ -25983,8 +26170,11 @@ end)
                 let _pointer = desk.client.seat_pointer(&desk.qh);
                 desk.pump();
                 let window = window(&desk, &opened);
-                desk.state
-                    .focus_window(&window, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &window,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 want(
                     &mut desk,
                     menu,
@@ -26073,8 +26263,11 @@ end)
             fn a_monitor_unplugged_while_its_scene_holds_the_keyboard_gives_it_back() {
                 let (mut desk, opened, _) = window_under_a_scene(button_over_the_window);
                 let window = window(&desk, &opened);
-                desk.state
-                    .focus_window(&window, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &window,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 let right = a_screen(&mut desk.state, "hold-right", (1920, 0));
                 desk.state.settle_monitors();
                 let search = stand_in(
@@ -26168,8 +26361,11 @@ end)
             fn a_window_closed_while_the_shell_holds_the_keyboard_is_not_given_it_back() {
                 let (mut desk, opened, shell) = window_under_a_scene(button_over_the_window);
                 let window = window(&desk, &opened);
-                desk.state
-                    .focus_window(&window, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &window,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 want(
                     &mut desk,
                     shell,
@@ -27310,8 +27506,11 @@ end)"#,
             fn a_window_row_carries_where_it_lives_and_its_focus() {
                 let (mut desk, opened, _) = window_under_a_scene(button_over_the_window);
                 let window = window(&desk, &opened);
-                desk.state
-                    .focus_window(&window, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &window,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 let id = opened.pane.get();
                 let row = window_row(&desk, id);
                 use crate::json::Json;
@@ -27472,8 +27671,16 @@ end)"#,
                 let (mut desk, first, _) = window_under_a_scene(button_over_the_window);
                 let second = desk.open_surface();
                 let (one, two) = (window(&desk, &first), window(&desk, &second));
-                desk.state.focus_window(&one, SERIAL_COUNTER.next_serial());
-                desk.state.focus_window(&two, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &one,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
+                desk.state.focus_window(
+                    &two,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 use crate::json::Json;
                 assert_eq!(
                     window_row(&desk, second.pane.get()).get("focusOrder"),
@@ -27493,8 +27700,11 @@ end)"#,
             fn a_window_still_loading_is_listed_as_loading() {
                 let (mut desk, opened, _) = window_under_a_scene(button_over_the_window);
                 let focused = window(&desk, &opened);
-                desk.state
-                    .focus_window(&focused, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &focused,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 let source = crate::pane::loading_source(None);
                 let loading = desk.state.open_loading("app", None, source, None);
                 let row = window_row(&desk, loading.get());
@@ -27530,10 +27740,21 @@ end)"#,
                     window(&desk, &second),
                     window(&desk, &third),
                 );
-                desk.state
-                    .focus_window(&three, SERIAL_COUNTER.next_serial());
-                desk.state.focus_window(&two, SERIAL_COUNTER.next_serial());
-                desk.state.focus_window(&one, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &three,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
+                desk.state.focus_window(
+                    &two,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
+                desk.state.focus_window(
+                    &one,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 desk.state.urgent.insert(second.pane.get());
                 second.toplevel.destroy();
                 desk.pump();
@@ -27551,8 +27772,11 @@ end)"#,
                     [Some(Json::Number(0.0)), Some(Json::Number(1.0))],
                     "[the window in front, the one focused before the closed one]"
                 );
-                desk.state
-                    .focus_window(&three, SERIAL_COUNTER.next_serial());
+                desk.state.focus_window(
+                    &three,
+                    SERIAL_COUNTER.next_serial(),
+                    crate::script::FocusSource::Script,
+                );
                 assert_eq!(
                     (desk.state.focus_history.clone(), desk.state.urgent.len()),
                     (vec![third.pane.get(), first.pane.get()], 0),
@@ -28656,7 +28880,11 @@ end)"#,
 
         // The window the user is working in, and the premise that this
         // fixture can see where typing goes at all.
-        state.focus_window(&visible, SERIAL_COUNTER.next_serial());
+        state.focus_window(
+            &visible,
+            SERIAL_COUNTER.next_serial(),
+            crate::script::FocusSource::Script,
+        );
         types(&mut state, KEY_A);
         pump(
             &mut display,
@@ -28797,7 +29025,11 @@ end)"#,
              question and not the mouse's"
         );
 
-        state.focus_window(&window, SERIAL_COUNTER.next_serial());
+        state.focus_window(
+            &window,
+            SERIAL_COUNTER.next_serial(),
+            crate::script::FocusSource::Script,
+        );
         state.close_pane(pane);
         state
             .clock
@@ -29288,7 +29520,11 @@ end)"#,
 
         // The window the user is working in, which is the one they are
         // about to close.
-        state.focus_window(&doomed, SERIAL_COUNTER.next_serial());
+        state.focus_window(
+            &doomed,
+            SERIAL_COUNTER.next_serial(),
+            crate::script::FocusSource::Script,
+        );
         types(&mut state, KEY_A);
         pump(
             &mut display,
@@ -29514,6 +29750,934 @@ end)"#,
              after the window comes back, which is what makes the \
              suppression a delay rather than a loss"
         );
+    }
+
+    /// **#220: the pointer follows the keyboard**, against a real client and
+    /// the real input path: a key that moves focus takes the pointer to the
+    /// window it focused at once and flies only its picture there, a click or
+    /// a bar's chip takes it nowhere, and the warp underneath -- refused while
+    /// something holds the pointer, ended by the hand on the mouse, and asking
+    /// again where it lands what the pointer is over (#229).
+    ///
+    /// Every key is pressed through the keymap with `us,ru` and the Cyrillic
+    /// group active (#132).
+    mod follow {
+        use super::*;
+        use crate::keymap::tests::{set_us_ru, tap};
+        use crate::script::{FocusSource, Warp, WarpTo};
+        use smithay::backend::input::ButtonState;
+
+        /// Super, the arrows and `t`, as xkb keycodes: evdev 125, 105, 106
+        /// and 20, plus eight.
+        const SUPER: u32 = 133;
+        const LEFT: u32 = 113;
+        const RIGHT: u32 = 114;
+        const T: u32 = 28;
+
+        /// The left button, as evdev names it.
+        const BUTTON: u32 = 0x110;
+
+        /// The shipped layouts, the action vocabulary and the pointer's
+        /// policy, with a stand-in for a bar's window chip: `chip` is
+        /// `windows.focus` for the window it names, as a shell's chip sends
+        /// it.
+        const SHIPPED: &str = "require(\"actions\")\n\
+             require(\"modes\")\n\
+             require(\"follow\")\n\
+             require(\"workspaces\")\n\
+             require(\"tiling\")\n\
+             require(\"scrolling\")\n\
+             require(\"direction\")\n\
+             sol.on(\"surface\", function(_, action, data)\n\
+                 if action == \"chip\" then sol.act(\"windows.focus\", data) end\n\
+             end)\n";
+
+        /// One client on `screens` monitors side by side, each 1920x1080, the
+        /// keyboard on `us,ru` with Russian active, focus not following the
+        /// mouse and a click focusing.
+        struct Desk {
+            display: Display<Solium>,
+            state: Solium,
+            conn: Connection,
+            queue: wayland_client::EventQueue<Client>,
+            qh: QueueHandle<Client>,
+            client: Client,
+            /// The input clock the synthetic events carry, in microseconds.
+            time: u64,
+        }
+
+        /// A window [`Desk::open`] opened: the client's surface, and the
+        /// server's.
+        struct Opened {
+            window: Window,
+            pane: crate::pane::PaneId,
+            surface: wl_surface::WlSurface,
+            server: WlSurface,
+        }
+
+        impl Desk {
+            fn new(screens: usize) -> Self {
+                let mut display =
+                    Display::<Solium>::new().expect("creating a test wayland display");
+                let mut state = Solium::new(display.handle());
+                // See the #99 test: a Qt scene in a process holding a
+                // libwayland connection of its own aborts the test binary.
+                state
+                    .decorations
+                    .set_style(&mut state.panes, Some("none".to_string()));
+                if screens == 2 {
+                    side_by_side(&mut state, "follow-test");
+                } else {
+                    a_screen(&mut state, "follow-test", (0, 0));
+                }
+                set_us_ru(&mut state, 1);
+                state.profile.focus_follows_mouse = false;
+                state.profile.click_to_focus = true;
+                let (conn, queue, client) = connect(&mut display, &mut state);
+                let qh = queue.handle();
+                Self {
+                    display,
+                    state,
+                    conn,
+                    queue,
+                    qh,
+                    client,
+                    time: 1_000_000,
+                }
+            }
+
+            /// The scripts `body` with the shipped files on `package.path`,
+            /// handed to the compositor. A directory per call, for the
+            /// reason the layout harness in `script.rs` gives.
+            fn install(&mut self, body: &str) {
+                static NEXT: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let directory = std::env::temp_dir()
+                    .join(format!("solium-follow-{}-{serial}", std::process::id()));
+                let _ = std::fs::create_dir_all(&directory);
+                let entry = directory.join("init.lua");
+                std::fs::write(
+                    &entry,
+                    format!(
+                        "package.path = {shipped:?} .. \"/?.lua\"\n{body}\n",
+                        shipped = concat!(env!("CARGO_MANIFEST_DIR"), "/lua"),
+                    ),
+                )
+                .expect("writing the entry point");
+                self.state.start_scripts(Some(
+                    Scripts::load(&entry).expect("loading the test scripts"),
+                ));
+            }
+
+            fn open(&mut self) -> Opened {
+                let (window, _toplevel, surface, _xdg) = open_xdg(
+                    &mut self.display,
+                    &mut self.state,
+                    &self.conn,
+                    &self.client,
+                    &self.qh,
+                );
+                self.state.sync_panes();
+                self.pump();
+                let pane = self
+                    .state
+                    .panes
+                    .id_of(&window)
+                    .expect("a client in the space has a pane");
+                let server = window
+                    .wl_surface()
+                    .map(std::borrow::Cow::into_owned)
+                    .expect("an xdg window has a surface");
+                Opened {
+                    window,
+                    pane,
+                    surface,
+                    server,
+                }
+            }
+
+            fn pump(&mut self) {
+                pump(
+                    &mut self.display,
+                    &mut self.state,
+                    &self.conn,
+                    &self.qh,
+                    &mut self.queue,
+                    &mut self.client,
+                );
+            }
+
+            /// Keys pressed in order and let go in reverse, through the keymap.
+            fn keys(&mut self, codes: &[u32]) {
+                tap(&mut self.state, codes);
+                self.pump();
+            }
+
+            /// Every transform landed, and the flights with them.
+            fn rest(&mut self) {
+                self.state.clock.advance(Duration::from_secs(2));
+                self.state.sync_panes();
+                let now = self.state.clock.now();
+                self.state.settle(now);
+                self.pump();
+            }
+
+            fn region(&self) -> Rectangle<i32, Logical> {
+                crate::monitor::union(&self.state.space).expect("a monitor")
+            }
+
+            /// The mouse moved by `by`, as a real one reports it.
+            fn nudge(&mut self, by: (f64, f64)) {
+                self.time += 8_000;
+                let region = self.region();
+                crate::synth::send_motion(&mut self.state, region, Point::from(by), self.time);
+            }
+
+            /// The mouse moved to `to`, as a real one reports it.
+            fn mouse_to(&mut self, to: Point<f64, Logical>) {
+                let by = to - self.drawn();
+                self.nudge((by.x, by.y));
+            }
+
+            /// The left button, pressed or let go.
+            fn button(&mut self, pressed: bool) {
+                self.time += 8_000;
+                let region = self.region();
+                let state = if pressed {
+                    ButtonState::Pressed
+                } else {
+                    ButtonState::Released
+                };
+                crate::synth::send_button(&mut self.state, region, BUTTON, state, self.time);
+                self.pump();
+            }
+
+            /// Where the pointer is.
+            fn at(&self) -> Point<f64, Logical> {
+                self.state
+                    .seat
+                    .get_pointer()
+                    .map(|pointer| pointer.current_location())
+                    .unwrap_or_default()
+            }
+
+            /// Where it is drawn.
+            fn drawn(&self) -> Point<f64, Logical> {
+                self.state.drawn_pointer()
+            }
+
+            /// The surface the pointer is on, as the seat says it.
+            fn under(&self) -> Option<WlSurface> {
+                self.state
+                    .seat
+                    .get_pointer()
+                    .and_then(|pointer| pointer.current_focus())
+            }
+
+            /// The rectangle the layout last asked for this pane.
+            fn placed(&self, pane: crate::pane::PaneId) -> Rectangle<i32, Logical> {
+                self.state
+                    .panes
+                    .get(pane)
+                    .and_then(Pane::placed)
+                    .expect("the layout has placed this pane")
+            }
+
+            fn focused(&self) -> Option<Window> {
+                self.state.focused_window()
+            }
+
+            /// Carry out `commands` as a script's dispatch would.
+            fn apply(&mut self, commands: Vec<Command>) {
+                self.state.apply(Outcome {
+                    commands,
+                    ..Outcome::default()
+                });
+                self.pump();
+            }
+
+            /// A warp, asked for by a script.
+            fn warp(&mut self, to: WarpTo, motion: Option<AnimationSpec>) {
+                self.apply(vec![Command::Warp(Warp { to, motion })]);
+            }
+
+            /// A scene's action, heard by the `surface` listeners and
+            /// applied, as `settle_actions` does.
+            fn action(&mut self, action: &str, data: &crate::json::Json) {
+                let snapshot = self.state.snapshot();
+                let mut scripts = self.state.scripts.take().expect("scripts are installed");
+                let outcome = scripts.surface_action("bar", action, data, snapshot);
+                self.state.scripts = Some(scripts);
+                self.state.apply(outcome);
+                self.pump();
+            }
+
+            /// What a script holds this window as.
+            fn id(&self, opened: &Opened) -> u64 {
+                opened.pane.get()
+            }
+
+            /// The client fills the tile the layout gave it, as a real one
+            /// answers its configure. No frame, so the tile is the client.
+            fn answer(&mut self, opened: &Opened) {
+                let tile = self.placed(opened.pane);
+                commit_buffer(
+                    &self.client,
+                    &self.qh,
+                    &opened.surface,
+                    tile.size.w,
+                    tile.size.h,
+                );
+                self.pump();
+            }
+        }
+
+        /// A floating window's place: 64 pixels square, the size every
+        /// client here commits, at `(x, y)`, and there at once unless
+        /// `millis` says.
+        fn floated(id: u64, x: f64, y: f64, millis: u64) -> Command {
+            Command::Place {
+                id,
+                rect: Rect {
+                    x,
+                    y,
+                    w: 64.0,
+                    h: 64.0,
+                },
+                animation: AnimationSpec {
+                    duration: Duration::from_millis(millis),
+                    easing: crate::present::Curve::Linear,
+                },
+                tile: false,
+                inside: None,
+                cramped: false,
+                moved: false,
+            }
+        }
+
+        fn centre(rect: Rectangle<i32, Logical>) -> Point<f64, Logical> {
+            (
+                f64::from(rect.loc.x) + f64::from(rect.size.w) / 2.0,
+                f64::from(rect.loc.y) + f64::from(rect.size.h) / 2.0,
+            )
+                .into()
+        }
+
+        /// A linear motion of `millis`, so a test can say where the picture
+        /// is half way.
+        fn linear(millis: u64) -> Option<AnimationSpec> {
+            Some(AnimationSpec {
+                duration: Duration::from_millis(millis),
+                easing: crate::present::Curve::Linear,
+            })
+        }
+
+        fn near(left: Point<f64, Logical>, right: Point<f64, Logical>) -> bool {
+            (left.x - right.x).abs() < 1.0 && (left.y - right.y).abs() < 1.0
+        }
+
+        /// Tiling, with three windows, each client filling its tile if
+        /// `answered`: `(alone, beside, arrow)`, the window alone in its
+        /// column, the upper of the two in the other, and the arrow key that
+        /// goes from the second to the first.
+        fn three_tiled(desk: &mut Desk, answered: bool) -> (Opened, Opened, u32) {
+            desk.install(SHIPPED);
+            let mut opened: Vec<Opened> = (0..3).map(|_| desk.open()).collect();
+            desk.keys(&[SUPER, T]);
+            desk.rest();
+            if answered {
+                for each in &opened {
+                    desk.answer(each);
+                }
+                desk.rest();
+            }
+            opened.sort_by_key(|each| std::cmp::Reverse(desk.placed(each.pane).size.h));
+            let alone = opened.remove(0);
+            opened.sort_by_key(|each| desk.placed(each.pane).loc.y);
+            let beside = opened.remove(0);
+            let (a, b) = (desk.placed(alone.pane), desk.placed(beside.pane));
+            assert!(
+                a.size.h > b.size.h * 3 / 2
+                    && (a.loc.x + a.size.w <= b.loc.x || b.loc.x + b.size.w <= a.loc.x),
+                "the premise: one window alone in a column and two in the other, {a:?} and {b:?}"
+            );
+            let arrow = if a.loc.x < b.loc.x { LEFT } else { RIGHT };
+            (alone, beside, arrow)
+        }
+
+        /// **A key takes the pointer to the window it focuses at once, and
+        /// flies its picture there**: `super` and an arrow in tiling put the
+        /// pointer at the centre of the window it focused before anything is
+        /// drawn,
+        /// gives that window the pointer, and draws the picture from where
+        /// it was, part of the way along half way through, and there once
+        /// it lands, asking for frames until it has. A click on another
+        /// window, and a bar's chip, focus without taking the pointer
+        /// anywhere.
+        #[test]
+        fn a_key_takes_the_pointer_to_the_window_it_focuses_at_once_and_flies_its_picture() {
+            let mut desk = Desk::new(1);
+            let (left, right, arrow) = three_tiled(&mut desk, true);
+            let was = centre(desk.placed(right.pane));
+            desk.mouse_to(was);
+            desk.state.focus_window(
+                &right.window,
+                SERIAL_COUNTER.next_serial(),
+                FocusSource::Script,
+            );
+            assert!(
+                desk.state.flight.is_none(),
+                "the premise: nothing flies yet"
+            );
+
+            let before = desk.state.clock.now();
+            desk.keys(&[SUPER, arrow]);
+            let to = centre(desk.placed(left.pane));
+            assert_eq!(
+                (
+                    desk.focused().as_ref() == Some(&left.window),
+                    desk.at(),
+                    desk.under().as_ref() == Some(&left.server),
+                ),
+                (true, to, true),
+                "(the left window has the keyboard, where the pointer is, the left window \
+                 has the pointer): all of it at once"
+            );
+            let flight = desk.state.flight.expect("the picture flies");
+            assert_eq!(
+                (flight.from(), flight.to()),
+                (was, to),
+                "(from where it was drawn, to where the pointer is)"
+            );
+            let half = desk
+                .state
+                .drawn_pointer_at(before + Duration::from_millis(130));
+            assert!(
+                (half.x - was.x).abs() > 1.0
+                    && (half.x - to.x).abs() > 1.0
+                    && (half.x - was.x).signum() != (half.x - to.x).signum(),
+                "half way through it is drawn between the two, not at {half:?}: from {was:?} \
+                 to {to:?}"
+            );
+            assert_eq!(
+                (
+                    desk.state.drawn_pointer_at(before),
+                    desk.state.drawn_pointer_at(before + Duration::from_secs(1)),
+                ),
+                (was, to),
+                "(drawn at the start, drawn once it has landed)"
+            );
+            assert!(
+                desk.state.settle_flight(desk.state.clock.now()),
+                "while it flies the frames keep coming"
+            );
+            desk.rest();
+            assert_eq!(
+                (desk.state.flight.is_none(), desk.drawn()),
+                (true, to),
+                "(landed and retired, drawn where the pointer is)"
+            );
+
+            // A click on the right window, off its centre: the keyboard goes
+            // there and the pointer stays where the hand put it.
+            let clicked = was + Point::from((40.0, 30.0));
+            desk.mouse_to(clicked);
+            desk.button(true);
+            desk.button(false);
+            assert_eq!(
+                (
+                    desk.focused().as_ref() == Some(&right.window),
+                    desk.at(),
+                    desk.state.flight.is_none(),
+                ),
+                (true, clicked, true),
+                "a click focused the right window and took the pointer nowhere"
+            );
+
+            // A bar's chip for the left window: the same.
+            let id = desk.id(&left);
+            #[expect(clippy::cast_precision_loss, reason = "a pane id, far below 2^52")]
+            let chip = crate::json::Json::Object(std::collections::BTreeMap::from([(
+                "id".to_owned(),
+                crate::json::Json::Number(id as f64),
+            )]));
+            desk.action("chip", &chip);
+            assert_eq!(
+                (
+                    desk.focused().as_ref() == Some(&left.window),
+                    desk.at(),
+                    desk.state.flight.is_none(),
+                ),
+                (true, clicked, true),
+                "a bar's chip focused the left window and took the pointer nowhere"
+            );
+        }
+
+        /// **A tiled window is warped to its tile before its client has
+        /// filled it**: the clients here never answer their tiles, and an
+        /// arrow key still puts the pointer at the centre of the tile it
+        /// focused, where the window is going, and not of the corner its old
+        /// size takes up there.
+        #[test]
+        fn a_tiled_window_is_warped_to_its_tile_before_its_client_has_filled_it() {
+            let mut desk = Desk::new(1);
+            let (left, right, arrow) = three_tiled(&mut desk, false);
+            desk.mouse_to(centre(desk.placed(right.pane)));
+            desk.state.focus_window(
+                &right.window,
+                SERIAL_COUNTER.next_serial(),
+                FocusSource::Script,
+            );
+            desk.keys(&[SUPER, arrow]);
+            assert_eq!(
+                (desk.focused().as_ref() == Some(&left.window), desk.at(),),
+                (true, centre(desk.placed(left.pane))),
+                "(focused, where the pointer is)"
+            );
+        }
+
+        /// **A key takes the pointer across to a window on the other
+        /// monitor**: two monitors, a tiled window on each, and `super+right`
+        /// from the left one puts the pointer at the right one's centre, on
+        /// the right monitor, at once, with its picture flying over the seam.
+        #[test]
+        fn a_key_takes_the_pointer_across_to_a_window_on_the_other_monitor() {
+            let mut desk = Desk::new(2);
+            desk.install(SHIPPED);
+            desk.keys(&[SUPER, T]);
+            desk.mouse_to((960.0, 540.0).into());
+            let left = desk.open();
+            desk.mouse_to((2880.0, 540.0).into());
+            let right = desk.open();
+            desk.rest();
+            let (l, r) = (desk.placed(left.pane), desk.placed(right.pane));
+            assert!(
+                l.loc.x + l.size.w <= 1920 && r.loc.x >= 1920,
+                "the premise: a window on each monitor, {l:?} and {r:?}"
+            );
+            let was = centre(l);
+            desk.mouse_to(was);
+            desk.state.focus_window(
+                &left.window,
+                SERIAL_COUNTER.next_serial(),
+                FocusSource::Script,
+            );
+
+            let before = desk.state.clock.now();
+            desk.keys(&[SUPER, RIGHT]);
+            let to = centre(r);
+            assert_eq!(
+                (
+                    desk.focused().as_ref() == Some(&right.window),
+                    desk.at(),
+                    desk.state.active_output().map(|output| output.name()),
+                ),
+                (true, to, Some(RIGHT_SCREEN.to_owned())),
+                "(the right window has the keyboard, the pointer, its monitor) at once"
+            );
+            let half = desk
+                .state
+                .drawn_pointer_at(before + Duration::from_millis(80));
+            assert!(
+                desk.state.flight.is_some() && half.x > was.x + 1.0 && half.x < to.x - 1.0,
+                "its picture flies from {was:?} to {to:?}, and is at {half:?}"
+            );
+        }
+
+        /// **A warp goes where the window was moved in the same handler**: a
+        /// handler that warps to a window and then moves it puts the pointer
+        /// at the centre of where it moved it, though the window is still
+        /// drawn on its way there.
+        #[test]
+        fn a_warp_goes_where_the_window_was_moved_in_the_same_handler() {
+            let mut desk = Desk::new(1);
+            desk.install("");
+            let opened = desk.open();
+            let id = desk.id(&opened);
+            desk.apply(vec![floated(id, 100.0, 100.0, 0)]);
+            desk.rest();
+            desk.apply(vec![
+                Command::Warp(Warp {
+                    to: WarpTo::Window { id, at: (0.5, 0.5) },
+                    motion: linear(200),
+                }),
+                floated(id, 1000.0, 500.0, 10_000),
+            ]);
+            assert_eq!(
+                desk.at(),
+                Point::from((1032.0, 532.0)),
+                "the pointer is at the centre of where the window was moved, not of where it was"
+            );
+        }
+
+        /// **What the pointer is over is asked again where its picture
+        /// lands** (#229): a warp to a window still sliding into place finds
+        /// nothing under the pointer when it is carried out, and once the
+        /// picture has landed, with the window there, the window has the
+        /// pointer -- with no motion to tell it.
+        #[test]
+        fn where_the_picture_lands_the_pointer_is_given_to_what_is_there() {
+            let mut desk = Desk::new(1);
+            desk.install("");
+            let opened = desk.open();
+            let id = desk.id(&opened);
+            desk.apply(vec![floated(id, 100.0, 100.0, 0)]);
+            desk.rest();
+            desk.mouse_to((1700.0, 900.0).into());
+            assert!(
+                desk.under().is_none(),
+                "the premise: the pointer is over nothing"
+            );
+
+            desk.apply(vec![
+                floated(id, 1200.0, 100.0, 400),
+                Command::Warp(Warp {
+                    to: WarpTo::Window { id, at: (0.5, 0.5) },
+                    motion: linear(300),
+                }),
+            ]);
+            assert_eq!(
+                (desk.at(), desk.under().is_none()),
+                (Point::from((1232.0, 132.0)), true),
+                "the pointer is where the window is going, and the window is not drawn there yet"
+            );
+            desk.rest();
+            assert!(
+                desk.under().as_ref() == Some(&opened.server),
+                "the picture landed with the window there, and the window was not given the \
+                 pointer"
+            );
+        }
+
+        /// **Real motion mid-flight wins at once**: the mouse moved while a
+        /// warp's picture is half way carries on from where it is drawn, and
+        /// the flight is over.
+        #[test]
+        fn real_motion_mid_flight_wins_at_once() {
+            let mut desk = Desk::new(1);
+            desk.install("");
+            desk.mouse_to((100.0, 100.0).into());
+            desk.warp(
+                WarpTo::Point {
+                    x: 1100.0,
+                    y: 600.0,
+                },
+                linear(10_000),
+            );
+            desk.state.clock.advance(Duration::from_secs(5));
+            let half = desk.drawn();
+            assert!(
+                near(half, (600.0, 350.0).into()),
+                "the premise: half way through it is drawn half way, at {half:?}"
+            );
+            desk.nudge((10.0, 0.0));
+            assert_eq!(
+                (
+                    desk.state.flight.is_none(),
+                    near(desk.at(), half + Point::from((10.0, 0.0)))
+                ),
+                (true, true),
+                "(the flight is over, the pointer went on from where it was drawn): at {:?}",
+                desk.at()
+            );
+            assert_eq!(desk.drawn(), desk.at(), "and it is drawn where it is");
+        }
+
+        /// **A press mid-flight lands it**: the press goes where the pointer
+        /// is, and the picture is there with it.
+        #[test]
+        fn a_press_mid_flight_lands_it() {
+            let mut desk = Desk::new(1);
+            desk.install("");
+            desk.mouse_to((100.0, 100.0).into());
+            desk.warp(
+                WarpTo::Point {
+                    x: 1100.0,
+                    y: 600.0,
+                },
+                linear(10_000),
+            );
+            desk.state.clock.advance(Duration::from_secs(5));
+            desk.button(true);
+            assert_eq!(
+                (desk.state.flight.is_none(), desk.drawn(), desk.at()),
+                (true, (1100.0, 600.0).into(), (1100.0, 600.0).into()),
+                "(landed, drawn, where the pointer is)"
+            );
+            desk.button(false);
+        }
+
+        /// **A second warp mid-flight starts from where the picture is**, not
+        /// from where the first was going.
+        #[test]
+        fn a_second_warp_mid_flight_starts_from_where_the_picture_is() {
+            let mut desk = Desk::new(1);
+            desk.install("");
+            desk.mouse_to((100.0, 100.0).into());
+            desk.warp(
+                WarpTo::Point {
+                    x: 1100.0,
+                    y: 600.0,
+                },
+                linear(10_000),
+            );
+            desk.state.clock.advance(Duration::from_secs(5));
+            let half = desk.drawn();
+            desk.warp(WarpTo::Point { x: 200.0, y: 900.0 }, linear(10_000));
+            let flight = desk.state.flight.expect("the second warp flies");
+            assert_eq!(
+                (near(flight.from(), half), flight.to(), desk.at()),
+                (true, (200.0, 900.0).into(), (200.0, 900.0).into()),
+                "(from where the first had got to {half:?}, to the second's point, the pointer \
+                 there): from {:?}",
+                flight.from()
+            );
+        }
+
+        /// **A warp takes no focus with it**: with focus following the
+        /// mouse, a warp onto another window gives that window the pointer
+        /// and leaves the keyboard where it was.
+        #[test]
+        fn a_warp_takes_no_focus_with_it() {
+            let mut desk = Desk::new(1);
+            desk.install("");
+            desk.state.profile.focus_follows_mouse = true;
+            let first = desk.open();
+            let second = desk.open();
+            desk.apply(vec![
+                floated(desk.id(&first), 100.0, 100.0, 0),
+                floated(desk.id(&second), 1000.0, 100.0, 0),
+            ]);
+            desk.rest();
+            desk.mouse_to((132.0, 132.0).into());
+            assert!(
+                desk.focused().as_ref() == Some(&first.window),
+                "the premise: focus follows the mouse onto the first window"
+            );
+            desk.warp(
+                WarpTo::Window {
+                    id: desk.id(&second),
+                    at: (0.5, 0.5),
+                },
+                None,
+            );
+            assert_eq!(
+                (
+                    desk.at(),
+                    desk.under().as_ref() == Some(&second.server),
+                    desk.focused().as_ref() == Some(&first.window),
+                ),
+                ((1032.0, 132.0).into(), true, true),
+                "(the pointer, on the second window, the keyboard still on the first)"
+            );
+        }
+
+        /// **A held pointer is not warped**: while a button is held over a
+        /// window, and while a client has the pointer locked, a warp moves it
+        /// nowhere; once the button is up it goes.
+        #[test]
+        fn a_held_pointer_is_not_warped() {
+            use zwp_pointer_constraints_v1::Lifetime;
+            let mut desk = Desk::new(1);
+            desk.install("");
+            let opened = desk.open();
+            let id = desk.id(&opened);
+            desk.apply(vec![floated(id, 100.0, 100.0, 0)]);
+            desk.rest();
+            desk.mouse_to((132.0, 132.0).into());
+
+            desk.button(true);
+            desk.warp(
+                WarpTo::Point {
+                    x: 1500.0,
+                    y: 800.0,
+                },
+                None,
+            );
+            let held = desk.at();
+            desk.button(false);
+            desk.warp(
+                WarpTo::Point {
+                    x: 1500.0,
+                    y: 800.0,
+                },
+                None,
+            );
+            let free = desk.at();
+
+            desk.mouse_to((132.0, 132.0).into());
+            let pointer = desk.client.seat_pointer(&desk.qh);
+            let constraints = desk
+                .client
+                .pointer_constraints
+                .clone()
+                .expect("zwp_pointer_constraints_v1 bound");
+            let _locked = constraints.lock_pointer(
+                &opened.surface,
+                &pointer,
+                None,
+                Lifetime::Persistent,
+                &desk.qh,
+                (),
+            );
+            desk.pump();
+            desk.nudge((1.0, 0.0));
+            desk.nudge((1.0, 0.0));
+            let locked_at = desk.at();
+            desk.warp(
+                WarpTo::Point {
+                    x: 1500.0,
+                    y: 800.0,
+                },
+                None,
+            );
+            assert_eq!(
+                (held, free, desk.at()),
+                ((132.0, 132.0).into(), (1500.0, 800.0).into(), locked_at),
+                "(where a warp left it with a button held, with the button up, with the \
+                 pointer locked)"
+            );
+        }
+
+        /// **A warp to nothing goes nowhere, and one off every screen is kept
+        /// on one**: a window that is not there moves the pointer nowhere,
+        /// and a point past the monitor's corner is its last pixel.
+        #[test]
+        fn a_warp_to_nothing_goes_nowhere_and_one_off_every_screen_is_kept_on_one() {
+            let mut desk = Desk::new(1);
+            desk.install("");
+            desk.mouse_to((100.0, 100.0).into());
+            desk.warp(
+                WarpTo::Window {
+                    id: 4242,
+                    at: (0.5, 0.5),
+                },
+                linear(200),
+            );
+            let nowhere = (desk.at(), desk.state.flight.is_none());
+            desk.warp(
+                WarpTo::Point {
+                    x: 5000.0,
+                    y: 5000.0,
+                },
+                None,
+            );
+            assert_eq!(
+                (nowhere, desk.at()),
+                (((100.0, 100.0).into(), true), (1919.0, 1079.0).into()),
+                "(a window that is not there, a point off every screen)"
+            );
+        }
+
+        /// **`sol.focus` with a warp takes the pointer to the window it
+        /// focuses**, at its centre for `warp = true`, with its picture there
+        /// at once.
+        #[test]
+        fn sol_focus_with_a_warp_takes_the_pointer_to_the_window_it_focuses() {
+            let mut desk = Desk::new(1);
+            desk.install("");
+            let opened = desk.open();
+            let id = desk.id(&opened);
+            desk.apply(vec![floated(id, 600.0, 200.0, 0)]);
+            desk.rest();
+            desk.mouse_to((100.0, 900.0).into());
+            desk.install(&format!(
+                "sol.bind(\"super+w\", function() sol.focus({id}, {{ warp = true }}) end)"
+            ));
+            assert!(desk.state.trigger("super+w"), "super+w is bound");
+            assert_eq!(
+                (
+                    desk.focused().as_ref() == Some(&opened.window),
+                    desk.at(),
+                    desk.state.flight.is_none(),
+                ),
+                (true, (632.0, 232.0).into(), true),
+                "(focused, the pointer at its centre, drawn there at once)"
+            );
+        }
+
+        /// **The compositor's own changes of focus say what they are**: a
+        /// window opening is `"open"`, a press `"click"`, the pointer moving
+        /// onto a window with focus following it `"hover"`, a touch
+        /// `"touch"`, an application asking `"activate"`, a window found
+        /// after the one with the keyboard went `"settle"`, and a scene's
+        /// `windows.focus` `"surface"`.
+        #[test]
+        fn the_compositors_own_focus_changes_say_what_they_are() {
+            let mut desk = Desk::new(1);
+            desk.install(
+                "heard = {}\n\
+                 sol.on(\"focus\", function(_, source) heard[#heard + 1] = source end)\n\
+                 sol.on(\"surface\", function(_, action, data)\n\
+                     if action == \"chip\" then sol.act(\"windows.focus\", data) end\n\
+                 end)",
+            );
+            let first = desk.open();
+            let second = desk.open();
+            desk.apply(vec![
+                floated(desk.id(&first), 100.0, 100.0, 0),
+                floated(desk.id(&second), 1000.0, 100.0, 0),
+            ]);
+            desk.rest();
+            let heard = |desk: &Desk| {
+                desk.state
+                    .scripts
+                    .as_ref()
+                    .map(|scripts| scripts.evaluate("return table.concat(heard, \",\")"))
+                    .unwrap_or_default()
+            };
+            let opened = heard(&desk);
+
+            // A press on the first window.
+            desk.mouse_to((132.0, 132.0).into());
+            desk.button(true);
+            desk.button(false);
+            // The pointer onto the second, with focus following it.
+            desk.state.profile.focus_follows_mouse = true;
+            desk.mouse_to((1032.0, 132.0).into());
+            desk.state.profile.focus_follows_mouse = false;
+            // A touch on the first.
+            desk.state.profile.touch_to_focus = true;
+            let region = desk.region();
+            crate::synth::send_touch(&mut desk.state, region, (132.0, 132.0), 9);
+            desk.pump();
+            // The second asks to be brought forward.
+            let token = {
+                let (token, _) = desk
+                    .state
+                    .activation_state
+                    .create_external_token(XdgActivationTokenData::default());
+                token.as_str().to_owned()
+            };
+            desk.client
+                .activation
+                .clone()
+                .expect("xdg_activation_v1 bound")
+                .activate(token, &second.surface);
+            desk.pump();
+            // The keyboard left with nowhere to be, and found a window.
+            desk.state.give_keyboard(None, SERIAL_COUNTER.next_serial());
+            desk.state.settle_focus();
+            // A bar's chip for the first.
+            #[expect(clippy::cast_precision_loss, reason = "a pane id, far below 2^52")]
+            let chip = crate::json::Json::Object(std::collections::BTreeMap::from([(
+                "id".to_owned(),
+                crate::json::Json::Number(desk.id(&first) as f64),
+            )]));
+            desk.action("chip", &chip);
+
+            let all = heard(&desk);
+            let after = all
+                .strip_prefix(opened.as_str())
+                .map(|rest| rest.trim_start_matches(','))
+                .unwrap_or(all.as_str());
+            assert_eq!(
+                (opened.split(',').next_back(), after),
+                (Some("open"), "click,hover,touch,activate,settle,surface"),
+                "(what the second window opening was told as, what came after it)"
+            );
+        }
     }
 }
 

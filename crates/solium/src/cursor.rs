@@ -86,6 +86,7 @@
 //! *shape* the theme has never heard of must end up at the theme's own arrow
 //! before it ever gets that far, which is [`shape::resolve`].
 
+pub(crate) mod flight;
 pub(crate) mod scene;
 pub(crate) mod shape;
 pub(crate) mod theme;

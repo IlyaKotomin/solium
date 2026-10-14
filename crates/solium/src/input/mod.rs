@@ -14,6 +14,7 @@ pub(crate) mod devices;
 pub(crate) mod grab;
 pub(crate) mod profile;
 pub(crate) mod resize;
+pub(crate) mod warp;
 
 use smithay::{
     backend::input::{
@@ -569,6 +570,10 @@ fn pointer_motion<B: InputBackend>(
         return;
     };
     let location = absolute_location(region, &event);
+    // A device that says where the pointer is says where it is drawn too: a
+    // flight under way is over (#220).
+    // `state::tests::real_client::follow::real_motion_mid_flight_wins_at_once`.
+    warp::interrupt(state);
     // What `Solium.cursor.velocity` is measured from:
     // `models::pointer::tests::the_published_pointer_is_its_buttons_its_motion_its_monitor_and_its_size`.
     state.pointer.moved(event.time(), location);
@@ -643,7 +648,10 @@ fn pointer_relative<B: InputBackend>(state: &mut Solium, event: impl PointerMoti
         .outputs()
         .filter_map(|output| state.space.output_geometry(output))
         .collect();
-    let was = pointer.current_location();
+    // From where the pointer is drawn, mid-flight included: the hand on the
+    // mouse moves what it sees, and the flight is over (#220).
+    // `state::tests::real_client::follow::real_motion_mid_flight_wins_at_once`.
+    let was = warp::interrupt(state).unwrap_or_else(|| pointer.current_location());
     let (location, locked) = held(state, &pointer, confine(&screens, was + event.delta()), was);
     let under = state.surface_under(location);
     // A locked pointer does not move, and the protocol is explicit that it is
@@ -950,7 +958,11 @@ pub(crate) fn follow_pointer(state: &mut Solium, location: Point<f64, Logical>, 
     if state.is_focused(&window) {
         return;
     }
-    state.focus_window(&window, SERIAL_COUNTER.next_serial());
+    state.focus_window(
+        &window,
+        SERIAL_COUNTER.next_serial(),
+        script::FocusSource::Hover,
+    );
 }
 
 /// Let a window frame see the pointer, so its buttons light up on hover.
@@ -1003,6 +1015,12 @@ fn pointer_button<B: InputBackend>(state: &mut Solium, event: impl PointerButton
     // `state::tests::real_client::reflow_on_close::hosted::a_right_press_on_a_scene_reaches_it_as_the_right_button_with_shift_held`,
     // `state::tests::real_client::lock_focus::a_button_let_go_behind_the_lock_is_not_held_after_it`.
     let pressed = button_state == ButtonState::Pressed;
+    // A press goes where the pointer is, so the picture of a flight under way
+    // lands there with it, and the two agree about what was clicked (#220).
+    // `state::tests::real_client::follow::a_press_mid_flight_lands_it`.
+    if pressed {
+        warp::land(state);
+    }
     let qt = crate::qml::keys::qt_button(button);
     if let Some(bit) = qt {
         if pressed {
@@ -1171,7 +1189,7 @@ fn pointer_button<B: InputBackend>(state: &mut Solium, event: impl PointerButton
                 // which is the point of giving it a frame: an application that
                 // is not coming can be dismissed before it arrives.
                 if pressed && let Some(window) = under.window {
-                    state.focus_window(&window, serial);
+                    state.focus_window(&window, serial, script::FocusSource::Click);
                     if !on_button && let Some(geometry) = state.real_geometry(&window) {
                         let start_data = GrabStartData {
                             focus: None,
@@ -1193,7 +1211,7 @@ fn pointer_button<B: InputBackend>(state: &mut Solium, event: impl PointerButton
                 // window to resize, so this is that guarantee restated rather
                 // than a case that happens.
                 if let Some(window) = under.window {
-                    state.focus_window(&window, serial);
+                    state.focus_window(&window, serial, script::FocusSource::Click);
                     // Before the grab, so the new drag cannot inherit the
                     // previous one's unsettled hold. Its answer is the
                     // rectangle to drag from rather than `under.outer`, which
@@ -1269,7 +1287,7 @@ fn pointer_button<B: InputBackend>(state: &mut Solium, event: impl PointerButton
                 .begin_resize(&window)
                 .or_else(|| state.outer_geometry(&window))
         {
-            state.focus_window(&window, serial);
+            state.focus_window(&window, serial, script::FocusSource::Click);
             let edges = resize::quadrant(outer, location);
             // #108's first symptom on the *other* resize gesture: the border
             // drag now names its cursor because `chrome_under` answered before
@@ -1322,7 +1340,7 @@ fn pointer_button<B: InputBackend>(state: &mut Solium, event: impl PointerButton
             }
 
             if state.profile.click_to_focus {
-                state.focus_window(&window, serial);
+                state.focus_window(&window, serial, script::FocusSource::Click);
             }
         }
     }
@@ -1525,7 +1543,7 @@ fn touch_down<B: InputBackend>(
         && !state.pointed_above(location)
         && let Some((window, _)) = state.window_under(location)
     {
-        state.focus_window(&window, serial);
+        state.focus_window(&window, serial, script::FocusSource::Touch);
     }
 
     touch.down(

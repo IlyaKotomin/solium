@@ -218,6 +218,28 @@ impl Solium {
         self.clock.now().saturating_add(SETTLED)
     }
 
+    /// The rectangle window `id` is headed for: where it is drawn once every
+    /// transform on it has landed, asked at [`Self::settling`] as a focus
+    /// question is. A warp aims here (#220): a desk sliding in is where it
+    /// slides to, and a window a layout has just moved is where it was moved.
+    ///
+    /// A tiled window is measured by its tile, which its client is about to
+    /// fill: a window a move has just put in a tile of another size has not
+    /// answered yet, and its old size there is not where it is going. Any
+    /// other window by where it lives, [`Self::pane_outer`].
+    ///
+    /// `None` for a window that is not there, or whose client has gone.
+    /// `tests::real_client::follow::a_warp_goes_where_the_window_was_moved_in_the_same_handler`,
+    /// `tests::real_client::follow::a_key_takes_the_pointer_to_the_window_it_focuses_at_once_and_flies_its_picture`.
+    pub(crate) fn headed_for(&self, id: u64) -> Option<Rectangle<f64, Logical>> {
+        let pane = self.panes.by_script_id(id)?;
+        if pane.ghost() || pane.gone() {
+            return None;
+        }
+        let lives = pane.placed().unwrap_or_else(|| self.pane_outer(pane));
+        Some(self.drawn_at(pane, lives, self.settling()).rect)
+    }
+
     /// Whether a pane is headed somewhere the user can see it.
     ///
     /// **The two halves `Frame::covers` asks of a point — `shows()` and the

@@ -39,6 +39,7 @@
 local config = require("config")
 local monitors = require("monitors")
 local wallpaper = require("wallpaper")
+local follow = require("follow")
 
 -- The key every monitor shares when workspaces are not per monitor. A name no
 -- connector can have, so it cannot collide with a real one.
@@ -289,6 +290,13 @@ function workspaces.go(index, monitor)
             return
         end
     end
+
+    -- No window there to take the keyboard, so no `focus` takes the pointer
+    -- along: it may go to the middle of the screen that switched instead,
+    -- `focus.cursor.empty_workspace` (#220).
+    -- `a_switch_to_an_empty_workspace_takes_the_pointer_to_the_middle_or_leaves_it`.
+    local active = monitors.active()
+    follow.monitor(switched or (active and active.name), sol.focus_source())
 end
 
 -- The next workspace after the one `monitor` is showing that has no window on

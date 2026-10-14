@@ -780,6 +780,51 @@ local defaults = {
         --     focus = { follow = false },   -- never follow the pointer, in any mode
         --     focus = { click = false },    -- a mode must `sol.focus` its own clicks
         --
+
+        -- Where the pointer goes when the keyboard moves (#220).
+        --
+        -- Moving focus with the keys -- `super+arrows`, a workspace key, a
+        -- move -- would leave the pointer over the window you left. With this
+        -- it goes to the window that took the keyboard, and its picture
+        -- glides there along `motion`. The pointer itself is there at once,
+        -- so what it is over -- a hover, a click, the cursor's shape -- is
+        -- the new window's from the first instant. Moving the mouse while it
+        -- glides takes it from wherever it is drawn. `lua/follow.lua` is
+        -- the whole of the policy, and `sol.warp` the compositor's part.
+        cursor = {
+            -- Which focus changes take the pointer along, by what moved the
+            -- keyboard: the `source` the `focus` event is told
+            -- (docs/modes.md). The keys do and the mouse does not: a click
+            -- or a bar's window chip is a hand already on the pointer, and a
+            -- window that opens is not somewhere you went.
+            follows = {
+                binding = true, -- any key binding: a workspace key, the overview's keys
+                direction = true, -- super+arrows and super+h/j/k/l
+                move = true, -- super+shift+arrows: to where the window was moved
+                click = false, -- a press on a window, or on one in the overview
+                scroll = false, -- the wheel with super held
+                drop = false, -- a dragged window let go
+                touch = false, -- a touch on a window
+                hover = false, -- focus following the mouse
+                surface = false, -- a bar's window chip, the dock, a shell's search
+                open = false, -- a window opening
+                activate = false, -- an application bringing its window forward
+                settle = false, -- the window you were in went, and another took over
+                script = false, -- `sol.focus` from anything else
+            },
+            -- Where on the window: "center", or a share of its width and
+            -- height, as `{ x = 0.5, y = 0.25 }`.
+            to = "center",
+            -- How the picture travels there: milliseconds and an easing, as
+            -- every `motion` here, or `easing = "spring"`, which takes as
+            -- long as it takes. `false` puts it there at once.
+            motion = { duration = 260, easing = "outCubic" },
+            -- A workspace switch that leaves no window to take the keyboard,
+            -- from a source above that takes the pointer along: "center" puts
+            -- the pointer in the middle of the monitor that switched, "stay"
+            -- leaves it where it is.
+            empty_workspace = "center",
+        },
     },
 
     -- Telling the rest of the session that Solium is its desktop.

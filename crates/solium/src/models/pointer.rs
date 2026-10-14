@@ -1,8 +1,10 @@
 //! The pointer, for `Solium.cursor`: the named shape it shows, whether a
 //! button is held, how fast it moves, the scale of the monitor under it and
-//! the configured size. Sent once a frame while a pointer scene is configured,
-//! and only when something moved
+//! the configured size, and a warp's flight: whether the picture is flying,
+//! from where and to where (#220). Sent once a frame while a pointer scene is
+//! configured, and only when something moved
 //! (`tests::the_published_pointer_is_its_buttons_its_motion_its_monitor_and_its_size`,
+//! `tests::a_flight_is_published_while_it_flies_and_said_to_have_landed_after`,
 //! `tests::nothing_is_published_with_no_scene`).
 
 use std::collections::BTreeMap;
@@ -16,6 +18,16 @@ pub(crate) struct Published {
     values: Option<BTreeMap<String, Json>>,
 }
 
+impl Published {
+    /// The value Qt last took under `key`.
+    fn get(&self, key: &str) -> Option<Json> {
+        self.values
+            .as_ref()
+            .and_then(|values| values.get(key))
+            .cloned()
+    }
+}
+
 /// Send the pointer if it changed since Qt last took it, while a scene is
 /// configured: with none, nothing is published and nothing is asked for, so a
 /// session that names no scene does what it did before there was one
@@ -27,12 +39,7 @@ pub(crate) fn publish(state: &mut Solium, last: &mut Published, apply: fn(&str) 
     if !state.pointer.has_scene() {
         return;
     }
-    let previous = last
-        .values
-        .as_ref()
-        .and_then(|values| values.get("shape"))
-        .cloned();
-    let (values, moving) = values(state, previous);
+    let (values, moving) = values(state, last);
     if moving {
         state.redraw = true;
     }
@@ -47,16 +54,43 @@ pub(crate) fn publish(state: &mut Solium, last: &mut Published, apply: fn(&str) 
 /// The pointer's values now, and whether it moved since they were last read.
 /// The shape is its CSS name; with no named shape shown, a client's own cursor
 /// surface or none, it stays the one last published, `previous`.
+///
+/// While a warp's picture flies, `moving` is true and the velocity is the
+/// flight's own; `from` and `to` are the last flight's ends, in the global
+/// space's logical pixels, and stay where they were once it lands (#220).
 /// `tests::the_published_pointer_is_its_buttons_its_motion_its_monitor_and_its_size`,
-/// `tests::a_named_shape_reaches_solium_cursor_shape`.
-fn values(state: &mut Solium, previous: Option<Json>) -> (BTreeMap<String, Json>, bool) {
+/// `tests::a_named_shape_reaches_solium_cursor_shape`,
+/// `tests::a_flight_is_published_while_it_flies_and_said_to_have_landed_after`.
+fn values(state: &mut Solium, previous: &Published) -> (BTreeMap<String, Json>, bool) {
     let shape = state
         .pointer
         .shape()
         .map(|icon| Json::Text(icon.name().to_owned()))
-        .or(previous)
+        .or_else(|| previous.get("shape"))
         .unwrap_or_else(|| Json::Text("default".to_owned()));
-    let velocity = state.pointer.velocity();
+    let now = state.clock.now();
+    // Read either way, so a movement the flight hid is not told later as
+    // if it were new.
+    let moved = state.pointer.velocity();
+    let flight = state.flight.filter(|flight| !flight.landed(now));
+    let velocity = flight.map_or(moved, |flight| flight.velocity(now));
+    let point = |at: smithay::utils::Point<f64, smithay::utils::Logical>| {
+        Json::Object(BTreeMap::from([
+            ("x".to_owned(), Json::Number(at.x)),
+            ("y".to_owned(), Json::Number(at.y)),
+        ]))
+    };
+    let (from, to) = match state.flight {
+        Some(flight) => (point(flight.from()), point(flight.to())),
+        None => (
+            previous
+                .get("from")
+                .unwrap_or_else(|| point(Default::default())),
+            previous
+                .get("to")
+                .unwrap_or_else(|| point(Default::default())),
+        ),
+    };
     let scale = state
         .active_output()
         .map_or(1.0, |output| output.current_scale().fractional_scale());
@@ -75,8 +109,14 @@ fn values(state: &mut Solium, previous: Option<Json>) -> (BTreeMap<String, Json>
             "size".to_owned(),
             Json::Number(f64::from(state.pointer.size())),
         ),
+        ("moving".to_owned(), Json::Bool(flight.is_some())),
+        ("from".to_owned(), from),
+        ("to".to_owned(), to),
     ]);
-    (values, velocity.x != 0.0 || velocity.y != 0.0)
+    (
+        values,
+        flight.is_some() || velocity.x != 0.0 || velocity.y != 0.0,
+    )
 }
 
 #[cfg(test)]
@@ -246,6 +286,94 @@ pub(crate) mod tests {
             ],
             "(pressed, velocity, scale, size): placed, moving with a button held, then on \
              the 2x monitor after a pause"
+        );
+    }
+
+    /// **A flight is published while it flies, and said to have landed
+    /// after** (#220): a warp's picture flying is `moving`, from where it set
+    /// off to where the pointer went, at the flight's own velocity, and asks
+    /// for the next frame; once it lands it is still, the two ends are kept,
+    /// and no frame is asked for. Tested with the Cyrillic group active
+    /// (#132).
+    #[test]
+    fn a_flight_is_published_while_it_flies_and_said_to_have_landed_after() {
+        use crate::script::{AnimationSpec, Warp, WarpTo};
+        let (_display, mut state) = us_ru(1);
+        monitor(&mut state, "pointer-flight", 0, 1.0);
+        with_a_scene(&mut state, 24);
+        let mut last = Published::default();
+        motion(&mut state, (100.0, 100.0), 1_000_000);
+        publish(&mut state, &mut last, taken);
+        crate::input::warp::warp(
+            &mut state,
+            Warp {
+                to: WarpTo::Point {
+                    x: 1100.0,
+                    y: 100.0,
+                },
+                motion: Some(AnimationSpec {
+                    duration: std::time::Duration::from_secs(10),
+                    easing: crate::present::Curve::Linear,
+                }),
+            },
+        );
+        state.redraw = false;
+        publish(&mut state, &mut last, taken);
+        let flying = state.redraw;
+        state.clock.advance(std::time::Duration::from_secs(11));
+        let now = state.clock.now();
+        state.settle_flight(now);
+        state.redraw = false;
+        publish(&mut state, &mut last, taken);
+        let landed = state.redraw;
+        let point = |x: f64, y: f64| {
+            Some(Json::Object(BTreeMap::from([
+                ("x".to_owned(), Json::Number(x)),
+                ("y".to_owned(), Json::Number(y)),
+            ])))
+        };
+        let batches = sent();
+        let read = |batch: &Json| {
+            let speed = match value(batch, "velocity") {
+                Some(Json::Object(velocity)) => match (velocity.get("x"), velocity.get("y")) {
+                    (Some(Json::Number(x)), Some(Json::Number(y))) => Some((x.round(), y.round())),
+                    _ => None,
+                },
+                _ => None,
+            };
+            (
+                value(batch, "moving").cloned(),
+                value(batch, "from").cloned(),
+                value(batch, "to").cloned(),
+                speed,
+            )
+        };
+        assert_eq!(
+            (
+                batches.iter().skip(1).map(read).collect::<Vec<_>>(),
+                flying,
+                landed
+            ),
+            (
+                vec![
+                    (
+                        Some(Json::Bool(true)),
+                        point(100.0, 100.0),
+                        point(1100.0, 100.0),
+                        Some((100.0, 0.0)),
+                    ),
+                    (
+                        Some(Json::Bool(false)),
+                        point(100.0, 100.0),
+                        point(1100.0, 100.0),
+                        Some((0.0, 0.0)),
+                    ),
+                ],
+                true,
+                false,
+            ),
+            "([(moving, from, to, velocity) flying, then landed], a frame asked for flying, \
+             one asked for landed)"
         );
     }
 

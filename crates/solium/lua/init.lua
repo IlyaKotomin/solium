@@ -78,6 +78,9 @@ require("actions")
 require("tweaks")
 
 require("modes")
+-- The pointer follows the keyboard, by what moved it: `focus.cursor` in
+-- config.lua (#220). `workspaces` and `direction` require it too.
+require("follow")
 require("open")
 -- How a window goes fullscreen or maximised, and back: `fullscreen` and
 -- `maximize` in config.lua.

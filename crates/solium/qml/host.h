@@ -119,7 +119,8 @@ int solium_qml_scene_root_size(const SoliumQmlScene *scene, double *width, doubl
 int solium_qml_scene_cursor_hotspot(const SoliumQmlScene *scene, double *x, double *y);
 
 /* The pointer as `Solium.cursor` reads it, as one JSON object: `shape`,
- * `pressed`, `velocity` (`{ x, y }`), `scale` and `size`. Returns 0 when Qt
+ * `pressed`, `velocity` (`{ x, y }`), `scale`, `size`, `moving`, `from` and
+ * `to` (`{ x, y }` each). Returns 0 when Qt
  * has not started, so the compositor sends it again.
  * `qml::pointer::tests::a_published_pointer_reaches_solium_cursor`. */
 int solium_qml_pointer_publish(const char *json);

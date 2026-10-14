@@ -1,0 +1,92 @@
+-- The pointer follows the keyboard (#220).
+--
+-- When focus moves by a key, the pointer goes to the window that took the
+-- keyboard; when it moves by a click, it stays where the hand put it. Which is
+-- which is `config.focus.cursor.follows`, by the `source` the `focus` event is
+-- told, and all the compositor provides is the warp: `sol.warp` puts the
+-- pointer there at once and flies its picture along `motion`, so what the
+-- pointer is over is the new window's from the first instant.
+--
+-- Two focus changes tell no `focus` and are asked for here by name: a move,
+-- which keeps the keyboard on the window that moved (`direction.lua` calls
+-- `follow.window` once the layout has moved it), and a workspace switch that
+-- leaves no window to take the keyboard (`workspaces.lua` calls
+-- `follow.monitor`).
+-- `the_pointer_follows_a_key_and_not_a_click`,
+-- `a_move_takes_the_pointer_to_where_the_window_went`,
+-- `a_switch_to_an_empty_workspace_takes_the_pointer_to_the_middle_or_leaves_it`
+-- and their neighbours in `script.rs`'s `follow` tests.
+
+local config = require("config")
+local monitors = require("monitors")
+
+local follow = {}
+
+local function settings()
+    return config.focus.cursor or {}
+end
+
+-- Say a setting that means nothing once, rather than on every key.
+local said = {}
+local function once(message)
+    if not said[message] then
+        said[message] = true
+        sol.log(message)
+    end
+end
+
+-- Whether a focus change from `source` takes the pointer along.
+function follow.wanted(source)
+    local follows = settings().follows
+    return type(follows) == "table" and follows[source] == true
+end
+
+-- How the picture travels: the configured motion, or nil, which puts it
+-- there at once.
+local function motion()
+    local given = settings().motion
+    if type(given) == "table" then
+        return given
+    end
+    if given ~= nil and given ~= false then
+        once(string.format(
+            "focus.cursor.motion is %s, which is neither a motion nor false; the pointer is put there at once",
+            tostring(given)
+        ))
+    end
+    return nil
+end
+
+-- Take the pointer to window `id`, if a focus change from `source` does.
+function follow.window(id, source)
+    if id ~= nil and follow.wanted(source) then
+        sol.warp(id, { to = settings().to or "center", motion = motion() })
+    end
+end
+
+-- Take the pointer to the middle of monitor `name`, for a workspace switch
+-- from `source` that left no window to take the keyboard, if
+-- `focus.cursor.empty_workspace` says so and that source takes it along.
+function follow.monitor(name, source)
+    local empty = settings().empty_workspace
+    if empty ~= "center" then
+        if empty ~= "stay" then
+            once(string.format(
+                "focus.cursor.empty_workspace is %s, which is neither \"center\" nor \"stay\"; the pointer stays",
+                tostring(empty)
+            ))
+        end
+        return
+    end
+    if not follow.wanted(source) then
+        return
+    end
+    local monitor = monitors.named(name)
+    if monitor then
+        sol.warp({ x = monitor.x + monitor.w / 2, y = monitor.y + monitor.h / 2 }, { motion = motion() })
+    end
+end
+
+sol.on("focus", follow.window)
+
+return follow

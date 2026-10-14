@@ -163,7 +163,11 @@ impl Solium {
             });
         if let Some(window) = next {
             tracing::debug!("a window went and the keyboard had nowhere to be");
-            self.focus_window(&window, SERIAL_COUNTER.next_serial());
+            self.focus_window(
+                &window,
+                SERIAL_COUNTER.next_serial(),
+                crate::script::FocusSource::Settle,
+            );
         }
     }
 
@@ -232,7 +236,15 @@ impl Solium {
         self.settle_focus();
     }
 
-    pub(crate) fn focus_window(&mut self, window: &Window, serial: Serial) {
+    /// Give `window` the keyboard, and tell scripts `focus` with `source`,
+    /// what moved it (#220).
+    /// `tests::real_client::follow::the_compositors_own_focus_changes_say_what_they_are`.
+    pub(crate) fn focus_window(
+        &mut self,
+        window: &Window,
+        serial: Serial,
+        source: crate::script::FocusSource,
+    ) {
         let Some(location) = self.space.element_location(window) else {
             return;
         };
@@ -291,19 +303,19 @@ impl Solium {
         // half off the edge and being able to use it.
         if !self.focusing {
             self.focusing = true;
-            self.trigger_focus(window);
+            self.trigger_focus(window, source);
             self.focusing = false;
         }
     }
 
-    /// Tell scripts focus moved.
-    fn trigger_focus(&mut self, window: &Window) {
+    /// Tell scripts focus moved, and what moved it.
+    fn trigger_focus(&mut self, window: &Window, source: crate::script::FocusSource) {
         let id = self.window_id(window);
         let snapshot = self.snapshot();
         let Some(mut scripts) = self.scripts.take() else {
             return;
         };
-        let outcome = scripts.focused(id, snapshot);
+        let outcome = scripts.focused(id, source, snapshot);
         self.scripts = Some(scripts);
         self.apply(outcome);
     }
