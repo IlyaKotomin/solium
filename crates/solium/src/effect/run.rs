@@ -194,6 +194,28 @@ impl Held {
     pub(crate) fn failed(&self) -> bool {
         self.failed
     }
+
+    /// Targets as a run leaves them, one state made, with no GPU: what a
+    /// test gives back.
+    /// `effect::store::tests::a_t2_place_that_turns_to_a_crop_gives_its_targets_back`.
+    #[cfg(test)]
+    pub(crate) fn made_for_test() -> Self {
+        Self {
+            state_keys: vec![Some(1)],
+            ..Self::default()
+        }
+    }
+
+    /// Holding nothing: no target, no state made, no output.
+    /// `effect::store::tests::a_t2_place_that_turns_to_a_crop_gives_its_targets_back`.
+    #[cfg(test)]
+    pub(crate) fn is_empty_for_test(&self) -> bool {
+        self.slots.is_empty()
+            && self.states.is_empty()
+            && self.state_keys.is_empty()
+            && self.state_results.is_empty()
+            && self.output.is_none()
+    }
 }
 
 /// A texture side, as the prelude's floats take it.

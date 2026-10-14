@@ -187,6 +187,20 @@ impl T2State {
         self.read_at
             .is_some_and(|read| read.saturating_add(1) == pass)
     }
+
+    /// Its place is a crop of a memo this pass, with `now` its key, and
+    /// runs no pass (`render::T2Work::Crop`): the targets a suffix or a
+    /// whole-plan run held for it go back, so a place that ran its whole
+    /// plan over `effects.memo.budget_mib` holds nothing part-sized once
+    /// its memo is admitted. Whether the memo it crops moved since, so its
+    /// commit moves.
+    /// `tests::a_t2_place_that_turns_to_a_crop_gives_its_targets_back`.
+    pub(crate) fn cropped(&mut self, now: T2Key, pool: &mut crate::pool::Pool) -> bool {
+        let rerun = self.key.is_none_or(|was| was.memo != now.memo);
+        self.key = Some(now);
+        self.held.release(pool);
+        rerun
+    }
 }
 
 /// Every slot's state, by its owner and slot.
@@ -514,6 +528,43 @@ mod tests {
         t2.read_at = Some(4);
         assert!(t2.read_last_pass(5));
         assert!(!t2.read_last_pass(6), "read two passes ago");
+    }
+
+    /// **A T2 place that turns to a crop gives its targets back**: one that
+    /// ran its whole plan over `effects.memo.budget_mib` and is admitted
+    /// now holds nothing part-sized while it crops the memo (Task 44's
+    /// review); its commit moves only when the memo it crops moved.
+    #[test]
+    fn a_t2_place_that_turns_to_a_crop_gives_its_targets_back() {
+        let mut state = slot();
+        let t2 = state.t2_mut("DP-1");
+        t2.held = super::super::run::Held::made_for_test();
+        let mut pool = crate::pool::Pool::new(0);
+        let key = crate::effect::memo::T2Key {
+            memo: 1,
+            xray: 1,
+            padded: smithay::utils::Rectangle::new((0, 0).into(), (10, 10).into()),
+            params: 0,
+            shape: 0,
+            own: None,
+        };
+        assert!(t2.cropped(key, &mut pool), "its first crop");
+        assert!(
+            t2.held.is_empty_for_test(),
+            "a crop kept the targets of a whole-plan run"
+        );
+        let moved = crate::effect::memo::T2Key {
+            padded: smithay::utils::Rectangle::new((4, 0).into(), (10, 10).into()),
+            ..key
+        };
+        assert!(
+            !t2.cropped(moved, &mut pool),
+            "the same memo, cropped elsewhere"
+        );
+        assert!(
+            t2.cropped(crate::effect::memo::T2Key { memo: 2, ..moved }, &mut pool),
+            "the memo re-ran"
+        );
     }
 
     /// **A T2 result on a monitor the slot left is given back**; the one

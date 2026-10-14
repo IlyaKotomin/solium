@@ -2305,7 +2305,9 @@ fn run_t2(
         let t2 = state.t2_mut(&place.monitor);
         let (texture, rerun, crop) = match &work {
             // No pass: the memo, cropped to the part's padded box, its
-            // commit moved when the memo re-ran or the crop moved.
+            // commit moved when the memo re-ran or the crop moved, and
+            // nothing part-sized held for it
+            // (`effect::store::tests::a_t2_place_that_turns_to_a_crop_gives_its_targets_back`).
             T2Work::Crop(export) => {
                 let Some(upto) = memo
                     .exports
@@ -2318,8 +2320,7 @@ fn run_t2(
                 let Some(texture) = cx.memos.output(&memo_of(*upto)).cloned() else {
                     continue;
                 };
-                let rerun = t2.key.is_none_or(|was| was.memo != now.memo);
-                t2.key = Some(now);
+                let rerun = t2.cropped(now, pool);
                 let size = texture.size();
                 let crop = crop_of(
                     place.map,
