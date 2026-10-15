@@ -17,7 +17,7 @@ mod gputime;
 
 #[path = "../../../crates/solium/src/warp/gl.rs"]
 #[allow(dead_code, reason = "the compositor's warp program")]
-mod warp_gl;
+pub(crate) mod warp_gl;
 
 #[path = "../../../crates/solium/src/pool.rs"]
 #[allow(

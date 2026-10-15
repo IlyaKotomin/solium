@@ -1,4 +1,5 @@
 //! FX3's GPU cases: the memo a T2 slot reads and the crop of it a part draws,
+//! and a backdrop drawn beneath a warp with the hole its capture keeps (13i),
 //! which no unit test can reach. Run alone with `WIRECHECK_ONLY=fx3`, and after
 //! FX2's cases in a full run. Each prints a `=== FX3:` heading. The effect
 //! programs, the executor and the effect element are the compositor's own, as
@@ -31,6 +32,7 @@ const REACH: usize = 48;
 pub(crate) fn all(renderer: &mut GlesRenderer) -> Result<()> {
     let memo = the_memo_matches_a_whole_monitor_blur(renderer)?;
     a_crop_of_the_memo_draws_its_own_pixels(renderer, &memo)?;
+    a_backdrop_beneath_a_mesh_and_its_hole(renderer)?;
     Ok(())
 }
 
@@ -313,5 +315,311 @@ fn a_crop_of_the_memo_draws_its_own_pixels(renderer: &mut GlesRenderer, memo: &M
         "  the 120×80 crop at (200, 40), drawn by smithay: at most {off} from the memo there; \
          its mirror in y differs by {apart}; through MASKED_TEXTURE under a mask of the box"
     );
+    Ok(())
+}
+
+/// 13i's bent 2×2 grid: a 200×120 pane's nine points on a 640×360 target,
+/// row by row (not affine, so a sample at the wrong place shows).
+const GRID: [(f32, f32); 9] = [
+    (100.0, 40.0),
+    (220.0, 50.0),
+    (340.0, 60.0),
+    (130.0, 170.0),
+    (215.0, 170.0),
+    (320.0, 160.0),
+    (160.0, 300.0),
+    (230.0, 290.0),
+    (300.0, 280.0),
+];
+
+/// 13i's mask: the part (20, 10, 160, 100) of the 200×120 pane, its
+/// top-left and bottom-right corners rounded by 16.
+const MASK: ([f32; 4], [f32; 4], [f32; 2]) = (
+    [20.0, 10.0, 160.0, 100.0],
+    [16.0, 0.0, 0.0, 16.0],
+    [200.0, 120.0],
+);
+
+/// 13i's grid as triangles, each vertex (x, y, u, v), two a cell as
+/// `warp::mesh_grid` cuts them.
+fn grid_triangles() -> Vec<[f32; 4]> {
+    let at = |column: usize, row: usize| {
+        let (x, y) = GRID[row * 3 + column];
+        #[expect(clippy::cast_precision_loss, reason = "0, 1 or 2")]
+        let (u, v) = (column as f32 / 2.0, row as f32 / 2.0);
+        [x, y, u, v]
+    };
+    let mut triangles = Vec::new();
+    for row in 0..2 {
+        for column in 0..2 {
+            let (tl, tr, br, bl) = (
+                at(column, row),
+                at(column + 1, row),
+                at(column + 1, row + 1),
+                at(column, row + 1),
+            );
+            triangles.extend([tl, tr, br, tl, br, bl]);
+        }
+    }
+    triangles
+}
+
+/// The texture coordinate the grid puts at `(x, y)`: the triangle holding
+/// it, by its own barycentric weights; `None` outside the grid.
+fn uv_at(triangles: &[[f32; 4]], (x, y): (f32, f32)) -> Option<(f32, f32)> {
+    triangles.chunks_exact(3).find_map(|t| {
+        let ([x0, y0, u0, v0], [x1, y1, u1, v1], [x2, y2, u2, v2]) = (t[0], t[1], t[2]);
+        let area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+        let b1 = ((x - x0) * (y2 - y0) - (x2 - x0) * (y - y0)) / area;
+        let b2 = ((x1 - x0) * (y - y0) - (x - x0) * (y1 - y0)) / area;
+        let b0 = 1.0 - b1 - b2;
+        (b0 >= 0.0 && b1 >= 0.0 && b2 >= 0.0)
+            .then(|| (b0 * u0 + b1 * u1 + b2 * u2, b0 * v0 + b1 * v1 + b2 * v2))
+    })
+}
+
+/// How far `(px, py)`, in the pane's pixels, is inside 13i's mask: positive
+/// inside, by the rounded rectangle's own field.
+fn inside_mask((px, py): (f32, f32)) -> f32 {
+    let ([x, y, w, h], radii, _) = MASK;
+    let (hw, hh) = (w / 2.0, h / 2.0);
+    let (ax, ay) = (px - x - hw, py - y - hh);
+    let picked = match (ax < 0.0, ay < 0.0) {
+        (true, true) => radii[0],
+        (false, true) => radii[1],
+        (true, false) => radii[2],
+        (false, false) => radii[3],
+    };
+    let r = picked.min(hw.min(hh));
+    let (qx, qy) = (ax.abs() - (hw - r), ay.abs() - (hh - r));
+    let away = qx.max(qy).min(0.0) + (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() - r;
+    -away
+}
+
+/// One draw through `program` into a cleared (or `fill`ed) `side` target,
+/// read back.
+fn draw_beneath(
+    renderer: &mut GlesRenderer,
+    side: (i32, i32),
+    fill: Option<[f32; 4]>,
+    (program, texture, vertices, draw, mask): (
+        crate::fx0::warp_gl::BeneathProgram,
+        u32,
+        &[f32],
+        crate::fx0::warp_gl::Draw,
+        ([f32; 4], [f32; 4], [f32; 2]),
+    ),
+) -> Result<Vec<u8>> {
+    use smithay::backend::renderer::Bind as _;
+    use smithay::backend::renderer::Color32F;
+    use smithay::backend::renderer::Frame as _;
+    let mut pool = pool::Pool::new(0);
+    let mut carrier = pool
+        .carrier(renderer)
+        .ok_or_else(|| anyhow!("no carrier"))?;
+    let target = pool
+        .target(&mut pool::Gl(renderer), side.into(), pool::Format::Rgba8)
+        .ok_or_else(|| anyhow!("no pooled target"))?;
+    {
+        let mut bound = renderer
+            .bind(&mut carrier)
+            .map_err(|err| anyhow!("{err}"))?;
+        let mut frame =
+            pool::frame_for(renderer, &mut bound, &target).map_err(|err| anyhow!("{err}"))?;
+        let [r, g, b, a] = fill.unwrap_or([0.0; 4]);
+        frame
+            .clear(
+                Color32F::new(r, g, b, a),
+                &[Rectangle::from_size(side.into())],
+            )
+            .map_err(|err| anyhow!("{err}"))?;
+        let projection = *frame.projection();
+        // SAFETY: inside the frame's context; the program and texture are its.
+        frame
+            .with_context(|gl| unsafe {
+                program.draw(gl, &projection, texture, vertices, draw, mask, &[])
+            })
+            .map_err(|err| anyhow!("{err}"))?;
+        frame
+            .finish()
+            .map_err(|err| anyhow!("{err}"))?
+            .wait()
+            .map_err(|err| anyhow!("{err:?}"))?;
+    }
+    let drawn = fx2::read_rgba(renderer, target.texture())?;
+    drop(target);
+    pool.sweep(renderer);
+    Ok(drawn)
+}
+
+/// **Case 13i: a backdrop beneath a mesh, and its hole** (Task 54, Ruling
+/// F37). The compositor's own `warp::BeneathProgram`, through a bent 2×2
+/// grid of a 200×120 pane on a 640×360 target, over a "memo" whose texel
+/// `(x, y)` is `(x mod 256, y mod 256, 64·⌊x/256⌋ + 32·⌊y/256⌋)`, so a flip
+/// or an offset in either axis shows, mapped as `ScreenMap::monitor`
+/// (640×360 at scale 1) maps it: the pixel at the grid's centre, and one a
+/// quarter of the way from it to each corner (each inside the mask), is the
+/// memo at its own screen position within 1, not the memo at its texture
+/// coordinate; a pixel the grid puts outside the mask's rectangle is
+/// transparent. Then a hole (`Draw::Erase`) over (20, 10, 160, 100) with
+/// its top-left corner rounded by 16, in a grey target: transparent inside,
+/// grey outside, and between on its arc. This pins the shader's convention,
+/// not a rendered memo's orientation, which `dev/effects-check.sh motion`'s
+/// `genie` shows against the wallpaper blurred everywhere.
+fn a_backdrop_beneath_a_mesh_and_its_hole(renderer: &mut GlesRenderer) -> Result<()> {
+    use crate::fx0::warp_gl::{BeneathProgram, Draw};
+    println!("\n=== FX3: a backdrop beneath a mesh reads where each fragment is, and its hole ===");
+    let (w, h) = MONITOR;
+    let texel = |x: usize, y: usize| -> [u8; 4] {
+        let byte = |n: usize| u8::try_from(n).unwrap_or(u8::MAX);
+        [
+            byte(x % 256),
+            byte(y % 256),
+            byte(64 * (x / 256) + 32 * (y / 256)),
+            255,
+        ]
+    };
+    let (memo, bytes) = fx2::upload(renderer, MONITOR, texel)?;
+    // SAFETY: `with_context` makes the context current.
+    let program = renderer
+        .with_context(|gl| unsafe { BeneathProgram::compile(gl) })
+        .map_err(|err| anyhow!("{err}"))?
+        .map_err(|why| anyhow!("{why}"))?;
+    let triangles = grid_triangles();
+    let vertices: Vec<f32> = triangles
+        .iter()
+        .flat_map(|[x, y, u, v]| [*x, *y, *u, *v, 1.0])
+        .collect();
+    #[expect(clippy::cast_precision_loss, reason = "a monitor's side")]
+    let map = [1.0 / w as f32, 1.0 / h as f32, 0.0, 0.0];
+    let side = (i32::try_from(w).unwrap_or(1), i32::try_from(h).unwrap_or(1));
+    let drawn = draw_beneath(
+        renderer,
+        side,
+        None,
+        (
+            program,
+            memo.tex_id(),
+            &vertices,
+            Draw::Backdrop { map, alpha: 1.0 },
+            MASK,
+        ),
+    )?;
+    let pixel = |picture: &[u8], width: usize, (x, y): (usize, usize)| -> Vec<u8> {
+        picture
+            .get((y * width + x) * 4..(y * width + x) * 4 + 4)
+            .map(<[u8]>::to_vec)
+            .unwrap_or_default()
+    };
+    let centre = (215.0_f32, 170.0_f32);
+    let mut probes = vec![(215_usize, 170_usize)];
+    for corner in [GRID[0], GRID[2], GRID[6], GRID[8]] {
+        let quarter = (
+            centre.0 + (corner.0 - centre.0) / 4.0,
+            centre.1 + (corner.1 - centre.1) / 4.0,
+        );
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a pixel on the target"
+        )]
+        probes.push((quarter.0 as usize, quarter.1 as usize));
+    }
+    for at in &probes {
+        #[expect(clippy::cast_precision_loss, reason = "a pixel's centre")]
+        let middle = (at.0 as f32 + 0.5, at.1 as f32 + 0.5);
+        let (u, v) = uv_at(&triangles, middle).ok_or_else(|| anyhow!("{at:?} is off the grid"))?;
+        let inside = inside_mask((u * MASK.2[0], v * MASK.2[1]));
+        if inside < 2.0 {
+            return Err(anyhow!(
+                "the premise: {at:?} (uv {u:.3}, {v:.3}) is not well inside the mask ({inside:.2})"
+            ));
+        }
+        let (got, want) = (pixel(&drawn, w, *at), pixel(&bytes, w, *at));
+        if got.len() != 4 || worst(&got, &want) > 1 {
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a texel"
+            )]
+            let at_uv = pixel(
+                &bytes,
+                w,
+                ((u * w as f32) as usize, (v * h as f32) as usize),
+            );
+            return Err(anyhow!(
+                "beneath the mesh, {at:?} reads {got:?}, not the memo there {want:?} (the memo at its uv is {at_uv:?})"
+            ));
+        }
+    }
+    // A pixel the grid puts outside the mask's rectangle: nothing drawn.
+    let outside = (111_usize, 48_usize);
+    #[expect(clippy::cast_precision_loss, reason = "a pixel's centre")]
+    let middle = (outside.0 as f32 + 0.5, outside.1 as f32 + 0.5);
+    let (u, v) = uv_at(&triangles, middle).ok_or_else(|| anyhow!("{outside:?} is off the grid"))?;
+    if inside_mask((u * MASK.2[0], v * MASK.2[1])) > -2.0 {
+        return Err(anyhow!(
+            "the premise: {outside:?} (uv {u:.3}, {v:.3}) is not well outside the mask"
+        ));
+    }
+    let got = pixel(&drawn, w, outside);
+    if got.iter().any(|channel| *channel > 1) {
+        return Err(anyhow!(
+            "outside the mask, {outside:?} reads {got:?}, not transparent"
+        ));
+    }
+    println!(
+        "  {} pixels beneath the bent grid read the memo where each is within 1; outside the mask, transparent",
+        probes.len()
+    );
+
+    // The hole: a 160×100 quad at (20, 10) of a grey 200×120 target, its
+    // uv 0 to 1 across it, as `warp::Mesh::quad` makes it.
+    let (x0, y0, x1, y1) = (20.0_f32, 10.0_f32, 180.0_f32, 110.0_f32);
+    let quad: Vec<f32> = [
+        (x0, y0, 0.0, 0.0),
+        (x1, y0, 1.0, 0.0),
+        (x1, y1, 1.0, 1.0),
+        (x0, y0, 0.0, 0.0),
+        (x1, y1, 1.0, 1.0),
+        (x0, y1, 0.0, 1.0),
+    ]
+    .iter()
+    .flat_map(|(x, y, u, v)| [*x, *y, *u, *v, 1.0])
+    .collect();
+    let grey = 128.0 / 255.0;
+    let holed = draw_beneath(
+        renderer,
+        (200, 120),
+        Some([grey, grey, grey, 1.0]),
+        (
+            program,
+            0,
+            &quad,
+            Draw::Erase,
+            ([0.0, 0.0, 160.0, 100.0], MASK.1, [160.0, 100.0]),
+        ),
+    )?;
+    let inside = pixel(&holed, 200, (100, 60));
+    if inside.iter().any(|channel| *channel > 1) {
+        return Err(anyhow!(
+            "inside the hole (100, 60) reads {inside:?}, not transparent"
+        ));
+    }
+    let beside = pixel(&holed, 200, (5, 5));
+    if beside.len() != 4 || worst(&beside, &[128, 128, 128, 255]) > 1 {
+        return Err(anyhow!(
+            "beside the hole (5, 5) reads {beside:?}, not the grey"
+        ));
+    }
+    // On the top-left corner's diagonal, where the arc of radius 16 about
+    // (36, 26) crosses: partly erased.
+    let arc = pixel(&holed, 200, (24, 14));
+    if !arc.first().is_some_and(|red| (8..120).contains(red)) {
+        return Err(anyhow!(
+            "on the hole's rounded corner (24, 14) reads {arc:?}, not between"
+        ));
+    }
+    println!("  the hole: transparent inside, grey beside it, {arc:?} on its rounded corner");
     Ok(())
 }
