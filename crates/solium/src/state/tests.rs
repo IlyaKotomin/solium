@@ -17566,8 +17566,7 @@ end)
         /// do not move at all. `crop` keeps the picture at the rectangle's
         /// left, going with the moving edge instead.
         #[test]
-        fn a_neighbour_growing_into_a_closed_windows_tile_keeps_its_picture_against_its_far_edge()
-        {
+        fn a_neighbour_growing_into_a_closed_windows_tile_keeps_its_picture_against_its_far_edge() {
             let mut desk = Desk::new();
             let (dying, others) = closing_scene(&mut desk, "tiling");
             for opened in others.iter().chain([&dying]) {
