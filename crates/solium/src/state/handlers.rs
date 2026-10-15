@@ -1686,6 +1686,9 @@ delegate_xdg_shell!(Solium);
 delegate_xdg_decoration!(Solium);
 smithay::delegate_xdg_dialog!(Solium);
 smithay::delegate_xdg_foreign!(Solium);
+// `wp_content_type_v1` (#71). No handler trait to implement: smithay stores
+// what the client said on the surface, and `content_type_of` reads it.
+smithay::delegate_content_type!(Solium);
 delegate_layer_shell!(Solium);
 delegate_seat!(Solium);
 // Routes `wp_cursor_shape_manager_v1` and the per-pointer device it hands out.

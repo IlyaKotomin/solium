@@ -57,6 +57,7 @@
 ---@field accepts_input boolean Whether the window may ever be given the keyboard: an X11 client's own `WM_HINTS.input`, or `true` for a Wayland window, which has nothing equivalent to decline with. Not what decides whether a window reaches this list at all (#221) -- an ICCCM 'Globally Active' application can set this `false` and still be an ordinary, shown window -- so a row here can read `false`; it exists for a window rule to act on.
 ---@field class? string Its X11 `WM_CLASS` class, or absent for a Wayland window, which has no such property. `config.x11.hidden` matches against this and `instance` to decide whether the window was shown at all (#221).
 ---@field instance? string Its X11 `WM_CLASS` instance, or absent for a Wayland window. See `class`.
+---@field content_type "none"|"photo"|"video"|"game" What the window says it is showing, through `wp_content_type_v1`, as it last committed it; `"none"` for a window that never said, which includes every X11 window. The compositor decides nothing with it: it is for a script deciding tearing, a refresh rate or keeping the screen awake for the one window that is a game or a film.
 
 ---One row of `sol.apps()`: an installed, visible application.
 ---@class sol.App

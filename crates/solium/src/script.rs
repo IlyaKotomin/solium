@@ -211,6 +211,16 @@ pub(crate) struct WindowInfo {
     /// Its `WM_CLASS` instance (`X11Surface::instance()`), or absent for a
     /// Wayland window. See `class`.
     pub(crate) instance: Option<String>,
+    /// What the window says it is showing, through `wp_content_type_v1`
+    /// (#71): `"photo"`, `"video"`, `"game"`, or `"none"` for a window that
+    /// never said. What the client has committed; see `content_type_of` in
+    /// `state/snapshot.rs`.
+    ///
+    /// The compositor decides nothing with it. It is here so a choice that
+    /// would otherwise be one switch for every window -- tearing (#37), a
+    /// variable refresh rate, keeping the screen awake -- can be made by a
+    /// script for the window that is actually a game or a film.
+    pub(crate) content_type: &'static str,
 }
 
 /// How a window is drawn this instant, as `Solium::window_under` reads it:
@@ -2752,7 +2762,9 @@ fn build_api(lua: &Lua) -> mlua::Result<Table> {
     // `nil` for a Wayland one, except `accepts_input`, which is `true` -- and
     // exist for a window rule (#56) to act on a case the compositor's own
     // default (hiding a window whose `class` or `instance` is in
-    // `config.x11.hidden`) does not already decide for it.
+    // `config.x11.hidden`) does not already decide for it. `content_type` is
+    // what the window says it is showing (#71), `"none"` when it said
+    // nothing; see `WindowInfo::content_type`.
     sol.set(
         "windows",
         lua.create_function(|lua, ()| {
@@ -2780,6 +2792,7 @@ fn build_api(lua: &Lua) -> mlua::Result<Table> {
                 entry.set("accepts_input", window.accepts_input)?;
                 entry.set("class", window.class.clone())?;
                 entry.set("instance", window.instance.clone())?;
+                entry.set("content_type", window.content_type)?;
                 windows.set(index + 1, entry)?;
             }
             Ok(windows)
@@ -5991,6 +6004,7 @@ mod tests {
                 accepts_input: true,
                 class: None,
                 instance: None,
+                content_type: "none",
             }],
             monitors: vec![MonitorInfo {
                 name: "test-1".to_owned(),
@@ -8385,6 +8399,7 @@ mod tests {
             accepts_input: true,
             class: None,
             instance: None,
+            content_type: "none",
         };
         snapshot.windows = vec![
             window(1, false, Parentage::None),
@@ -8881,6 +8896,7 @@ mod tests {
                     accepts_input: true,
                     class: None,
                     instance: None,
+                    content_type: "none",
                 })
                 .collect(),
             monitors: vec![MonitorInfo {
@@ -12164,6 +12180,7 @@ mod dialogs {
             accepts_input: true,
             class: None,
             instance: None,
+            content_type: "none",
         }
     }
 
@@ -15730,6 +15747,7 @@ mod directions {
             accepts_input: true,
             class: None,
             instance: None,
+            content_type: "none",
         }
     }
 
