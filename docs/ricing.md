@@ -116,10 +116,9 @@ job without being overwritten.
 return { pane = "left" }
 ```
 
-Eleven styles ship, and
+Twelve styles ship, and
 [the pane styles' README](../crates/solium/qml/panes/README.md#what-is-here)
-lists them with what each one is for. Reload and every open window is
-re-framed.
+lists them with what each one is for. Reload and every open window is re-framed.
 
 ### No frame at all
 
@@ -170,7 +169,7 @@ where it already is, so rounding buys no pass at all and no copy of the window,
 and a window that is tilted or pulled by a genie keeps its corners.
 `client.radius: 0` is no effect at all rather than a radius of nothing, so a
 style that does not want it draws its client exactly as before, and nine of the
-eleven shipped bundles do not want it.
+twelve shipped bundles do not want it.
 
 A rounded window that fades in or out is faded surface by surface, with no
 picture of it taken: where a subsurface overlaps its parent (a player's video
@@ -301,6 +300,12 @@ fails on it too. With no rules nothing changes, and nothing costs anything.
 `blur` ships with Solium, a dual Kawase blur with `passes` and `offset`
 ([its folder](../crates/solium/effects/blur/README.md)); copy the folder to
 `~/.config/solium/effects/blur/` to change it, and your copy is used instead.
+So does `glass`, liquid glass, dark unless its `tint` says otherwise
+([its folder](../crates/solium/effects/glass/README.md)), which the `glass`
+pane style puts behind every window it frames; a rule of yours for
+`{ style = "glass" }`, the `pane` part and its `behind` slot wins over the
+style's, with other params (`tint = { 1, 1, 1, 0.11 }` is light glass) or with
+`effect = false`.
 An effect that reads the part's own pixels (`self`, or `source = "self"`, as
 the rule above gives the blur) is drawn in its slot, and runs again only when
 the window draws something new, changes size, or the rule's params change:

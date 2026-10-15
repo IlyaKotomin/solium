@@ -159,8 +159,8 @@ window instead of pressing, which looks like broken buttons rather than like a
 missing property. `hovered` on its own is not read by anything. Five of the
 shipped styles with buttons, `left`, `bottom`, `pulse`, `reactive` and
 `reveal`, declare `hovered` and not `onButton`, so their buttons may not press
-([#158](https://github.com/Lilium-Linux/solium/issues/158)). `top` is the one
-to copy.
+([#158](https://github.com/Lilium-Linux/solium/issues/158)). `top` and `glass`
+are the ones to copy.
 
 Two more things a style author meets. Presses reach a layer only inside the
 band the insets reserve; hover goes everywhere, presses do not, so a button

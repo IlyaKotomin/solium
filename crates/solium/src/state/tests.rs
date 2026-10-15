@@ -910,6 +910,56 @@ fn a_styles_rules_are_bound_when_it_is_applied_and_its_problems_are_on_the_overl
     let _ = std::fs::remove_dir_all(place);
 }
 
+/// **The shipped `glass` style binds liquid glass behind the whole pane**:
+/// its `effects.lua` holds one rule, the shipped `glass` effect in the
+/// pane's `behind` slot for a window that is not fullscreen, and applied
+/// with the shipped effects it binds as T2, reading the backdrop, with
+/// nothing on the overlay.
+#[test]
+fn the_shipped_glass_style_binds_liquid_glass_behind_the_pane() {
+    use crate::effect::rules::{Fill, Part, Slot, Tier};
+    let style = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/qml/panes/glass"));
+    let read = crate::style::rules_of(style);
+    assert!(read.problems.is_empty(), "{:?}", read.problems);
+    let [rule] = &read.rules[..] else {
+        panic!("one rule: {:?}", read.rules)
+    };
+    assert_eq!((&rule.part, rule.slot), (&Part::Pane, Slot::Behind));
+    assert_eq!(rule.matches.fullscreen, Some(false), "{:?}", rule.matches);
+    assert!(
+        matches!(&rule.fill, Fill::Chain(links) if links.len() == 1 && links[0].effect == "glass"),
+        "{:?}",
+        rule.fill
+    );
+
+    let display = TestDisplay::new().expect("creating a test wayland display");
+    let mut state = Solium::new(display.handle());
+    state.effects = crate::effect::host::Host::new(crate::effect::host::Library::with(
+        None,
+        std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/effects")).to_path_buf(),
+    ));
+    state.apply_style_rules_from(Some(style));
+    assert!(
+        state.effects.has_pending("glass"),
+        "the style's effect is not wanted"
+    );
+    assert!(
+        !state
+            .effects
+            .problems()
+            .iter()
+            .any(|each| each.effect.starts_with("style:")),
+        "{:?}",
+        state.effects.problems()
+    );
+    let chain = state
+        .chains
+        .first_for_test(crate::effect::rules::Origin::Style)
+        .expect("the style's rule is bound");
+    assert_eq!(chain.tier, Tier::Xray);
+    assert!(chain.plan.reads.backdrop, "{:?}", chain.plan.reads);
+}
+
 /// **A style's rule that cannot bind is a problem at its `effects.lua`, and
 /// the others run** (Ruling 15): where your own set is taken whole, a
 /// style's rules are bound one by one, so one naming an effect nobody ships

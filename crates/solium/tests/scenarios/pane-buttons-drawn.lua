@@ -12,10 +12,12 @@
 -- Where each style puts its two buttons' centres, by its own `Frame.qml`:
 -- `Theme.margin` (12) from the end of the bar, `Theme.gap` (9) apart, each
 -- 13 across and centred on the bar. `reveal`'s bar is there only while the
--- pointer is inside the window.
+-- pointer is inside the window. `glass` puts them at the left, close at the
+-- outer edge.
 local styles = {
     { pane = "top", client = { 400, 268 }, close = { 381, 16 }, maximize = { 359, 16 } },
     { pane = "bottom", client = { 400, 270 }, close = { 381, 285 }, maximize = { 359, 285 } },
+    { pane = "glass", client = { 400, 268 }, close = { 18, 284 }, maximize = { 40, 284 } },
     { pane = "left", client = { 366, 300 }, close = { 17, 281 }, maximize = { 17, 259 } },
     { pane = "reveal", client = { 400, 300 }, close = { 381, 17 }, maximize = { 359, 17 }, inside = true },
     { pane = "reactive", client = { 392, 266 }, close = { 381, 15 }, maximize = { 359, 15 } },

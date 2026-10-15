@@ -96,3 +96,20 @@ To change the effect itself, copy this folder to
 `~/.config/solium/effects/glass/`: your copy is used in its place,
 everywhere that names `glass`. `solium --check
 ~/.config/solium/effects/glass` checks your copy without starting anything.
+
+## In the `glass` pane style
+
+The shipped `glass` pane style puts it behind the whole of every window it
+frames but a fullscreen one, the window and its bar together, so each window
+is one piece of glass with one rim round its outline:
+
+```lua
+{ match = { fullscreen = false }, part = "pane", slot = "behind", effect = "glass" }
+```
+
+It shows where the window is translucent: through the bar, which draws no
+fill, and behind a terminal whose background is clear. An opaque application
+covers it, except in its bar. Your rules win over a pane style's for the same
+part and slot: a rule of yours for `{ style = "glass" }`, `part = "pane"` and
+`slot = "behind"` gives those windows other params, light glass with
+`tint = { 1, 1, 1, 0.11 }`, and `effect = false` there takes the glass away.

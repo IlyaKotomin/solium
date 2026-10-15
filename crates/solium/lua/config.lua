@@ -833,6 +833,12 @@ local defaults = {
     -- ~/.config/solium/qml/panes, which shadows a shipped one of the same
     -- name. A path is anywhere.
     --
+    --   "glass"      the window and its bar one rounded piece of dark
+    --                liquid glass, the bar along the bottom with the
+    --                buttons at its left, the title after them and the
+    --                application's icon at its right; a thin dark shade just
+    --                inside the window's rounded edge while it does not have
+    --                the keyboard
     --   "top"        a titlebar above the window (the default)
     --   "left"       a titlebar down the left side
     --   "bottom"     a titlebar underneath
@@ -852,12 +858,16 @@ local defaults = {
     --                or a tiling layout whose own bar makes a titlebar
     --                redundant.
     --
-    -- "rounded" and "flush" cut the client's corners as it is drawn, at no
-    -- extra cost: no pass and no copy of the window. The panes README,
-    -- `qml/panes/README.md`, has what each style is made of and costs.
-    -- A style folder may also give its windows effect rules, in an
+    -- "glass", "rounded" and "flush" cut the client's corners as it is
+    -- drawn, at no extra cost: no pass and no copy of the window. The panes
+    -- README, `qml/panes/README.md`, has what each style is made of and
+    -- costs. A style folder may also give its windows effect rules, in an
     -- `effects.lua` beside its Pane.qml; yours in `effects.rules` win over
-    -- them. SOLIUM_PANE overrides this, for one run.
+    -- them. "glass" is the one that ships with a rule: the `glass` effect
+    -- behind every window it frames, except a fullscreen one, which keeps
+    -- direct scanout. Its blur is run once per monitor and shared, and each
+    -- window refracts its own share; the other styles cost no effect at all.
+    -- SOLIUM_PANE overrides this, for one run.
     --
     -- A single QML file still works and is still called a decoration: drop one
     -- in ~/.config/solium/qml/decorations and name it here. It is one layer in
