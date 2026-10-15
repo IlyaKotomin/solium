@@ -1656,7 +1656,7 @@ impl State {
             // whether it can put this buffer on that plane -- and a single
             // number covering both would name the wrong one half the time.
             let _commit = crate::pacing::span(crate::pacing::Phase::Commit);
-            match rendered {
+            let queued = match rendered {
                 Ok(result) if !result.is_empty => {
                     match screen.compositor.queue_frame(built_under) {
                         Ok(()) => {
@@ -1675,6 +1675,7 @@ impl State {
                             // monitor's may be answered with this one's timestamp.
                             screen.pending_feedback =
                                 Some(self.solium.presentation_feedback(&output));
+                            true
                         }
                         Err(err) => {
                             tracing::warn!(
@@ -1682,11 +1683,25 @@ impl State {
                                 monitor = output.name(),
                                 "could not queue a frame"
                             );
+                            false
                         }
                     }
                 }
-                Ok(_) => {}
-                Err(err) => tracing::warn!(?err, monitor = output.name(), "rendering failed"),
+                Ok(_) => false,
+                Err(err) => {
+                    tracing::warn!(?err, monitor = output.name(), "rendering failed");
+                    false
+                }
+            };
+            // A first frame held to the clear colour draws the same nothing on
+            // every pass after its first flip, so nothing is queued and no
+            // flip comes to tell this screen's clients to draw: told here,
+            // throttled as a flip's are, as the nested backend tells them on
+            // every pass (`tests::a_held_pass_that_queued_nothing_tells_its_clients`;
+            // the call needs a GPU, and no test reaches it).
+            if owes_frame_callbacks(prepared.held, queued) {
+                self.solium
+                    .send_frames_on(&output, wall_clock(), frame_interval(&output));
             }
         }
 
@@ -2305,6 +2320,13 @@ fn nothing_in_flight(pending: impl IntoIterator<Item = bool>) -> bool {
     !pending.into_iter().any(|pending| pending)
 }
 
+/// Whether a screen's pass owes its clients their frame callbacks itself: a
+/// pass the first frame's gate held that queued nothing, so no flip will
+/// send them. `tests::a_held_pass_that_queued_nothing_tells_its_clients`.
+fn owes_frame_callbacks(held: bool, queued: bool) -> bool {
+    held && !queued
+}
+
 #[cfg(test)]
 mod tests {
     use super::{gone, nothing_in_flight, on_first_pass};
@@ -2476,6 +2498,26 @@ mod tests {
         );
         assert!(nothing_in_flight([false, false]));
         assert!(nothing_in_flight([]));
+    }
+
+    /// **A held pass that queued nothing tells its screen's clients to
+    /// draw**: the first frame held to the clear colour is queued once, and
+    /// after its flip each held pass draws the same nothing, queues no frame,
+    /// and so no flip comes to send the frame callbacks; the pass sends them
+    /// itself, throttled as a flip's are. A queued frame's flip sends them,
+    /// and a pass not held that queued nothing is as before the gate.
+    #[test]
+    fn a_held_pass_that_queued_nothing_tells_its_clients() {
+        assert!(super::owes_frame_callbacks(true, false));
+        assert!(
+            !super::owes_frame_callbacks(true, true),
+            "its flip tells them"
+        );
+        assert!(
+            !super::owes_frame_callbacks(false, false),
+            "a pass not held changed"
+        );
+        assert!(!super::owes_frame_callbacks(false, true));
     }
 
     #[test]
