@@ -52,10 +52,10 @@ return {
         local s = { { "save", "sharp" } }
         if p.soften_passes >= 1 then
             s[#s + 1] = { "use", "blur", passes = p.soften_passes, offset = p.soften_offset }
-            s[#s + 1] = { "save", "soft" }
         end
-        s[#s + 1] = { "pass", "refract.frag", per_part = true,
-                      uses = p.soften_passes >= 1 and { "sharp", "soft" } or { "sharp" } }
+        -- With no blur, `soft` is the backdrop itself: clear glass, one pass.
+        s[#s + 1] = { "save", "soft" }
+        s[#s + 1] = { "pass", "refract.frag", per_part = true, uses = { "sharp", "soft" } }
         return s
     end,
 }
