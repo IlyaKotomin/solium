@@ -4225,6 +4225,8 @@ pub(crate) fn layer_canvas(
         outer,
         alpha: 1.0,
         scale: 1.0,
+        // Only the canvas is asked of it, which no instant changes.
+        now: std::time::Duration::ZERO,
     };
     held.decoration()?
         .layer_canvas(index, drawing)
@@ -4253,7 +4255,7 @@ pub(crate) fn one_layer(
         .decoration()?
         .layer_places()
         .find(|(each, ..)| *each == index)?;
-    let drawing = layer_drawing_at(canvas, outer, at, scale);
+    let drawing = layer_drawing_at(canvas, outer, at, scale, pass_now(state));
     let title = state.pane_title(pane);
     let app_id = state.pane_app_id(pane);
     let look = crate::decoration::Look {
@@ -4286,6 +4288,7 @@ pub(crate) fn layer_drawing_at(
     outer: Size<i32, Logical>,
     at: Point<i32, Physical>,
     scale: f64,
+    now: std::time::Duration,
 ) -> crate::decoration::Drawing {
     let corner = at.to_f64().to_logical(scale);
     crate::decoration::Drawing {
@@ -4299,6 +4302,7 @@ pub(crate) fn layer_drawing_at(
         outer,
         alpha: 1.0,
         scale,
+        now,
     }
 }
 
@@ -5151,6 +5155,7 @@ fn panes(
                 outer: outer.size,
                 alpha: frame.opacity,
                 scale,
+                now,
             },
             state
                 .panes
@@ -5176,6 +5181,7 @@ fn panes(
             outer: outer.size,
             alpha: frame.opacity,
             scale,
+            now,
         };
 
         // Its client has gone: its frame's layers, fading with the rest of it,
@@ -6093,7 +6099,7 @@ fn flat_pane(
     // at its real size and the warp applies the transform's opacity to the
     // whole texture afterwards, so applying it here as well would fade the
     // frame squared. The client within it.
-    let (drawing, origin) = pane_drawing_at(outer, insets, at, scale);
+    let (drawing, origin) = pane_drawing_at(outer, insets, at, scale, pass_now(state));
 
     // Asked before the walk, which holds the state.
     let rounded = pane.and_then(|pane| clipped(state, pane));
@@ -6216,6 +6222,7 @@ pub(crate) fn pane_drawing_at(
     insets: crate::decoration::Insets,
     at: Point<i32, Physical>,
     scale: f64,
+    now: std::time::Duration,
 ) -> (crate::decoration::Drawing, Point<i32, Physical>) {
     let corner = at.to_f64().to_logical(scale);
     let drawing = crate::decoration::Drawing {
@@ -6226,6 +6233,7 @@ pub(crate) fn pane_drawing_at(
         outer,
         alpha: 1.0,
         scale,
+        now,
     };
     let client = at
         + Point::<i32, Logical>::from((insets.left, insets.top)).to_physical_precise_round(scale);
@@ -8617,7 +8625,8 @@ pub(crate) mod tests {
             ((6, 6), 1.0, (8, 38)),
             ((12, 12), 2.0, (16, 76)),
         ] {
-            let (drawing, origin) = super::pane_drawing_at(outer, insets, at.into(), scale);
+            let (drawing, origin) =
+                super::pane_drawing_at(outer, insets, at.into(), scale, std::time::Duration::ZERO);
             let corner = drawing.rect.loc.to_physical(scale);
             assert_eq!(
                 (corner.x, corner.y),
@@ -8662,7 +8671,13 @@ pub(crate) mod tests {
         };
         let canvas = crate::decoration::canvas(smithay::utils::Rectangle::from_size(outer), bleed);
         for (scale, pad) in [(1.0, 6), (2.0, 12), (1.25, 8)] {
-            let drawing = super::layer_drawing_at(canvas, outer, (pad, pad).into(), scale);
+            let drawing = super::layer_drawing_at(
+                canvas,
+                outer,
+                (pad, pad).into(),
+                scale,
+                std::time::Duration::ZERO,
+            );
             let spread = crate::decoration::spread(drawing, bleed);
             assert_eq!(spread.canvas, canvas);
             let corner = spread.drawn.loc.to_physical(scale);

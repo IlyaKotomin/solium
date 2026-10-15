@@ -45,6 +45,11 @@ Item {
     // The application's icon, in logical pixels.
     property int iconSize: 16
 
+    // How often, at most, the bar is drawn again for a new size while the
+    // window's size keeps changing, in times a second (5 to 1000; 0 draws it
+    // at every size). Read by the compositor.
+    property real resizeHz: 30
+
     // Whether the icon is on show: an id set, room for it, and an icon the
     // theme has for that id. What the tests read.
     readonly property bool iconShown: icon.visible

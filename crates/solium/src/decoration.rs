@@ -58,6 +58,12 @@ use crate::{
 /// client area.
 pub(crate) const TITLEBAR_HEIGHT: i32 = 32;
 
+/// The bounds a layer's `resizeHz` is held to, in times a second: below 5 a
+/// window resized and let go would show its layer stretched for over a fifth
+/// of a second, and above 1000 it is drawn at every size of any monitor
+/// anyway. `tests::a_layer_is_drawn_again_for_a_new_size_at_most_resize_hz_times_a_second`.
+const RESIZE_HZ: std::ops::RangeInclusive<f64> = 5.0..=1000.0;
+
 /// The style drawn when nothing has named one.
 ///
 /// A *name* rather than a path: every style this build ships is a folder under
@@ -218,15 +224,6 @@ struct Shown {
     /// border that lights up when you approach the window needs to know this
     /// even while the pointer is over the client, which is not ours.
     pointer_inside: bool,
-    /// The pane's outer size, in logical pixels.
-    ///
-    /// Here because [`Decoration::tell`] hands QML four numbers derived from it
-    /// — `contentWidth`, `contentHeight`, `paneWidth`, `paneHeight` — and
-    /// returns early when nothing it shows has changed. Without the size in
-    /// that comparison a window resized without being retitled or refocused
-    /// keeps the sizes it had when its title last changed, which
-    /// `panes/reactive/Frame.qml` reads to size its own content.
-    size: (i32, i32),
     /// The caret last written, `None` once it was taken away.
     caret: Option<Rectangle<i32, Logical>>,
     /// Which generation of the configuration's values was last written.
@@ -277,6 +274,10 @@ pub(crate) struct Drawing {
     pub(crate) alpha: f32,
     /// Device pixels per logical one, on the monitor this is drawn on.
     pub(crate) scale: f64,
+    /// The instant this is drawn at, the pass's: what a layer drawn again for
+    /// a new size at most `resizeHz` times a second goes by
+    /// ([`LayerScene::holds`]).
+    pub(crate) now: std::time::Duration,
 }
 
 /// The rectangle a layer is rasterised into: the pane, grown by its bleed.
@@ -457,6 +458,16 @@ struct LayerScene {
     /// and so has let go of what it is drawn with: see [`LayerScene::sleeps`].
     /// `tests::a_dormant_layer_draws_nothing_and_holds_no_buffer`.
     asleep: bool,
+    /// The pane's outer size this layer was last told, in logical pixels:
+    /// `paneWidth` and `paneHeight`, and the client's share of it as
+    /// `contentWidth` and `contentHeight`. Per layer, and told only as the
+    /// layer is drawn at that size, so a layer whose picture is held at the
+    /// size it has ([`LayerScene::holds`]) lays nothing out again for one it
+    /// is not drawing. `tests::a_layer_is_drawn_again_for_a_new_size_at_most_resize_hz_times_a_second`.
+    told: (i32, i32),
+    /// When this layer was last drawn at a new size, for its `resizeHz`.
+    /// `tests::a_layer_is_drawn_again_for_a_new_size_at_most_resize_hz_times_a_second`.
+    resized_at: Option<std::time::Duration>,
 }
 
 /// A decoration animates on its own clock -- a border easing to a new colour, a
@@ -639,6 +650,8 @@ impl Decoration {
                 overlay,
                 buffer_size: (0, 0),
                 asleep: false,
+                told: (0, 0),
+                resized_at: None,
             }],
             insets,
             // A single QML file has no manifest either, and `client.radius` is
@@ -797,7 +810,8 @@ impl Decoration {
         // not the ones about to be drawn. This runs once per depth and the
         // write is guarded by `shown`, so telling only this depth's layers
         // would tell whichever depth came first and silently skip the rest.
-        self.tell(look, width, height);
+        // The size is each layer's own, below, told as it is drawn at it.
+        self.tell_look(look);
         // The **pane's** pixels and not any layer's canvas. `client_size` reads
         // this to size a client while a style is being swapped, and a bleeding
         // layer's canvas would tell it the window is larger than it is.
@@ -809,7 +823,13 @@ impl Decoration {
             // Per layer, because this is the whole of bleed: its own canvas,
             // its own buffer, and its own rectangle on screen.
             let spread = spread(drawing, layer.bleed);
-            let size = (pixels(spread.canvas.size.w), pixels(spread.canvas.size.h));
+            let wanted = (pixels(spread.canvas.size.w), pixels(spread.canvas.size.h));
+            // While its pane's size keeps changing, a layer is drawn again for
+            // it at most `resizeHz` times a second, and between those its last
+            // picture is drawn stretched to the new size, as the client's is
+            // until it has drawn one at that size:
+            // `tests::a_layer_is_drawn_again_for_a_new_size_at_most_resize_hz_times_a_second`.
+            let (size, held) = layer.size_for(drawing.now, wanted, (width, height), insets);
             // The drawn size scales the layer with the window it belongs to.
             #[expect(
                 clippy::cast_possible_truncation,
@@ -839,7 +859,9 @@ impl Decoration {
             around(into, layer.index, true);
             into.extend(drawn.element);
             around(into, layer.index, false);
-            animating |= drawn.animating;
+            // A layer held at the picture it has is owed the frame that draws
+            // it at its pane's size, whether or not the size moves again.
+            animating |= drawn.animating || held;
         }
         animating
     }
@@ -909,7 +931,23 @@ impl Decoration {
             .map(|(index, layer)| (index, layer.name.as_str()))
     }
 
-    /// Hand every layer everything it is told about its window.
+    /// Hand every layer everything it is told about its window: its look,
+    /// and the pane's size.
+    ///
+    /// What a frame tells, as [`Self::layer_elements`] tells it apart: the
+    /// look to every layer at once, and the size to each layer as it is drawn
+    /// at it ([`LayerScene::tell_size`]). What a test tells a decoration it
+    /// does not draw.
+    #[cfg(test)]
+    fn tell(&mut self, look: &Look<'_>, width: i32, height: i32) {
+        self.tell_look(look);
+        let insets = self.insets;
+        for layer in &mut self.layers {
+            layer.tell_size((width, height), insets);
+        }
+    }
+
+    /// Hand every layer what it is told about its window but its size.
     ///
     /// Compared field by field rather than by building a `Shown`: this runs for
     /// every window of every frame, and the title and the app id are the only
@@ -919,15 +957,7 @@ impl Decoration {
     /// tell whether the window is focused is a glow that is always on. The
     /// properties are declared on `PaneStyle` as well as on a delegated layer's
     /// own root, so an inline layer can bind to them too.
-    ///
-    /// The **size** is in the comparison as well as the look, and that is not
-    /// tidiness. `paneWidth` and `paneHeight` are how a bleeding layer finds
-    /// the window's own rectangle inside a canvas larger than it — with
-    /// `bleedLeft` and `bleedTop`, which never change and are written once at
-    /// build. Leaving the size out would mean a window that is resized without
-    /// being retitled keeps the numbers it had at its last title change, which
-    /// puts a spike-throwing bar's spikes at the width the window used to be.
-    fn tell(&mut self, look: &Look<'_>, width: i32, height: i32) {
+    fn tell_look(&mut self, look: &Look<'_>) {
         let Look {
             title,
             app_id,
@@ -961,28 +991,15 @@ impl Decoration {
             && self.shown.app_id == app_id
             && self.shown.focused == focused
             && self.shown.pointer_inside == pointer_inside
-            && self.shown.size == (width, height)
         {
             return;
         }
-        // The client's own size, so a layer can place things against the
-        // window rather than against itself.
-        let content = (
-            width - self.insets.horizontal(),
-            height - self.insets.vertical(),
-        );
         for layer in &mut self.layers {
             layer.scene.set_string("title", title);
             // `tests::a_layer_is_told_the_app_id_and_told_again_when_it_changes`.
             layer.scene.set_string("appId", app_id);
             layer.scene.set_bool("focused", focused);
             layer.scene.set_bool("pointerInside", pointer_inside);
-            layer.scene.set_int("contentWidth", content.0);
-            layer.scene.set_int("contentHeight", content.1);
-            // The pane, which is not the canvas a bleeding layer is laid out
-            // in and not the client either.
-            layer.scene.set_int("paneWidth", width);
-            layer.scene.set_int("paneHeight", height);
         }
         self.shown.title.clear();
         self.shown.title.push_str(title);
@@ -990,7 +1007,6 @@ impl Decoration {
         self.shown.app_id.push_str(app_id);
         self.shown.focused = focused;
         self.shown.pointer_inside = pointer_inside;
-        self.shown.size = (width, height);
     }
 
     /// Tell the frame the pointer has left the window altogether.
@@ -1406,6 +1422,8 @@ impl LayerScene {
             overlay,
             buffer_size: (0, 0),
             asleep: false,
+            told: (0, 0),
+            resized_at: None,
         })
     }
 
@@ -1425,6 +1443,89 @@ impl LayerScene {
         #[expect(clippy::cast_possible_truncation, reason = "an alpha, clamped to 0..1")]
         let alpha = read.clamp(0.0, 1.0) as f32;
         alpha
+    }
+
+    /// How often, at most, this layer is drawn again for a new size while its
+    /// pane's size keeps changing: its root's `resizeHz`, in times a second,
+    /// held to [`RESIZE_HZ`]; 0, or a root that declares none, draws it at
+    /// every size. Read on a frame its size has changed, as `dormant` is.
+    /// `tests::a_layer_is_drawn_again_for_a_new_size_at_most_resize_hz_times_a_second`.
+    fn resize_hz(&self) -> f64 {
+        let read = self.scene.get_real("resizeHz", 0.0);
+        if !read.is_finite() || read <= 0.0 {
+            return 0.0;
+        }
+        read.clamp(*RESIZE_HZ.start(), *RESIZE_HZ.end())
+    }
+
+    /// Whether to draw the picture this layer has, stretched to its pane's
+    /// new size, rather than draw it again at `wanted`: while it was drawn at
+    /// a new size less than a `1 / resizeHz` second ago (`resized_at`), so a
+    /// window resized by a drag or a layout's sweep draws its layer again at
+    /// most `resizeHz` times a second, and at its last size within that once
+    /// it stops. Never a layer with something new to draw (a new title, a
+    /// focus change, an animation of its own), which is drawn at once at its
+    /// pane's size; never its first picture; never at a size it has.
+    /// `tests::a_layer_is_drawn_again_for_a_new_size_at_most_resize_hz_times_a_second`.
+    fn holds(&self, now: std::time::Duration, wanted: (i32, i32)) -> bool {
+        if self.buffer_size == wanted || self.buffer_size == (0, 0) || self.scene.needs_render() {
+            return false;
+        }
+        let Some(at) = self.resized_at else {
+            return false;
+        };
+        let hz = self.resize_hz();
+        hz > 0.0 && now.saturating_sub(at).as_secs_f64() < 1.0 / hz
+    }
+
+    /// What this layer is drawn at this frame for a canvas of `wanted`
+    /// pixels on a pane of `pane` logical ones: `wanted`, its pane's size
+    /// told to it ([`Self::tell_size`]); or, while it [`holds`](Self::holds),
+    /// the size of the picture it has, and nothing told. And whether it held.
+    /// `tests::a_layer_is_drawn_again_for_a_new_size_at_most_resize_hz_times_a_second`.
+    fn size_for(
+        &mut self,
+        now: std::time::Duration,
+        wanted: (i32, i32),
+        pane: (i32, i32),
+        insets: Insets,
+    ) -> ((i32, i32), bool) {
+        if self.holds(now, wanted) {
+            return (self.buffer_size, true);
+        }
+        if self.buffer_size != wanted {
+            self.resized_at = Some(now);
+        }
+        self.tell_size(pane, insets);
+        (wanted, false)
+    }
+
+    /// Tell this layer its pane's outer size, `paneWidth` and `paneHeight`,
+    /// and the client's share of it inside `insets`, `contentWidth` and
+    /// `contentHeight`, when it has changed since the layer was last told:
+    /// as the layer is drawn at that size, so a layer held at the picture it
+    /// has ([`Self::holds`]) lays nothing out for a size it is not drawn at.
+    ///
+    /// **The size is told at all**, and that is not tidiness: `paneWidth`
+    /// and `paneHeight` are how a bleeding layer finds the window's own
+    /// rectangle inside a canvas larger than it — with `bleedLeft` and
+    /// `bleedTop`, which never change and are written once at build — and
+    /// `panes/reactive/Frame.qml` sizes its own content by `contentWidth`.
+    fn tell_size(&mut self, (width, height): (i32, i32), insets: Insets) {
+        if self.told == (width, height) {
+            return;
+        }
+        // The client's own size, so a layer can place things against the
+        // window rather than against itself.
+        self.scene
+            .set_int("contentWidth", width - insets.horizontal());
+        self.scene
+            .set_int("contentHeight", height - insets.vertical());
+        // The pane, which is not the canvas a bleeding layer is laid out in
+        // and not the client either.
+        self.scene.set_int("paneWidth", width);
+        self.scene.set_int("paneHeight", height);
+        self.told = (width, height);
     }
 
     /// Whether this layer has nothing to draw this frame, as its root's
@@ -4288,6 +4389,7 @@ mod tests {
             outer: (800, 600).into(),
             alpha: 1.0,
             scale: 1.0,
+            now: std::time::Duration::ZERO,
         }
     }
 
@@ -4366,6 +4468,7 @@ mod tests {
             outer: (800, 600).into(),
             alpha: 1.0,
             scale: 1.0,
+            now: std::time::Duration::ZERO,
         };
         let spread = super::spread(
             half,
@@ -5693,6 +5796,90 @@ mod tests {
                 !narrow.layers[0].scene.get_bool("roomForTitle"),
                 "a larger icon leaves the title no room at 120"
             );
+        });
+    }
+
+    /// **A layer is drawn again for a new size at most `resizeHz` times a
+    /// second** while its pane's size keeps changing: the glass bar, at its
+    /// 30, through a second of a drag that widens its pane on every frame of
+    /// a 260 Hz monitor, is drawn about 30 times and not 260, its picture
+    /// stretched between; at its last size within a thirtieth of a second of
+    /// the drag stopping, and not again after; and at once, at the pane's
+    /// size, when it has something new to draw (a focus change). At
+    /// `resizeHz = 0` it is drawn at every size, as every layer was.
+    #[test]
+    fn a_layer_is_drawn_again_for_a_new_size_at_most_resize_hz_times_a_second() {
+        use std::time::Duration;
+        on_the_qt_thread(|| {
+            let Some(mut decoration) = glass(400, 268) else {
+                return;
+            };
+            let values = Values::default();
+            let insets = decoration.insets;
+            decoration.tell(&look_with(&values, true), 400, 300);
+            // One frame of `layer_elements`' for the bar, at `ms` with its pane
+            // `width` wide, as the software path draws it: whether it drew a
+            // new picture, and the size it is at.
+            let frame = |decoration: &mut Decoration, ms: u64, width: i32| {
+                let bar = &mut decoration.layers[0];
+                let wanted = (width, 300);
+                let (size, _) = bar.size_for(Duration::from_millis(ms), wanted, wanted, insets);
+                bar.scene.resize(size.0, size.1, 1.0);
+                let fresh = bar.scene.needs_render();
+                if fresh {
+                    let _ = bar.scene.render();
+                }
+                bar.buffer_size = size;
+                (u32::from(fresh), size)
+            };
+            // A drag: 250 frames 4 ms apart, the pane a pixel wider on each.
+            let drag = |decoration: &mut Decoration, from: u64| {
+                (0..250_u64)
+                    .map(|step| {
+                        let width = 400 + i32::try_from(step).unwrap_or(0);
+                        frame(decoration, from + step * 4, width).0
+                    })
+                    .sum::<u32>()
+            };
+            assert_eq!(
+                frame(&mut decoration, 0, 400),
+                (1, (400, 300)),
+                "first drawn"
+            );
+            let drawn = drag(&mut decoration, 1000);
+            assert!(
+                (25..=31).contains(&drawn),
+                "drawn {drawn} times through the drag"
+            );
+            // Stopped at 649 wide: drawn there within 34 ms, and then no more.
+            let mut settled = Vec::new();
+            for ms in (2000..2100).step_by(4) {
+                settled.push(frame(&mut decoration, ms, 649));
+            }
+            let at: Vec<(u32, (i32, i32))> =
+                settled.iter().copied().filter(|seen| seen.0 == 1).collect();
+            assert_eq!(at, [(1, (649, 300))], "{settled:?}");
+            assert!(
+                settled.iter().take(9).any(|seen| seen.1 == (649, 300)),
+                "not drawn at its last size within 34 ms: {settled:?}"
+            );
+            // A focus change mid-drag is drawn at once, at the pane's size.
+            assert_eq!(frame(&mut decoration, 3000, 700).1, (700, 300));
+            assert_eq!(frame(&mut decoration, 3004, 701), (0, (700, 300)), "held");
+            decoration.tell(&look_with(&values, false), 701, 300);
+            assert_eq!(
+                frame(&mut decoration, 3008, 702),
+                (1, (702, 300)),
+                "something new"
+            );
+            // And at 0, at every size.
+            assert!(
+                decoration.layers[0]
+                    .scene
+                    .set_json("resizeHz", &crate::json::Json::Number(0.0))
+            );
+            let every = drag(&mut decoration, 4000);
+            assert_eq!(every, 250, "at resizeHz 0");
         });
     }
 
