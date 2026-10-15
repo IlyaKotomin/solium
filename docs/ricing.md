@@ -1279,11 +1279,17 @@ edges that are not moving, so text never changes size; `"crop"` keeps it at
 the window's top-left instead; `"stretch"` scales it to fill, which is smooth
 but draws text up to twice as wide while the application catches up.
 `resize.background` is what shows where the picture does not reach, `"none"`
-to see through:
+to see through. `resize.modes` gives a mode a fill of its own, for every size
+change while it is in charge, as `focus.modes` does for focus; a mode it does
+not name takes `resize.fill`:
 
 ```lua
 return {
-    resize = { fill = "crop", background = "#000000" },
+    resize = {
+        fill = "crop",
+        background = "#000000",
+        modes = { scrolling = "stretch" },
+    },
 }
 ```
 

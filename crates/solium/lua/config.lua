@@ -1096,6 +1096,19 @@ local defaults = {
         -- behind the window -- or a style's own `behind` layer -- shows.
         -- Anything else is named in the log and the default kept.
         background = "#1c1c1c",
+
+        -- A fill of its own for a mode (the names `modes.register` uses),
+        -- for every size change made while that mode is in charge: its
+        -- drags, its glides, and a fullscreen glide begun in it. A mode with
+        -- no entry takes `fill` above. Handed over whenever the mode
+        -- changes, as `focus.modes` is:
+        --
+        --     resize = { modes = { scrolling = "stretch" } },
+        --
+        -- An entry that is not a fill is named in the log and "anchor"
+        -- kept, as `fill`'s is.
+        -- `each_mode_fits_a_resize_by_its_own_fill_or_the_one_for_every_mode`.
+        modes = {},
     },
 
     -- A fullscreen window: what it covers, and how a window goes fullscreen
@@ -1612,9 +1625,11 @@ local open_sections = {
     focus = { click = true, follow = true },
     -- Mode names are open-ended, the same as a key combination: a mode
     -- outside this file can register any name with `modes.register` and
-    -- give `focus.modes` and `focus.after_close` entries of its own.
+    -- give `focus.modes`, `focus.after_close` and `resize.modes` entries of
+    -- its own.
     ["focus.modes"] = true,
     ["focus.after_close"] = true,
+    ["resize.modes"] = true,
     -- `true` rather than a set of names: everything is accepted.
     bindings = true,
 }
@@ -1781,10 +1796,10 @@ end
 --   * `keyboard`, `cursor` and `bindings` are the sections above; the first
 --     two are checked against a list this file restates, the other two
 --     against nothing: `bindings` because any key combination is one, and
---     `focus.modes` and `focus.after_close` because mode names are
---     open-ended the same way (a mode outside this file can register any
---     name). `focus.modes.folating` merges in silently, exactly like a
---     misspelled binding.
+--     `focus.modes`, `focus.after_close` and `resize.modes` because mode
+--     names are open-ended the same way (a mode outside this file can
+--     register any name). `focus.modes.folating` merges in silently, exactly
+--     like a misspelled binding.
 --   * A value of the wrong *type* is not this check's business. `gap = "12"`
 --     is a recognised key and passes.
 for _, entry in ipairs(unrecognised) do

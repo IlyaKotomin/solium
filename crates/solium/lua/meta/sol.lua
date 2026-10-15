@@ -687,7 +687,10 @@ function sol.client_sizes(options) end
 ---resized before its application painted, and is `"anchor"` elsewhere.
 ---`background`: `"#rrggbb"`, `"#rrggbbaa"` or `"none"`, what shows where the
 ---picture does not reach (default `"#1c1c1c"`). Another value is logged and
----the default kept.
+---the default kept. Each call sets both, a key left out at its default.
+---`init.lua` calls this with `config.resize`, and `modes.lua` again with a
+---mode's own fill from `config.resize.modes` whenever the mode changes, when
+---that table names any mode.
 ---@param options? { fill?: "anchor"|"crop"|"stretch"|"scene", background?: string }
 ---@return nil
 function sol.resize(options) end

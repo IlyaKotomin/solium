@@ -9354,6 +9354,78 @@ mod tests {
         }
     }
 
+    /// **Each mode fits a resize by its own `resize.modes` entry, or by
+    /// `resize.fill`, the one for every mode (#233)**, handed over as the
+    /// focus model is: once at load for the mode the session opens in, and
+    /// again at each switch, with the background beside it. A mode the table
+    /// does not name takes `fill`; a table naming no mode hands nothing over
+    /// past `init.lua`'s one call, so the shipped configuration says it once.
+    #[test]
+    fn each_mode_fits_a_resize_by_its_own_fill_or_the_one_for_every_mode() {
+        use crate::resizing::{BACKGROUND, Fill, Settings};
+        let last = |commands: Vec<Command>| {
+            commands
+                .into_iter()
+                .filter_map(|command| match command {
+                    Command::Resize(settings) => Some(settings),
+                    _ => None,
+                })
+                .last()
+        };
+        let fill = |fill: Fill| {
+            Some(Settings {
+                fill,
+                background: BACKGROUND,
+            })
+        };
+        // At load (floating), then tiling, then scrolling.
+        for (resize, expected) in [
+            (
+                r#"{ fill = "crop", modes = { tiling = "stretch" } }"#,
+                [fill(Fill::Crop), fill(Fill::Stretch), fill(Fill::Crop)],
+            ),
+            (
+                r#"{ modes = { floating = "stretch", scrolling = "crop" } }"#,
+                [fill(Fill::Stretch), fill(Fill::Anchor), fill(Fill::Crop)],
+            ),
+            (
+                r#"{ background = "none", modes = { scrolling = "stretch" } }"#,
+                [
+                    Some(Settings {
+                        fill: Fill::Anchor,
+                        background: None,
+                    }),
+                    Some(Settings {
+                        fill: Fill::Anchor,
+                        background: None,
+                    }),
+                    Some(Settings {
+                        fill: Fill::Stretch,
+                        background: None,
+                    }),
+                ],
+            ),
+            ("{}", [fill(Fill::Anchor), None, None]),
+        ] {
+            let Some((directory, mut scripts)) = shipped_init_with_user(
+                "solium-script-test-resize-modes",
+                &format!("return {{ resize = {resize} }}"),
+            ) else {
+                return;
+            };
+            let handed = [
+                last(scripts.startup().commands),
+                last(scripts.key("super+t", empty_snapshot()).commands),
+                last(scripts.key("super+s", empty_snapshot()).commands),
+            ];
+            let _ = std::fs::remove_dir_all(&directory);
+            assert_eq!(
+                handed, expected,
+                "resize = {resize}: at load, then tiling, then scrolling"
+            );
+        }
+    }
+
     /// Every key `config.lua`'s `open_sections` accepts for one section.
     ///
     /// Scraped from the shipped file rather than restated here: a third copy of
