@@ -1182,6 +1182,8 @@ impl Phases for Gpu<'_> {
             pass,
             memos,
             xrays: &*xrays,
+            motion: (std::time::Duration::ZERO, 0.0),
+            waited: false,
         };
         let _ = with_carrier(pool, renderer, |renderer, carrier, pool| {
             let mut runner = GlRunner::new(renderer, carrier, timer.as_mut());
@@ -1249,6 +1251,8 @@ impl Phases for Gpu<'_> {
             pass,
             ..
         } = self;
+        let instant = pass_now(state);
+        let motion_hz = state.effect_settings.motion_hz;
         let Solium {
             store,
             pool,
@@ -1270,12 +1274,20 @@ impl Phases for Gpu<'_> {
             pass: *pass,
             memos,
             xrays: &*xrays,
+            motion: (instant, motion_hz),
+            waited: false,
         };
         let drawn = &*drawn;
         let _ = with_carrier(pool, renderer, |renderer, carrier, pool| {
             let mut runner = GlRunner::new(renderer, carrier, timer.as_mut());
             run_slots(&mut cx, pool, &mut runner, slots, drawn, nest);
         });
+        // A suffix that waited for its next tick is run on a later pass even
+        // if nothing else on screen asks for one:
+        // `effect::store::tests::a_moving_parts_suffix_runs_at_most_motion_hz_times_a_second`.
+        if cx.waited {
+            state.redraw = true;
+        }
     }
 
     fn warps(&mut self, slots: &Slots) {
@@ -2215,6 +2227,16 @@ pub(crate) struct RunCx<'a> {
     pub(crate) memos: &'a mut crate::effect::memo::Memos,
     /// Every xray cut: what a memo prefix and a T2 run bind as `backdrop`.
     pub(crate) xrays: &'a crate::effect::xray::Xrays,
+    /// The pass's instant, which a run is marked with, and
+    /// `effects.motion_hz`: how often, at most, a chain moved only by its
+    /// part's place or size runs again
+    /// ([`crate::effect::store::SlotState::waits`],
+    /// [`crate::effect::store::T2State::waits`]).
+    pub(crate) motion: (std::time::Duration, f64),
+    /// Whether a chain waited for its next motion tick this pass: the pass
+    /// that runs it at its part's last place and size is then owed, whether
+    /// or not the part moves again.
+    pub(crate) waited: bool,
 }
 
 impl std::fmt::Debug for RunCx<'_> {
@@ -2479,9 +2501,23 @@ pub(crate) fn run_slots(
             own: drawn.commit(&owner, slot),
             shape: shape_hash(part.content, part.radii),
         };
+        let (instant, hz) = cx.motion;
         let state = cx.store.slot_mut(&owner, slot, key);
         state.seen = cx.pass;
-        if !state.needs_run(redrawn, params, size) {
+        // Run again only when its input was redrawn, its params changed or
+        // its box changed size; a T0 chain whose box only changed size, run
+        // already in this tick of `effects.motion_hz`, draws its last result
+        // stretched over the part and runs at the next tick
+        // (`effect::store::tests::a_resized_parts_t0_chain_runs_at_most_motion_hz_times_a_second`).
+        let motion = crate::effect::store::Motion {
+            hz,
+            phase: motion_phase(&owner, slot, ""),
+        };
+        let waits = chain.tier == Tier::Generated
+            && state.held.output().is_some()
+            && state.waits(redrawn, params, size, instant, motion);
+        cx.waited |= waits;
+        if waits || !state.needs_run(redrawn, params, size) {
             if let Some(texture) = state.held.output().cloned()
                 && let Some(ready) = ready_from(state, cx.masked.as_ref(), texture, false, part)
             {
@@ -2528,6 +2564,7 @@ pub(crate) fn run_slots(
                 );
                 crate::pacing::effect_ran();
                 state.ran(params, size);
+                state.ran_at = Some(instant);
                 if let Some(ready) = ready_from(state, cx.masked.as_ref(), texture, true, part) {
                     slots.set_ready(owner, slot, ready);
                 }
@@ -2591,6 +2628,8 @@ fn run_t2(
         return false;
     };
     let places = slots.places(owner, slot).to_vec();
+    let (instant, hz) = cx.motion;
+    let waited = &mut cx.waited;
     let state = cx.store.slot_mut(owner, slot, rule);
     state.seen = cx.pass;
     // A monitor the part left gives its result's targets back
@@ -2604,6 +2643,10 @@ fn run_t2(
             continue;
         };
         let work = t2_work(memo, slots.shared_on(owner, slot, &place.monitor));
+        let motion = crate::effect::store::Motion {
+            hz,
+            phase: motion_phase(owner, slot, &place.monitor),
+        };
         let part = place.part;
         let now = t2_key(
             cx.memos,
@@ -2653,6 +2696,19 @@ fn run_t2(
                 let Some(texture) = t2.held.output().cloned() else {
                     continue;
                 };
+                (texture, false, None)
+            }
+            // Moved only by its part's place or size, and run already in this
+            // tick of `effects.motion_hz`: its last result is drawn
+            // where the part is, and it runs again at the next tick
+            // (`effect::store::tests::a_moving_parts_suffix_runs_at_most_motion_hz_times_a_second`).
+            T2Work::Suffix | T2Work::Whole
+                if t2.held.output().is_some() && t2.waits(now, instant, motion) =>
+            {
+                let Some(texture) = t2.held.output().cloned() else {
+                    continue;
+                };
+                *waited = true;
                 (texture, false, None)
             }
             T2Work::Suffix | T2Work::Whole => {
@@ -2716,6 +2772,7 @@ fn run_t2(
                         );
                         crate::pacing::effect_ran();
                         t2.key = Some(now);
+                        t2.ran_at = Some(instant);
                         (texture, true, None)
                     }
                     // Not compiled yet, or a format waiting for the rebind:
@@ -2752,6 +2809,24 @@ fn run_t2(
         }
     }
     failed
+}
+
+/// Where in one interval of `effects.motion_hz` a slot's ticks fall, 0 to
+/// 1, from its owner, slot and monitor (a T2 place's own; `""` for a T0
+/// slot's one result): fixed for the slot, and spread across slots, so the
+/// glass and the shade of windows that start moving together run on
+/// different passes rather than all on one.
+/// `effect::store::tests::a_moving_parts_suffix_runs_at_most_motion_hz_times_a_second`.
+fn motion_phase(owner: &crate::effect::plan::Owner, slot: Slot, monitor: &str) -> f64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (owner, slot, monitor).hash(&mut hasher);
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a share of 1024, exact in an f64"
+    )]
+    let share = (hasher.finish() % 1024) as f64 / 1024.0;
+    share
 }
 
 /// A T2 place's result as the walk places it on its monitor: the texture in
@@ -7101,6 +7176,8 @@ pub(crate) mod tests {
             pass: 1,
             memos: &mut memos,
             xrays: &xrays,
+            motion: (std::time::Duration::ZERO, 0.0),
+            waited: false,
         };
         let (mut runner, mut pool) = (NoGpu::default(), crate::pool::Pool::new(0));
         for nest in [super::Nest::Inner, super::Nest::Whole] {
@@ -7193,6 +7270,8 @@ pub(crate) mod tests {
             pass: 1,
             memos: &mut memos,
             xrays: &xrays,
+            motion: (std::time::Duration::ZERO, 0.0),
+            waited: false,
         };
         let mut runner = NoGpu::default();
         super::run_slots(

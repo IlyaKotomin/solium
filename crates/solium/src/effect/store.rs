@@ -50,6 +50,9 @@ pub(crate) struct SlotState {
     /// same for as long as the slot keeps this state.
     /// `render::tests::a_beneath_slot_is_a_hole_only_inside_a_capture`.
     pub(crate) hole: Id,
+    /// The pass instant the chain last ran at, for `effects.motion_hz`
+    /// ([`SlotState::waits`]).
+    pub(crate) ran_at: Option<std::time::Duration>,
 }
 
 impl SlotState {
@@ -68,6 +71,7 @@ impl SlotState {
             seen: 0,
             t2: BTreeMap::new(),
             hole: Id::new(),
+            ran_at: None,
         }
     }
 
@@ -99,6 +103,34 @@ impl SlotState {
     /// `tests::a_redrawn_input_reruns_the_chain_every_pass`.
     pub(crate) fn needs_run(&self, redrawn: bool, params: u64, size: (u32, u32)) -> bool {
         redrawn || self.size != Some(size) || self.params != params
+    }
+
+    /// Whether a chain whose box has only changed size, its input not
+    /// redrawn and its params as they were, waits for its next tick of
+    /// `motion` before it runs again, its last result drawn stretched over
+    /// the part meanwhile: while it last ran in the tick `now` falls in. So
+    /// a T0 chain (a shade, a ring) on a window being resized runs at most
+    /// `effects.motion_hz` times a second, at every size of a 260 Hz drag
+    /// no more, and at its last size within one tick of the window
+    /// stopping. `render::run_slots` asks it of a T0 chain only.
+    /// `tests::a_resized_parts_t0_chain_runs_at_most_motion_hz_times_a_second`.
+    pub(crate) fn waits(
+        &self,
+        redrawn: bool,
+        params: u64,
+        size: (u32, u32),
+        now: std::time::Duration,
+        motion: Motion,
+    ) -> bool {
+        let (Some(had), Some(ran)) = (self.size, self.ran_at) else {
+            return false;
+        };
+        !redrawn
+            && self.params == params
+            && had != size
+            && motion
+                .tick(ran)
+                .is_some_and(|tick| Some(tick) == motion.tick(now))
     }
 
     /// The chain ran at `params` over a box of `size`.
@@ -151,6 +183,9 @@ pub(crate) struct T2State {
     /// The warp's commit its beneath draw last saw, and the beneath's own
     /// (Ruling F37): `tests::an_unders_commit_moves_with_its_warp_or_its_rerun`.
     pub(crate) under: Option<(CommitCounter, CommitCounter)>,
+    /// The pass instant its suffix last ran at, for `effects.motion_hz`
+    /// ([`T2State::waits`]).
+    pub(crate) ran_at: Option<std::time::Duration>,
 }
 
 /// Never run, with an id of its own.
@@ -165,7 +200,49 @@ impl Default for T2State {
             placed: None,
             read_at: None,
             under: None,
+            ran_at: None,
         }
+    }
+}
+
+/// How often, at most, a chain moved only by its part's place or size runs
+/// again, `effects.motion_hz` (0: on every pass), and where in one
+/// interval of that rate this place's ticks fall (`phase`, 0 to 1), so the
+/// glass of windows that start moving together does not run together on
+/// the same passes. `tests::a_moving_parts_suffix_runs_at_most_motion_hz_times_a_second`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Motion {
+    pub(crate) hz: f64,
+    pub(crate) phase: f64,
+}
+
+impl Motion {
+    /// Which tick of this place's clock `at` falls in; `None` with no cap.
+    fn tick(self, at: std::time::Duration) -> Option<u64> {
+        if self.hz <= 0.0 || !self.hz.is_finite() {
+            return None;
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a count of ticks of a session's clock, whole and far below 2^53"
+        )]
+        let tick = (at.as_secs_f64() * self.hz + self.phase.clamp(0.0, 1.0)).floor() as u64;
+        Some(tick)
+    }
+}
+
+impl T2Key {
+    /// Whether this key differs from `last` only in where its part is drawn
+    /// and how big it is (its padded box and its shape): what moves it on
+    /// every pass of a glide, a drag or a resize, and nothing else does.
+    /// `tests::a_moving_parts_suffix_runs_at_most_motion_hz_times_a_second`.
+    pub(crate) fn moved_only(&self, last: &Self) -> bool {
+        self.memo == last.memo
+            && self.xray == last.xray
+            && self.params == last.params
+            && self.own == last.own
+            && (self.padded != last.padded || self.shape != last.shape)
     }
 }
 
@@ -175,6 +252,25 @@ impl T2State {
     /// `tests::a_t2_suffix_reruns_only_when_its_key_moves`.
     pub(crate) fn needs_run(&self, key: T2Key) -> bool {
         self.key != Some(key)
+    }
+
+    /// Whether a suffix whose key moved only with its part ([`T2Key::moved_only`])
+    /// waits for its next tick of `motion` before it runs again, its last
+    /// result drawn where the part is meanwhile: while it last ran in the
+    /// tick `now` falls in. So a moving part's glass is run at most
+    /// `motion_hz` times a second, and at its last place within one tick of
+    /// its stopping. A key moved by anything else (the backdrop redrawn, its
+    /// params) runs at once.
+    /// `tests::a_moving_parts_suffix_runs_at_most_motion_hz_times_a_second`.
+    pub(crate) fn waits(&self, key: T2Key, now: std::time::Duration, motion: Motion) -> bool {
+        let (Some(last), Some(ran)) = (self.key, self.ran_at) else {
+            return false;
+        };
+        key != last
+            && key.moved_only(&last)
+            && motion
+                .tick(ran)
+                .is_some_and(|tick| Some(tick) == motion.tick(now))
     }
 
     /// The commit its result carries at `placement` on this monitor, as
@@ -523,6 +619,150 @@ mod tests {
             state.t2_mut("DP-2").needs_run(key),
             "another monitor's result is its own"
         );
+    }
+
+    /// **A resized part's T0 chain runs at most `motion_hz` times a
+    /// second**: a part a pixel wider on every 4 ms pass for a second runs
+    /// about 60 times at 60, not 250, its last result drawn stretched
+    /// between; at its last size within a sixtieth of a second of stopping;
+    /// on every pass at 0; and at once whatever the cap when its params
+    /// change or its input was redrawn.
+    #[test]
+    fn a_resized_parts_t0_chain_runs_at_most_motion_hz_times_a_second() {
+        use super::{Motion, SlotState};
+        use std::time::Duration;
+        // One pass at `ms` over a box `width` wide: the chain runs when it
+        // needs to and does not wait. Whether it ran.
+        let pass = |slot: &mut SlotState, width: u32, params: u64, ms: u64, motion: Motion| {
+            let now = Duration::from_millis(ms);
+            let size = (width, 300);
+            let runs = slot.needs_run(false, params, size)
+                && !slot.waits(false, params, size, now, motion);
+            if runs {
+                slot.ran(params, size);
+                slot.ran_at = Some(now);
+            }
+            u32::from(runs)
+        };
+        let resize = |motion: Motion| {
+            let mut state = slot();
+            let runs: u32 = (0..250_u64)
+                .map(|step| {
+                    let width = 400 + u32::try_from(step).unwrap_or(0);
+                    pass(&mut state, width, 7, 10_000 + step * 4, motion)
+                })
+                .sum();
+            (state, runs)
+        };
+        let sixty = Motion {
+            hz: 60.0,
+            phase: 0.0,
+        };
+        let (mut state, runs) = resize(sixty);
+        assert!((58..=62).contains(&runs), "ran {runs} times at 60");
+        let after: Vec<u32> = (0..10_u64)
+            .map(|step| pass(&mut state, 649, 7, 11_000 + step * 4, sixty))
+            .collect();
+        assert_eq!(after.iter().sum::<u32>(), 1, "{after:?}");
+        assert!(after.iter().take(5).any(|ran| *ran == 1), "{after:?}");
+        let (_, every) = resize(Motion {
+            hz: 0.0,
+            phase: 0.0,
+        });
+        assert_eq!(every, 250, "at 0");
+        // New params, mid-tick, run at once; so does a redrawn input.
+        assert_eq!(pass(&mut state, 649, 8, 11_100, sixty), 1, "new params");
+        let now = Duration::from_millis(11_101);
+        assert!(
+            !state.waits(true, 8, (650, 300), now, sixty),
+            "a redrawn input"
+        );
+    }
+
+    /// **A moving part's suffix runs at most `motion_hz` times a second**:
+    /// a part gliding a pixel on every 4 ms pass for a second runs about 60
+    /// times at 60, not 250, its last result drawn where it is between; at
+    /// its last place within a sixtieth of a second of stopping; on every
+    /// pass at 0; and on every pass whatever the cap when what moved its key
+    /// is not its place (the backdrop redrawn on each pass). Two places a
+    /// phase apart run on different passes.
+    #[test]
+    fn a_moving_parts_suffix_runs_at_most_motion_hz_times_a_second() {
+        use super::{Motion, T2State};
+        use crate::effect::memo::T2Key;
+        use smithay::utils::Rectangle;
+        use std::time::Duration;
+        let at = |x: i32| T2Key {
+            memo: 1,
+            xray: 1,
+            padded: Rectangle::new((x, 0).into(), (300, 200).into()),
+            params: 0,
+            shape: 0,
+            own: None,
+        };
+        // One pass at `ms`: the suffix runs when its key moved and it does not
+        // wait. Whether it ran.
+        let pass = |t2: &mut T2State, key: T2Key, ms: u64, motion: Motion| {
+            let now = Duration::from_millis(ms);
+            let runs = t2.needs_run(key) && !t2.waits(key, now, motion);
+            if runs {
+                t2.key = Some(key);
+                t2.ran_at = Some(now);
+            }
+            u32::from(runs)
+        };
+        let glide = |motion: Motion, moved: &dyn Fn(u64) -> T2Key| {
+            let mut t2 = T2State::default();
+            let runs: u32 = (0..250_u64)
+                .map(|step| pass(&mut t2, moved(step), 10_000 + step * 4, motion))
+                .sum();
+            (t2, runs)
+        };
+        let sixty = Motion {
+            hz: 60.0,
+            phase: 0.0,
+        };
+        let gliding = |step: u64| at(i32::try_from(step).unwrap_or(0));
+        let (mut t2, runs) = glide(sixty, &gliding);
+        assert!((58..=62).contains(&runs), "ran {runs} times at 60");
+        // Stopped at x = 249: run there within 17 ms, and not again.
+        let after: Vec<u32> = (0..10_u64)
+            .map(|step| pass(&mut t2, at(249), 11_000 + step * 4, sixty))
+            .collect();
+        assert_eq!(after.iter().sum::<u32>(), 1, "{after:?}");
+        assert!(after.iter().take(5).any(|ran| *ran == 1), "{after:?}");
+        assert_eq!(t2.key, Some(at(249)));
+        let (_, every) = glide(
+            Motion {
+                hz: 0.0,
+                phase: 0.0,
+            },
+            &gliding,
+        );
+        assert_eq!(every, 250, "at 0");
+        let redrawn = |step: u64| T2Key {
+            xray: step,
+            ..at(i32::try_from(step).unwrap_or(0))
+        };
+        let (_, backdrop) = glide(sixty, &redrawn);
+        assert_eq!(backdrop, 250, "a backdrop redrawn on every pass");
+        // Two places a half-tick apart: their runs fall on different passes.
+        let ran_on = |phase: f64| {
+            let mut t2 = T2State::default();
+            (0..250_u64)
+                .filter(|step| {
+                    pass(
+                        &mut t2,
+                        gliding(*step),
+                        10_000 + step * 4,
+                        Motion { hz: 60.0, phase },
+                    ) == 1
+                })
+                .collect::<Vec<u64>>()
+        };
+        let (one, other) = (ran_on(0.0), ran_on(0.5));
+        let shared = one.iter().filter(|step| other.contains(step)).count();
+        assert!(shared <= 2, "{shared} passes ran both: {one:?} {other:?}");
     }
 
     /// **A T2 result's commit moves only when it re-ran or is placed

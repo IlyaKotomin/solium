@@ -1447,6 +1447,15 @@ local defaults = {
         -- past which a window runs its whole effect itself, and a held one
         -- past a lowered cap is given back.
         memo = { split = "resize", keep_passes = 0, budget_mib = 0 },
+        -- While a window glides, is dragged or changes size, an effect's own
+        -- steps for it run again at most `motion_hz` times a second: the
+        -- glass's refraction as it moves, the shade as it changes size (10
+        -- to 1000; 0 on every pass). Between, its last result is drawn where
+        -- the window is, stretched to its size, so what shows through the
+        -- glass trails the window by at most that long's worth of its motion,
+        -- and everything is exact again within it once the window stops. A
+        -- backdrop that changes, or new params, run it at once.
+        motion_hz = 60,
     },
 
     -- Starting up. The first desktop frame waits until what it shows is

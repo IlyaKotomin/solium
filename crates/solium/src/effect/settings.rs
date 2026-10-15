@@ -13,10 +13,18 @@ use super::tree::Tree;
 /// `mesh_ms` and `revive` to `sandbox`'s list in [`parse`]), Task 31 `on`;
 /// FX3's Task 43 adds `xray` and `memo` ([`OWN_TABLES`]).
 /// `tests::the_engines_keys_read_with_their_defaults_and_bounds`.
-pub(crate) const KEYS: &[&str] = &["rules", "sandbox", "limits", "present", "xray", "memo"];
+pub(crate) const KEYS: &[&str] = &[
+    "rules",
+    "sandbox",
+    "limits",
+    "present",
+    "xray",
+    "memo",
+    "motion_hz",
+];
 
 /// Everything under `effects` that is not a rule or a transition.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Settings {
     pub(crate) sandbox: Caps,
     pub(crate) limits: Limits,
@@ -28,7 +36,40 @@ pub(crate) struct Settings {
     /// an unwanted one is kept and what they may hold.
     /// `script::tests::sol_effects_reads_xray_and_memo`.
     pub(crate) memo: crate::effect::memo::MemoConfig,
+    /// `effects.motion_hz` (amended 2026-10-15, the 260 Hz TTY trace): how
+    /// many times a second, at most, an effect's steps for a part run again
+    /// while only the part's place or size moves them, a T0 chain's on its
+    /// size and a T2 suffix's on its place and size; 0 on every pass.
+    /// `render::run_slots`, `render::run_t2`,
+    /// `effect::store::tests::a_moving_parts_suffix_runs_at_most_motion_hz_times_a_second`,
+    /// `effect::store::tests::a_resized_parts_t0_chain_runs_at_most_motion_hz_times_a_second`.
+    pub(crate) motion_hz: f64,
 }
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            sandbox: Caps::default(),
+            limits: Limits::default(),
+            present: Present::default(),
+            xray: crate::effect::xray::XrayConfig::default(),
+            memo: crate::effect::memo::MemoConfig::default(),
+            motion_hz: MOTION_HZ_DEFAULT,
+        }
+    }
+}
+
+/// `effects.motion_hz` unless a configuration says otherwise: a moving
+/// window's glass and a resized one's shade run again 60 times a second,
+/// which a 60 Hz monitor would show anyway, and not on every frame of a
+/// 260 Hz one. `tests::the_engines_keys_read_with_their_defaults_and_bounds`.
+const MOTION_HZ_DEFAULT: f64 = 60.0;
+
+/// What `effects.motion_hz` may be besides 0: below 10 what a window shows
+/// through its glass would trail it for over a tenth of a second, and above
+/// 1000 it runs on every pass of any monitor anyway.
+/// `tests::the_engines_keys_read_with_their_defaults_and_bounds`.
+const MOTION_HZ: std::ops::RangeInclusive<f64> = 10.0..=1000.0;
 
 /// `effects.sandbox`: what one effect's Lua may spend as it loads.
 /// `sandbox::tests::the_load_budget_is_configurable`,
@@ -344,6 +385,16 @@ pub(crate) fn parse(options: &Tree) -> Result<Settings, String> {
     let memo = options
         .field("memo")
         .map_or_else(|| Ok(Default::default()), crate::effect::memo::parse)?;
+    let motion_hz = match at(options, "motion_hz") {
+        None => MOTION_HZ_DEFAULT,
+        Some(Tree::Number(number)) => *number,
+        #[expect(clippy::cast_precision_loss, reason = "a rate, far below 2^52")]
+        Some(Tree::Int(int)) => *int as f64,
+        Some(_) => f64::NAN,
+    };
+    if motion_hz != 0.0 && !MOTION_HZ.contains(&motion_hz) {
+        return Err("`effects.motion_hz` is 0, or a number from 10 to 1000".to_owned());
+    }
     Ok(Settings {
         sandbox: Caps {
             load: Duration::from_secs_f64(load / 1000.0),
@@ -353,6 +404,7 @@ pub(crate) fn parse(options: &Tree) -> Result<Settings, String> {
         present: Present { failed, on_reload },
         xray,
         memo,
+        motion_hz,
     })
 }
 
@@ -385,6 +437,14 @@ mod tests {
             (none.present.failed, none.present.on_reload),
             (super::PresentFailed::Flat, super::PresentReload::Flat)
         );
+        assert!(
+            (none.motion_hz - 60.0).abs() < f64::EPSILON,
+            "60 unless said"
+        );
+        for (lua, hz) in [("{ motion_hz = 0 }", 0.0), ("{ motion_hz = 144.5 }", 144.5)] {
+            let read = super::parse(&tree(lua)).expect(lua).motion_hz;
+            assert!((read - hz).abs() < f64::EPSILON, "{lua}: {read}");
+        }
         let set = super::parse(&tree(
             "{ sandbox = { load_ms = 500, memory_mib = 64 }, limits = { params = 16 }, present = { failed = 'hide', on_reload = 'keep' } }",
         ))
@@ -421,6 +481,22 @@ mod tests {
             (
                 "{ present = { on_reload = 'switch' } }",
                 "`effects.present.on_reload` is \"flat\" or \"keep\"",
+            ),
+            (
+                "{ motion_hz = 5 }",
+                "`effects.motion_hz` is 0, or a number from 10 to 1000",
+            ),
+            (
+                "{ motion_hz = 1001 }",
+                "`effects.motion_hz` is 0, or a number from 10 to 1000",
+            ),
+            (
+                "{ motion_hz = 'fast' }",
+                "`effects.motion_hz` is 0, or a number from 10 to 1000",
+            ),
+            (
+                "{ motion_hz = 1/0 }",
+                "`effects.motion_hz` is 0, or a number from 10 to 1000",
             ),
             // No "did you mean": `load` is 3 edits from `load_ms`, past
             // `nearest`'s 2.

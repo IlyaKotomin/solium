@@ -433,7 +433,11 @@ with the window and a suffix runs again on each pass its box moves. The pass
 reads the clock once, at the top of `resolve`, where it also plans every
 pane's warp (`render::plan_warps`; the `warps` phase takes those plans), and
 the places, the warps and `elements`' walk are all measured at that instant
-(`Prepared::now`). A warped pane's capture holds its slots, with one
+(`Prepared::now`). A suffix whose key moved only with its part's place or
+size runs at most `effects.motion_hz` times a second (60 by default; 0
+on every pass), its last result drawn where the part is between, each place
+on a tick of its own phase so windows that glide together do not run
+together (`effect::store::T2State::waits`). A warped pane's capture holds its slots, with one
 exception: under `effects.xray.warped = "drawn"`, the default, a `behind` T2
 slot is drawn beneath the warp instead (`effect::beneath`), through the same
 mesh, each fragment sampling the memo or the suffix's result where it is on

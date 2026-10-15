@@ -113,3 +113,9 @@ covers it, except in its bar. Your rules win over a pane style's for the same
 part and slot: a rule of yours for `{ style = "glass" }`, `part = "pane"` and
 `slot = "behind"` gives those windows other params, light glass with
 `tint = { 1, 1, 1, 0.11 }`, and `effect = false` there takes the glass away.
+The style's other rule puts the [`shade`](../shade/README.md) in front of a
+window without the keyboard.
+
+While a window glides, is dragged or changes size, its refraction runs again
+at most `effects.motion_hz` times a second (60 unless you change it),
+the last result drawn where the window is between.
