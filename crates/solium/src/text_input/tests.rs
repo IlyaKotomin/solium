@@ -517,11 +517,17 @@ fn the_caret_follows_its_window_moved_and_presented() {
         f64::from(outer.size.h) / 2.0,
     );
     let now = desk.state.clock.now();
+    // Zoomed as `sol.present` zooms a window it draws somewhere else
+    // (`state::commands`): a picture of the whole window at half its size.
+    // Left at 1.0, the frame would be a half-size rectangle the client has
+    // not drawn at, which since #233 is fitted by `resize.fill` -- cut at
+    // its own size, not scaled.
     present::present(
         pane,
         outer,
         Frame {
             rect: half,
+            zoom: Frame::zoom_of(half, outer),
             ..Frame::real(outer)
         },
         now,

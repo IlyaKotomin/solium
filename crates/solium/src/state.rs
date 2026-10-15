@@ -859,11 +859,12 @@ pub(crate) struct Solium {
     /// held at the rectangle the change gave it until its client answers
     /// (#49): the hold [`Self::resize_hold`] keeps for a drag, made by the
     /// change rather than by a pointer. Until then the slot is the window's
-    /// rectangle, and the client's last picture is stretched into it, so a
-    /// client slower than the glide is not shown at its old size where the
-    /// glide landed. Ended by the client's answer, or `resizing::PATIENCE`
-    /// after the glide lands, in `Self::settle`. One per pane.
-    /// `a_slow_client_is_drawn_stretched_until_it_answers`,
+    /// rectangle, and the client's last picture is fitted into it as
+    /// `resize.fill` says (#233), so a client slower than the glide is not
+    /// shown at its old size and place where the glide landed. Ended by the
+    /// client's answer, or `resize.patience` after the glide lands, in
+    /// `Self::settle`. One per pane.
+    /// `a_slow_client_is_held_at_its_new_rectangle_until_it_answers`,
     /// `a_client_that_never_answers_is_drawn_as_it_is_once_its_patience_runs_out`.
     answering: Vec<crate::resizing::Held>,
 
@@ -1883,6 +1884,11 @@ impl Solium {
         // answers would be held until something else drew one.
         // `a_client_that_never_answers_is_drawn_as_it_is_once_its_patience_runs_out`.
         animating |= self.settle_answering(now);
+        // And a glide that has landed with its client's picture still held
+        // against the edges it pinned, until `resize.patience` lets it go
+        // (#233): that frame has to be drawn too.
+        // `a_landed_glide_keeps_the_frames_coming_until_its_patience_runs_out`.
+        animating |= self.landed_waiting(now);
         // And the selections, which animate on the same clock and damage
         // nothing either. Not folded into the loop above: a group is not a
         // pane, and one that has landed has to be released exactly once.

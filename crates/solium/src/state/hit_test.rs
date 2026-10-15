@@ -931,6 +931,18 @@ impl Solium {
         // `pane_chrome` keeps it.
         let placed =
             crate::render::place_client(self, pane, &frame, outer.size, window.geometry().size);
+        // **And what the fit cuts away is not drawn, so it is not pressed.**
+        // A picture larger than its rectangle is cut to it, and since #233 an
+        // anchored one can be cut on its top or left, under the titlebar or
+        // a border: a point there maps into the buffer, onto pixels nobody
+        // sees. Only the popups, which are drawn uncut, are asked there.
+        // `a_press_on_what_an_anchored_picture_cuts_away_is_not_the_clients`.
+        let kind = match placed.fit.crop {
+            Some(crop) if !crop.contains(location) => {
+                kind & (WindowSurfaceType::POPUP | WindowSurfaceType::SUBSURFACE)
+            }
+            _ => kind,
+        };
         let undo = |drawn: f64, factor: f64| {
             if factor.abs() > f64::EPSILON {
                 drawn / factor

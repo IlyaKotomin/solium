@@ -388,7 +388,7 @@
 ---| "close_landed" # A close the compositor asked for has played its animation: the window has faded out of sight where it stood, and its application has just been asked to go -- or, an X11 one that let the last request go unanswered, been ended: `(id)`. Told after `closing` and before the `close` or `refused` that follows; not told for a window that went, or answered with a dialog, before its close landed, nor for one whose application never came, which is told `close` there and then.
 ---| "refused" # Its application declined, and the window is back: `(id)`.
 ---| "close" # The window is gone: `(id)`.
----| "fullscreen" # A window went fullscreen, or left it: `(id, entering)`. Told once the change is made: its client has been sent its new size and it lives at its new rectangle. Once every listener has run, the compositor moves its picture there from where it is drawn, as a layout's glide does, with the timing a listener set with `sol.animate`, and at once if none set one. Until the client answers at its new size the window is held there and its last picture stretched into it, for a quarter of a second past the landing at most; the transform is released when the glide lands. With no timing the change puts no transform on the window and holds nothing. A window a mode is presenting is left where the mode draws it. A change a listener makes is made at once and not told.
+---| "fullscreen" # A window went fullscreen, or left it: `(id, entering)`. Told once the change is made: its client has been sent its new size and it lives at its new rectangle. Once every listener has run, the compositor moves its picture there from where it is drawn, as a layout's glide does, with the timing a listener set with `sol.animate`, and at once if none set one. Until the client answers at its new size the window is held there and its last picture fitted into it as `resize.fill` says (`sol.resize`), for a quarter of a second past the landing at most; the transform is released when the glide lands. With no timing the change puts no transform on the window and holds nothing. A window a mode is presenting is left where the mode draws it. A change a listener makes is made at once and not told.
 ---| "maximize" # A window was maximised, or restored: `(id, entering)`. Told and answered as `"fullscreen"` is, and on its own, so the two can move differently.
 ---| "drop" # A dragged window was let go: `(id, x, y)`.
 ---| "resize" # An edge is being dragged: `(id, edge_x, edge_y, horizontal_side, vertical_side)`.
@@ -676,13 +676,26 @@ function sol.loading(options) end
 ---@return nil
 function sol.client_sizes(options) end
 
----Set what fills a window while a resize drag is ahead of its client.
+---Set how a window's picture is fitted while the window changes size -- an
+---edge or seam drag, a layout's glide, a fullscreen or maximise glide -- and
+---what fills the part it does not cover.
 ---
----`"stretch"` (the default) scales the last picture; `"hold"` leaves it at its
----own size; `"scene"` draws the window's QML scene, which today reaches only a
----window resized before its application painted. Another name is logged and
----the default kept.
----@param options? { fill?: "stretch"|"hold"|"scene" }
+---`fill`: `"anchor"` (the default) draws the picture at its own size against
+---the edges that are not moving, cut to the window; `"crop"` the same from the
+---window's top-left whichever edge moves; `"stretch"` scales it to fill;
+---`"scene"` draws the window's QML scene, which today reaches only a window
+---resized before its application painted, and is `"anchor"` elsewhere.
+---`background`: `"#rrggbb"`, `"#rrggbbaa"` or `"none"`, what shows where the
+---picture does not reach (default `"#1c1c1c"`). Another value is logged and
+---the default kept. `patience`: how long, in milliseconds from 0 to 5000, a
+---picture waits for its application once a change is over -- after a drag's
+---release, a fullscreen or maximise glide's landing, or a layout glide's
+---landing, while it stays against the edges the glide did not move (default
+---250). Each call sets all three, a key left out at its default. `init.lua`
+---calls this with `config.resize`, and `modes.lua` again with a mode's own
+---fill from `config.resize.modes` whenever the mode changes, when that table
+---names any mode.
+---@param options? { fill?: "anchor"|"crop"|"stretch"|"scene", background?: string, patience?: number }
 ---@return nil
 function sol.resize(options) end
 

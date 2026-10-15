@@ -1,5 +1,7 @@
 //! One client surface drawn through its client's rounded rectangle, in its
-//! own place: rounding with no capture (\[16\] 0.5).
+//! own place: rounding with no capture (\[16\] 0.5). And a strip of the
+//! background a picture leaves while its window changes size, drawn through
+//! the same rectangle so it is cut at the same corners ([`ClippedSolid`]).
 //!
 //! The element is the surface's own, wrapped: same id, same commit, same
 //! damage, so a still client is not redrawn. Its program maps the surface's
@@ -14,6 +16,7 @@ use smithay::{
         Color32F, Renderer, Texture as _,
         element::{
             Element, Id, Kind, RenderElement, UnderlyingStorage,
+            solid::SolidColorRenderElement,
             surface::{WaylandSurfaceRenderElement, WaylandSurfaceTexture},
         },
         gles::{GlesError, GlesFrame, GlesRenderer, Uniform, UniformValue},
@@ -283,6 +286,82 @@ pub(crate) fn claim(
     cut_corners(regions, &local)
 }
 
+/// The four uniforms the clipped programs share, for `clip` seen through
+/// `to_geo`; the solid program adds its colour.
+fn uniforms(clip: &Clip, to_geo: Mat3) -> Vec<Uniform<'static>> {
+    let radii = &clip.radii;
+    #[expect(clippy::cast_possible_truncation, reason = "pixel-sized floats")]
+    let packed = (
+        radii.top_left as f32,
+        radii.top_right as f32,
+        radii.bottom_left as f32,
+        radii.bottom_right as f32,
+    );
+    #[expect(clippy::cast_possible_truncation, reason = "pixel-sized floats")]
+    let (size, px) = (
+        (clip.rect.size.w as f32, clip.rect.size.h as f32),
+        clip.factor.x.min(clip.factor.y) as f32,
+    );
+    vec![
+        Uniform::new(
+            INPUT_TO_GEO_UNIFORM,
+            UniformValue::Matrix3x3 {
+                matrices: vec![to_geo],
+                transpose: false,
+            },
+        ),
+        Uniform::new(GEO_SIZE_UNIFORM, size),
+        Uniform::new(RADIUS_UNIFORM, packed),
+        Uniform::new(GEO_PX_UNIFORM, px),
+    ]
+}
+
+/// The matrix the solid program's `v_coords` (0..1 across `dst`) is taken
+/// into `clip`'s own pixels by: the same `src` and `size` smithay builds the
+/// pixel program's texture matrix from, taken back. `None` when it cannot
+/// be inverted. `tests::a_background_strip_is_cut_at_its_clients_corners`.
+pub(crate) fn solid_to_geo(dst: Rectangle<i32, Physical>, clip: &Clip) -> Option<Mat3> {
+    let size = Size::<i32, BufferCoords>::from((dst.size.w, dst.size.h));
+    let tex = texture_mat(
+        Rectangle::from_size(size.to_f64()),
+        dst,
+        size,
+        Transform::Normal,
+        false,
+    );
+    input_to_geo(tex, dst, clip)
+}
+
+/// A flat `colour` over `dst`, through `clip`, by the solid program: what a
+/// single-pixel surface and a background strip both are. `None` when the
+/// matrix cannot be inverted, for the caller to draw the colour square.
+fn draw_solid(
+    frame: &mut GlesFrame<'_, '_>,
+    programs: &crate::pass::ClipPrograms,
+    clip: &Clip,
+    dst: Rectangle<i32, Physical>,
+    damage: &[Rectangle<i32, Physical>],
+    colour: Color32F,
+    alpha: f32,
+) -> Option<Result<(), GlesError>> {
+    let to_geo = solid_to_geo(dst, clip)?;
+    let size = Size::<i32, BufferCoords>::from((dst.size.w, dst.size.h));
+    let mut uniforms = uniforms(clip, to_geo);
+    uniforms.push(Uniform::new(
+        COLOUR_UNIFORM,
+        (colour.r(), colour.g(), colour.b(), colour.a()),
+    ));
+    Some(frame.render_pixel_shader_to(
+        &programs.solid,
+        Rectangle::from_size(size.to_f64()),
+        dst,
+        size,
+        Some(damage),
+        alpha,
+        &uniforms,
+    ))
+}
+
 /// One client surface, drawn through the clipped programs in its own place.
 #[derive(Debug)]
 pub(crate) struct Clipped {
@@ -302,35 +381,6 @@ impl Clipped {
             clip,
             programs,
         }
-    }
-
-    /// The four the clipped programs share; the solid one adds its colour.
-    fn uniforms(&self, to_geo: Mat3) -> Vec<Uniform<'static>> {
-        let radii = &self.clip.radii;
-        #[expect(clippy::cast_possible_truncation, reason = "pixel-sized floats")]
-        let packed = (
-            radii.top_left as f32,
-            radii.top_right as f32,
-            radii.bottom_left as f32,
-            radii.bottom_right as f32,
-        );
-        #[expect(clippy::cast_possible_truncation, reason = "pixel-sized floats")]
-        let (size, px) = (
-            (self.clip.rect.size.w as f32, self.clip.rect.size.h as f32),
-            self.clip.factor.x.min(self.clip.factor.y) as f32,
-        );
-        vec![
-            Uniform::new(
-                INPUT_TO_GEO_UNIFORM,
-                UniformValue::Matrix3x3 {
-                    matrices: vec![to_geo],
-                    transpose: false,
-                },
-            ),
-            Uniform::new(GEO_SIZE_UNIFORM, size),
-            Uniform::new(RADIUS_UNIFORM, packed),
-            Uniform::new(GEO_PX_UNIFORM, px),
-        ]
     }
 }
 
@@ -413,38 +463,138 @@ impl RenderElement<GlesRenderer> for Clipped {
                     self.inner.transform(),
                     self.inner.alpha(),
                     Some(&self.programs.texture),
-                    &self.uniforms(to_geo),
+                    &uniforms(&self.clip, to_geo),
                 )
             }
             ClipDraw::Solid(colour) => {
-                // The same `src` and `size` smithay builds the pixel
-                // program's texture matrix from, so `v_coords` runs 0..1
-                // across `dst` and this matrix takes it back.
-                let size = Size::<i32, BufferCoords>::from((dst.size.w, dst.size.h));
-                let whole = Rectangle::from_size(size.to_f64());
-                let tex = texture_mat(whole, dst, size, Transform::Normal, false);
-                let Some(to_geo) = input_to_geo(tex, dst, &self.clip) else {
-                    return self.inner.draw(frame, src, dst, damage, opaque_regions);
-                };
-                let mut uniforms = self.uniforms(to_geo);
-                uniforms.push(Uniform::new(
-                    COLOUR_UNIFORM,
-                    (colour.r(), colour.g(), colour.b(), colour.a()),
-                ));
-                frame.render_pixel_shader_to(
-                    &self.programs.solid,
-                    whole,
+                match draw_solid(
+                    frame,
+                    &self.programs,
+                    &self.clip,
                     dst,
-                    size,
-                    Some(damage),
+                    damage,
+                    colour,
                     self.inner.alpha(),
-                    &uniforms,
-                )
+                ) {
+                    Some(drawn) => drawn,
+                    None => self.inner.draw(frame, src, dst, damage, opaque_regions),
+                }
             }
         }
     }
 
     /// Never a scanout candidate: a plane would show the buffer uncut.
+    fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
+        None
+    }
+}
+
+/// A flat colour drawn through its client's rounded rectangle: a strip of the
+/// background a picture smaller than its window leaves (#233,
+/// `render::background_strips`), cut at the client's own corners, so a
+/// rounded style's window keeps its rounded corners while it changes size and
+/// what its style draws behind them -- `rounded`'s bar -- still shows there.
+///
+/// The solid program, as a single-pixel surface's; the colour already
+/// carries the frame's opacity, premultiplied, as smithay's solid does, so
+/// the program is given an alpha of 1. `clip` is the client's rectangle in
+/// the output's pixels, with a `factor` of 1: a strip is not rescaled.
+/// `tests::a_background_strip_is_cut_at_its_clients_corners`.
+#[derive(Debug)]
+pub(crate) struct ClippedSolid {
+    inner: SolidColorRenderElement,
+    clip: Clip,
+    programs: crate::pass::ClipPrograms,
+}
+
+impl ClippedSolid {
+    pub(crate) fn new(
+        inner: SolidColorRenderElement,
+        clip: Clip,
+        programs: crate::pass::ClipPrograms,
+    ) -> Self {
+        Self {
+            inner,
+            clip,
+            programs,
+        }
+    }
+}
+
+impl Element for ClippedSolid {
+    fn id(&self) -> &Id {
+        self.inner.id()
+    }
+    fn current_commit(&self) -> CommitCounter {
+        self.inner.current_commit()
+    }
+    fn src(&self) -> Rectangle<f64, BufferCoords> {
+        self.inner.src()
+    }
+    fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        self.inner.geometry(scale)
+    }
+    fn transform(&self) -> Transform {
+        self.inner.transform()
+    }
+    fn damage_since(
+        &self,
+        scale: Scale<f64>,
+        commit: Option<CommitCounter>,
+    ) -> DamageSet<i32, Physical> {
+        self.inner.damage_since(scale, commit)
+    }
+    /// [`claim`], of the solid's own claim: none of a corner the clip cuts.
+    fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        claim(
+            &self.inner.opaque_regions(scale),
+            self.inner.geometry(scale).loc,
+            self.inner.alpha(),
+            &self.clip,
+        )
+        .into_iter()
+        .collect()
+    }
+    fn alpha(&self) -> f32 {
+        self.inner.alpha()
+    }
+    fn kind(&self) -> Kind {
+        self.inner.kind()
+    }
+}
+
+impl RenderElement<GlesRenderer> for ClippedSolid {
+    /// A matrix that cannot be inverted draws the strip as smithay would,
+    /// square, rather than not at all.
+    fn draw(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        src: Rectangle<f64, BufferCoords>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+    ) -> Result<(), GlesError> {
+        match draw_solid(
+            frame,
+            &self.programs,
+            &self.clip,
+            dst,
+            damage,
+            self.inner.color(),
+            1.0,
+        ) {
+            Some(drawn) => drawn,
+            None => RenderElement::<GlesRenderer>::draw(
+                &self.inner,
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+            ),
+        }
+    }
+
     fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
         None
     }

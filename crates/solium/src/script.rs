@@ -3957,7 +3957,9 @@ fn build_api(lua: &Lua) -> mlua::Result<Table> {
         })?,
     )?;
 
-    // What fills a window while a resize drag is ahead of its client.
+    // How a window's picture is fitted while its rectangle and its client
+    // disagree about its size -- a drag ahead of its client, a glide between
+    // two tiles (#233) -- and what fills the part it does not cover.
     //
     // `Option<Table>` and not `Table`, for the reason `sol.cursor_theme` below
     // spells out at length: the documented way to override the configuration is
@@ -3979,7 +3981,7 @@ fn build_api(lua: &Lua) -> mlua::Result<Table> {
             // whole handler down with it. Same reasoning as `scene` above, and
             // it is how bezier easings once silently stopped working.
             //
-            // A name that is not one of the three is named in the log and the
+            // A name that is not one of the four is named in the log and the
             // default kept, rather than guessed at. Someone who wrote `fill =
             // "stretched"` wants to be told, and a compositor that silently
             // picks for them is one they cannot debug.
@@ -3992,7 +3994,7 @@ fn build_api(lua: &Lua) -> mlua::Result<Table> {
                         // `scene` is a real setting and its render path is
                         // real, but the only pane that has a scene to draw is
                         // one whose application has not painted yet -- so on
-                        // an ordinary window it is `hold` today, and someone
+                        // an ordinary window it is `anchor` today, and someone
                         // who chose it and saw no difference deserves to be
                         // told why rather than left doubting their config.
                         // `crate::resizing::Fill::Scene` carries the whole of
@@ -4001,15 +4003,52 @@ fn build_api(lua: &Lua) -> mlua::Result<Table> {
                             tracing::warn!(
                                 "resize.fill = \"scene\" only draws a scene a window already \
                                  has, which today means one resized before its application \
-                                 painted; anywhere else it behaves as \"hold\""
+                                 painted; anywhere else it behaves as \"anchor\""
                             );
                         }
                         resize.fill = fill;
                     }
                     None => tracing::warn!(
                         fill = %name,
-                        "resize.fill is one of stretch, hold or scene; keeping the default"
+                        "resize.fill is one of anchor, crop, stretch or scene; keeping the \
+                         default"
                     ),
+                }
+            }
+            // The same for the colour of what a picture does not cover, for
+            // the same reasons. `the_shipped_resize_setting_reaches_the_compositor`.
+            if let Ok(Value::String(name)) = options.get::<Value>("background")
+                && let Ok(name) = name.to_str()
+            {
+                match crate::resizing::background_named(&name) {
+                    Some(background) => resize.background = background,
+                    None => tracing::warn!(
+                        background = %name,
+                        "resize.background is \"#rrggbb\", \"#rrggbbaa\" or \"none\"; \
+                         keeping the default"
+                    ),
+                }
+            }
+            // And how long a picture waits for its client once a change is
+            // over (#233): milliseconds, 0 to `resizing::PATIENCE_MAX`, under
+            // the same contract. `the_shipped_resize_setting_reaches_the_compositor`.
+            match options.get::<Value>("patience") {
+                Ok(Value::Nil) | Err(_) => {}
+                Ok(value) => {
+                    let most = crate::resizing::PATIENCE_MAX.as_secs_f64() * 1000.0;
+                    match number(&value)
+                        .filter(|millis| (0.0..=most).contains(millis))
+                        .and_then(|millis| {
+                            std::time::Duration::try_from_secs_f64(millis / 1000.0).ok()
+                        }) {
+                        Some(patience) => resize.patience = patience,
+                        None => tracing::warn!(
+                            value = describe(&value),
+                            most_ms = most,
+                            "resize.patience is a number of milliseconds from 0 to most_ms; \
+                             keeping the default"
+                        ),
+                    }
                 }
             }
             with_pending(lua, |pending| {
@@ -9271,6 +9310,177 @@ mod tests {
                 .collect();
             assert_eq!(handed, vec![wanted], "{user}");
             let _ = std::fs::remove_dir_all(&directory);
+        }
+    }
+
+    /// **The shipped `resize` setting reaches the compositor (#233)**: the
+    /// default is `anchor` on `#1c1c1c`, and each key a user changes changes
+    /// what the compositor is told -- a name that is not one keeps the
+    /// default, as `fill`'s always did. `patience` is milliseconds from 0 to
+    /// `resizing::PATIENCE_MAX`, anything else keeping the quarter second.
+    #[test]
+    fn the_shipped_resize_setting_reaches_the_compositor() {
+        use crate::resizing::{BACKGROUND, Fill, PATIENCE, Settings};
+        let waits = |millis| Settings {
+            patience: std::time::Duration::from_millis(millis),
+            ..Settings::default()
+        };
+        for (user, wanted) in [
+            (
+                "return {}",
+                Settings {
+                    fill: Fill::Anchor,
+                    background: BACKGROUND,
+                    patience: PATIENCE,
+                },
+            ),
+            (
+                "return { resize = { fill = \"stretch\" } }",
+                Settings {
+                    fill: Fill::Stretch,
+                    background: BACKGROUND,
+                    patience: PATIENCE,
+                },
+            ),
+            (
+                "return { resize = { fill = \"crop\", background = \"#10203080\" } }",
+                Settings {
+                    fill: Fill::Crop,
+                    background: Some([0x10, 0x20, 0x30, 0x80]),
+                    patience: PATIENCE,
+                },
+            ),
+            (
+                "return { resize = { background = \"none\" } }",
+                Settings {
+                    fill: Fill::Anchor,
+                    background: None,
+                    patience: PATIENCE,
+                },
+            ),
+            (
+                "return { resize = { fill = \"hold\", background = \"dark\" } }",
+                Settings {
+                    fill: Fill::Anchor,
+                    background: BACKGROUND,
+                    patience: PATIENCE,
+                },
+            ),
+            ("return { resize = { patience = 600 } }", waits(600)),
+            ("return { resize = { patience = 0 } }", waits(0)),
+            ("return { resize = { patience = 5000 } }", waits(5000)),
+            ("return { resize = { patience = 5001 } }", waits(250)),
+            ("return { resize = { patience = -1 } }", waits(250)),
+            ("return { resize = { patience = \"long\" } }", waits(250)),
+        ] {
+            let Some((directory, mut scripts)) =
+                shipped_init_with_user("solium-script-test-resize", user)
+            else {
+                return;
+            };
+            let handed: Vec<Settings> = scripts
+                .startup()
+                .commands
+                .into_iter()
+                .filter_map(|command| match command {
+                    Command::Resize(settings) => Some(settings),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(handed, vec![wanted], "{user}");
+            let _ = std::fs::remove_dir_all(&directory);
+        }
+    }
+
+    /// **Each mode fits a resize by its own `resize.modes` entry, or by
+    /// `resize.fill`, the one for every mode (#233)**, handed over as the
+    /// focus model is: once at load for the mode the session opens in, and
+    /// again at each switch, with the background and the patience beside it.
+    /// A mode the table does not name takes `fill`; a table naming no mode
+    /// hands nothing over past `init.lua`'s one call, so the shipped
+    /// configuration says it once.
+    #[test]
+    fn each_mode_fits_a_resize_by_its_own_fill_or_the_one_for_every_mode() {
+        use crate::resizing::{BACKGROUND, Fill, Settings};
+        let last = |commands: Vec<Command>| {
+            commands
+                .into_iter()
+                .filter_map(|command| match command {
+                    Command::Resize(settings) => Some(settings),
+                    _ => None,
+                })
+                .next_back()
+        };
+        let fill = |fill: Fill| {
+            Some(Settings {
+                fill,
+                background: BACKGROUND,
+                ..Settings::default()
+            })
+        };
+        let patient = |fill: Fill| {
+            Some(Settings {
+                fill,
+                patience: std::time::Duration::from_millis(600),
+                ..Settings::default()
+            })
+        };
+        // At load (floating), then tiling, then scrolling.
+        for (resize, expected) in [
+            (
+                r#"{ fill = "crop", modes = { tiling = "stretch" } }"#,
+                [fill(Fill::Crop), fill(Fill::Stretch), fill(Fill::Crop)],
+            ),
+            (
+                r#"{ modes = { floating = "stretch", scrolling = "crop" } }"#,
+                [fill(Fill::Stretch), fill(Fill::Anchor), fill(Fill::Crop)],
+            ),
+            (
+                r#"{ background = "none", modes = { scrolling = "stretch" } }"#,
+                [
+                    Some(Settings {
+                        fill: Fill::Anchor,
+                        background: None,
+                        ..Settings::default()
+                    }),
+                    Some(Settings {
+                        fill: Fill::Anchor,
+                        background: None,
+                        ..Settings::default()
+                    }),
+                    Some(Settings {
+                        fill: Fill::Stretch,
+                        background: None,
+                        ..Settings::default()
+                    }),
+                ],
+            ),
+            (
+                r#"{ patience = 600, modes = { tiling = "stretch" } }"#,
+                [
+                    patient(Fill::Anchor),
+                    patient(Fill::Stretch),
+                    patient(Fill::Anchor),
+                ],
+            ),
+            ("{}", [fill(Fill::Anchor), None, None]),
+        ] {
+            let Some((directory, mut scripts)) = shipped_init_with_user(
+                "solium-script-test-resize-modes",
+                &format!("return {{ resize = {resize} }}"),
+            ) else {
+                return;
+            };
+            let handed = [
+                last(scripts.startup().commands),
+                last(scripts.key("super+t", empty_snapshot()).commands),
+                last(scripts.key("super+s", empty_snapshot()).commands),
+            ];
+            let _ = std::fs::remove_dir_all(&directory);
+            assert_eq!(
+                handed, expected,
+                "resize = {resize}: at load, then tiling, then scrolling"
+            );
         }
     }
 

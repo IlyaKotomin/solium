@@ -5527,17 +5527,22 @@ end)"#,
             assert!(!desk.state.holding_resize(desk.pane), "and nothing held");
         }
 
-        /// **A client slower than the glide is drawn stretched until it
-        /// answers**, at the rectangle the glide landed on: the hold an
-        /// edge drag keeps on a window until its client answers, kept from
-        /// the toggle. Without it, going in, the window was drawn 400x300 in
-        /// the monitor's corner from the moment it landed, and coming out,
-        /// 1920x1080 hanging off the monitor at 300,200. Answered, it is
-        /// drawn as it is and nothing holds it.
+        /// **A client slower than the glide is held at its new rectangle
+        /// until it answers**, at the rectangle the glide landed on: the
+        /// hold an edge drag keeps on a window until its client answers,
+        /// kept from the toggle. Without it, going in, the window was drawn
+        /// 400x300 in the monitor's corner from the moment it landed, and
+        /// coming out, 1920x1080 hanging off the monitor at 300,200.
+        /// Answered, it is drawn as it is and nothing holds it.
+        ///
+        /// Its picture meanwhile is fitted as `resize.fill` says, as every
+        /// glide's is since #233 -- stretched before that, whatever the
+        /// setting, which then spoke only of a drag. A fill that is not the
+        /// default, so that the default cannot pass for it.
         #[test]
-        fn a_slow_client_is_drawn_stretched_until_it_answers() {
+        fn a_slow_client_is_held_at_its_new_rectangle_until_it_answers() {
             let mut desk = Desk::new("slow", SCRIPT);
-            desk.state.resizing.fill = crate::resizing::Fill::Hold;
+            desk.state.resizing.fill = crate::resizing::Fill::Crop;
             for (size, to) in [((1920, 1080), screen()), ((400, 300), before())] {
                 assert!(desk.state.trigger("super+f"));
                 desk.pump();
@@ -5550,8 +5555,8 @@ end)"#,
                 );
                 assert_eq!(
                     desk.state.resize_fill(desk.pane),
-                    None,
-                    "stretched into it, whatever `resize.fill` says of a drag"
+                    crate::resizing::Fill::Crop,
+                    "fitted to it as `resize.fill` says"
                 );
                 desk.answer(size.0, size.1);
                 desk.frame_after(Duration::from_millis(16));
@@ -8262,6 +8267,309 @@ end)"#,
         }
     }
 
+    /// **#233: a glide that shrinks a window draws its client's answer at its
+    /// own size, against the edge the layout pins.**
+    ///
+    /// A full-width window shrunk to the right half -- its left edge moves,
+    /// its right edge stays -- whose client answers with the half straight
+    /// away, which a terminal does within a frame or two of a 240 ms glide.
+    /// Before #233 the rest of the glide stretched that answer across the
+    /// rectangle the glide had reached, glyphs up to twice as wide: no hold
+    /// meant no `resize.fill`, and no fill meant a stretch. Now every pane is
+    /// fitted by the configured fill, the default draws the answer 1:1, and
+    /// the glide's own two ends say which edge it stands against: the right,
+    /// so the gap is on the left, where the window is still on its way in.
+    #[test]
+    fn a_glide_that_shrinks_a_window_draws_its_answer_at_its_own_size() {
+        tiled_fixture!(display, state, conn, queue, client, qh);
+        let (window, surface, pane, tile) = filled_tile(
+            &mut display,
+            &mut state,
+            &conn,
+            &qh,
+            &mut queue,
+            &mut client,
+        );
+
+        let right = Rectangle::new(
+            (tile.loc.x + tile.size.w / 2, tile.loc.y).into(),
+            (tile.size.w / 2, tile.size.h).into(),
+        );
+        let start = state.clock.now();
+        glide(
+            &mut state,
+            &window,
+            right,
+            Duration::from_secs(10),
+            present::Curve::Linear,
+            start,
+        );
+        commit_buffer(&client, &qh, &surface, right.size.w, right.size.h);
+        pump(
+            &mut display,
+            &mut state,
+            &conn,
+            &qh,
+            &mut queue,
+            &mut client,
+        );
+        let committed = window.geometry().size;
+        assert_eq!(
+            committed, right.size,
+            "the premise: the client has answered"
+        );
+        assert_eq!(
+            state.resize_pins(pane),
+            (true, false),
+            "the glide moves the left edge and not the right"
+        );
+
+        let outer = state.pane_outer_of(pane).expect("the pane is here");
+        let held = state.panes.get(pane).expect("the pane is here");
+        let frame = state.drawn_at(held, outer, start + Duration::from_secs(5));
+        let drawn = crate::render::place_client(&state, held, &frame, outer.size, committed);
+        assert!(
+            drawn.client.size.w > f64::from(committed.w) + 1.0,
+            "half way, the glide is wider than the answer, or this proves nothing: {frame:?}"
+        );
+        assert_eq!(
+            drawn.fit.factor,
+            smithay::utils::Scale::from((1.0, 1.0)),
+            "the answer at its own size, not stretched across the glide"
+        );
+        assert_eq!(drawn.fit.crop, None, "and nothing of it to cut");
+        assert!(
+            (drawn.origin.x + f64::from(committed.w) - (drawn.client.loc.x + drawn.client.size.w))
+                .abs()
+                < 1e-9,
+            "against the right edge, which is standing still: {drawn:?}"
+        );
+    }
+
+    /// **#233: a glide that lands before its client answers keeps the
+    /// picture where it was, against the edge it pinned.**
+    ///
+    /// The full-width window shrunk to the right half again, by a 240 ms
+    /// glide, and a client slower than that: the glide lands with the old,
+    /// full-width picture still the only one. Through the glide it stood
+    /// against the right edge, cut on the left, where the window was moving.
+    /// The transform is retired the pass it lands, and with nothing left to
+    /// say which edge stood still the picture went back to the top-left: the
+    /// whole of the window's contents jumped by half a screen at the moment
+    /// the glide finished. It stays against that edge for
+    /// `resizing::PATIENCE` past the landing, as a drag's picture does past
+    /// the release, and then the client's own picture is drawn as it is.
+    #[test]
+    fn a_glide_that_lands_before_its_client_answers_keeps_its_picture_where_it_was() {
+        tiled_fixture!(display, state, conn, queue, client, qh);
+        let (window, _surface, pane, tile) = filled_tile(
+            &mut display,
+            &mut state,
+            &conn,
+            &qh,
+            &mut queue,
+            &mut client,
+        );
+
+        let right = Rectangle::new(
+            (tile.loc.x + tile.size.w / 2, tile.loc.y).into(),
+            (tile.size.w / 2, tile.size.h).into(),
+        );
+        let start = state.clock.now();
+        glide(
+            &mut state,
+            &window,
+            right,
+            Duration::from_millis(240),
+            present::Curve::Linear,
+            start,
+        );
+        let committed = window.geometry().size;
+        assert_eq!(
+            committed, tile.size,
+            "the premise: the client has not answered"
+        );
+
+        let anchored = |state: &Solium| {
+            let held = state.panes.get(pane).expect("the pane is here");
+            let outer = state.pane_outer(held);
+            let frame = state.drawn_at(held, outer, state.clock.now());
+            let drawn = crate::render::place_client(state, held, &frame, outer.size, committed);
+            (
+                drawn.origin.x + f64::from(committed.w)
+                    - (drawn.client.loc.x + drawn.client.size.w),
+                drawn.origin.x - drawn.client.loc.x,
+            )
+        };
+        state.clock.advance(Duration::from_millis(120));
+        assert!(
+            anchored(&state).0.abs() < 1e-9,
+            "half way, the old picture stands against the right edge"
+        );
+
+        state.clock.advance(Duration::from_millis(140));
+        state.settle(state.clock.now());
+        assert!(
+            state
+                .panes
+                .get(pane)
+                .and_then(crate::present::course)
+                .is_none(),
+            "the premise: the glide has landed and its transform is gone"
+        );
+        assert_eq!(
+            state.resize_pins(pane),
+            (true, false),
+            "landed, the edge the glide pinned is still the one standing still"
+        );
+        assert!(
+            anchored(&state).0.abs() < 1e-9,
+            "and the picture has not moved: {:?}",
+            anchored(&state)
+        );
+
+        state.clock.advance(crate::resizing::PATIENCE);
+        state.settle(state.clock.now());
+        assert_eq!(state.resize_pins(pane), (false, false));
+        assert!(
+            anchored(&state).1.abs() < 1e-9,
+            "once its patience is out, the client's picture is drawn from \
+             the corner, as a window at rest is: {:?}",
+            anchored(&state)
+        );
+    }
+
+    /// **#233: a longer `resize.patience` keeps a landed glide's picture
+    /// where it was for longer.** The glide above, landed with its client
+    /// silent, under 600 ms of patience: 400 ms past the landing -- past the
+    /// shipped quarter second -- the picture still stands against the edge
+    /// the glide pinned, and at 600 it goes to the corner.
+    #[test]
+    fn a_longer_patience_keeps_a_landed_glides_picture_where_it_was_for_longer() {
+        tiled_fixture!(display, state, conn, queue, client, qh);
+        let (window, _surface, pane, tile) = filled_tile(
+            &mut display,
+            &mut state,
+            &conn,
+            &qh,
+            &mut queue,
+            &mut client,
+        );
+        state.resizing.patience = Duration::from_millis(600);
+        let right = Rectangle::new(
+            (tile.loc.x + tile.size.w / 2, tile.loc.y).into(),
+            (tile.size.w / 2, tile.size.h).into(),
+        );
+        let start = state.clock.now();
+        glide(
+            &mut state,
+            &window,
+            right,
+            Duration::from_millis(240),
+            present::Curve::Linear,
+            start,
+        );
+        state.clock.advance(Duration::from_millis(260));
+        state.settle(state.clock.now());
+        assert!(
+            state
+                .panes
+                .get(pane)
+                .and_then(crate::present::course)
+                .is_none(),
+            "the premise: the glide has landed and its transform is gone"
+        );
+
+        state.clock.advance(Duration::from_millis(400));
+        assert_eq!(
+            state.resize_pins(pane),
+            (true, false),
+            "400 ms past the landing, within the 600 configured, the edge the \
+             glide pinned is still the one standing still"
+        );
+        state.clock.advance(Duration::from_millis(200));
+        assert_eq!(
+            state.resize_pins(pane),
+            (false, false),
+            "and at 600 the picture goes to the corner"
+        );
+    }
+
+    /// **#233: a landed glide keeps the frames coming until its patience
+    /// runs out.** `Solium::settle` says whether anything needs the next
+    /// frame. A glide that has landed with its client silent holds its
+    /// picture against the edge it pinned until `resize.patience` is out, and
+    /// it is the frame after that which moves it to the corner -- so until
+    /// then something does: before, nothing did, and the picture moved on
+    /// whatever frame something else happened to ask for. Once the patience
+    /// is out nothing is waiting, and a glide whose client already has the
+    /// size it lands on keeps nothing coming at all.
+    #[test]
+    fn a_landed_glide_keeps_the_frames_coming_until_its_patience_runs_out() {
+        tiled_fixture!(display, state, conn, queue, client, qh);
+        let (window, _surface, pane, tile) = filled_tile(
+            &mut display,
+            &mut state,
+            &conn,
+            &qh,
+            &mut queue,
+            &mut client,
+        );
+        let right = Rectangle::new(
+            (tile.loc.x + tile.size.w / 2, tile.loc.y).into(),
+            (tile.size.w / 2, tile.size.h).into(),
+        );
+        let start = state.clock.now();
+        glide(
+            &mut state,
+            &window,
+            right,
+            Duration::from_millis(240),
+            present::Curve::Linear,
+            start,
+        );
+        state.clock.advance(Duration::from_millis(260));
+        assert!(
+            state.settle(state.clock.now()),
+            "landed with its client silent, the frames keep coming"
+        );
+        assert!(
+            state
+                .panes
+                .get(pane)
+                .and_then(crate::present::course)
+                .is_none(),
+            "the premise: its transform is gone, so the transform is not what keeps them"
+        );
+        state.clock.advance(crate::resizing::PATIENCE);
+        assert!(
+            !state.settle(state.clock.now()),
+            "once its patience is out, nothing is waiting"
+        );
+
+        // Back to the whole tile, whose width the client has had committed
+        // all along: this glide lands on the size the client already has.
+        let start = state.clock.now();
+        glide(
+            &mut state,
+            &window,
+            tile,
+            Duration::from_millis(240),
+            present::Curve::Linear,
+            start,
+        );
+        assert_eq!(
+            state.resize_pins(pane),
+            (true, false),
+            "the premise: this glide pins an edge too"
+        );
+        state.clock.advance(Duration::from_millis(260));
+        assert!(
+            !state.settle(state.clock.now()),
+            "a client already at the size its glide landed on keeps nothing coming"
+        );
+    }
+
     /// **And a press on a gliding window lands on the pixel under it.**
     ///
     /// `surface_under` used to map a point through `to_window_space`,
@@ -9331,12 +9639,16 @@ end)"#,
             edge_at: (600.0, 450.0),
             edges: ResizeEdge::BottomRight,
         };
+        // A stretch, which is the fill whose picture and rectangle differ
+        // in scale and so the one a 1:1 mapping got wrong. Not the default
+        // since #233.
+        state.resizing.fill = crate::resizing::Fill::Stretch;
         state.begin_resize(&window);
         tiled_frame(&mut state, &request, pane, outer, Duration::ZERO);
         assert!(state.holding_resize(pane), "the drag is holding the pane");
         assert_eq!(
             state.resize_fill(pane),
-            Some(crate::resizing::Fill::Stretch),
+            crate::resizing::Fill::Stretch,
             "and stretching the last buffer into the dragged rectangle"
         );
 
@@ -9349,6 +9661,91 @@ end)"#,
             (within.x - 300.0).abs() < 0.5 && (within.y - 200.0).abs() < 0.5,
             "the picture has buffer pixel 300,200 there, and the client was \
              told {within:?}"
+        );
+    }
+
+    /// **#233: a press on what an anchored picture cuts away is not the
+    /// client's.**
+    ///
+    /// A window under a titlebar has its top edge dragged down by 100. Its
+    /// client has not answered, so under the default fill its 300-tall
+    /// picture stays against the bottom edge, which is standing still, and
+    /// the top 100 of it is cut away -- under the titlebar that came down
+    /// with the edge. The hit test inverted the fit without its cut, so a
+    /// point on the titlebar landed in that hidden band and the client was
+    /// handed the pointer over pixels it is not showing. Below the cut the
+    /// press still lands on the pixel the picture has there.
+    #[test]
+    fn a_press_on_what_an_anchored_picture_cuts_away_is_not_the_clients() {
+        tiled_fixture!(display, state, conn, queue, client, qh);
+        let (window, _toplevel, surface) =
+            open_surface(&mut display, &mut state, &conn, &client, &qh);
+        state.map_stacked(window.clone(), (400, 300), false);
+        state.sync_panes();
+        let pane = state.panes.id_of(&window).expect("the pane is here");
+        state
+            .panes
+            .get_mut(pane)
+            .expect("the pane is here")
+            .set_frame(crate::pane::Frame::Pending);
+        commit_buffer(&client, &qh, &surface, 400, 300);
+        pump(
+            &mut display,
+            &mut state,
+            &conn,
+            &qh,
+            &mut queue,
+            &mut client,
+        );
+        state.clock.advance(Duration::from_secs(1));
+        a_frame(&mut state);
+        let toplevel = window
+            .toplevel()
+            .map(|toplevel| toplevel.wl_surface().clone());
+
+        let outer = at(400, 400 - TITLEBAR_HEIGHT, 400, 200 + TITLEBAR_HEIGHT);
+        let request = ResizeRequest {
+            window: window.clone(),
+            wanted: outer,
+            edge_at: (500.0, f64::from(400 - TITLEBAR_HEIGHT)),
+            edges: ResizeEdge::Top,
+        };
+        state.begin_resize(&window);
+        let now = state.clock.now();
+        tiled_frame(&mut state, &request, pane, outer, now);
+        assert_eq!(
+            state.resize_fill(pane),
+            crate::resizing::Fill::Anchor,
+            "the default fill"
+        );
+        assert_eq!(
+            state.resize_pins(pane),
+            (false, true),
+            "the top edge moves and the bottom stands still"
+        );
+
+        let titlebar: Point<f64, Logical> = (450.0, f64::from(400 - TITLEBAR_HEIGHT / 2)).into();
+        assert!(
+            state.drawn(pane, outer).covers(titlebar),
+            "the point is on the window's titlebar"
+        );
+        assert_ne!(
+            state.surface_under(titlebar).map(|(surface, _)| surface),
+            toplevel,
+            "the band of the picture under the titlebar is cut away, and a \
+             press there is not the client's"
+        );
+
+        let point: Point<f64, Logical> = (450.0, 450.0).into();
+        let (under, origin) = state
+            .surface_under(point)
+            .expect("the window is under the point");
+        assert_eq!(Some(under), toplevel);
+        let within = point - origin;
+        assert!(
+            (within.x - 50.0).abs() < 0.5 && (within.y - 150.0).abs() < 0.5,
+            "50 below the cut is buffer row 150 of the picture held against \
+             the bottom edge, and the client was told {within:?}"
         );
     }
 
@@ -9742,12 +10139,15 @@ end)"#,
             edge_at: (700.0, 500.0),
             edges: ResizeEdge::Right,
         };
+        // A configured stretch, which is the fill a refusal takes away; the
+        // default since #233 has no stretch to take.
+        state.resizing.fill = crate::resizing::Fill::Stretch;
         state.begin_resize(&window);
         let outer = at(400, 300, 300, 200);
         tiled_frame(&mut state, &request, pane, outer, Duration::ZERO);
         assert_eq!(
             state.resize_fill(pane),
-            Some(crate::resizing::Fill::Stretch),
+            crate::resizing::Fill::Stretch,
             "nothing has been refused yet, so the configured fill stands"
         );
 
@@ -9773,7 +10173,7 @@ end)"#,
         tiled_frame(&mut state, &request, pane, outer, Duration::from_millis(16));
         assert_eq!(
             state.resize_fill(pane),
-            Some(crate::resizing::Fill::Hold),
+            crate::resizing::Fill::Anchor,
             "a refusal overrides the configured fill. A stretch towards a \
              size the client has walked away from never returns to 1, so \
              the window stays soft until something else resizes it"
@@ -10429,13 +10829,14 @@ end)"#,
     /// the difference, so kitty never got the fill the user configured.**
     ///
     /// `Hold::note` records a decline for any answer that is not exactly
-    /// the ask, and `fill` forced `Fill::Hold` for the rest of the gesture
+    /// the ask, and `fill` forced `Fill::Hold` (`Fill::Anchor` since #233)
+    /// for the rest of the gesture
     /// on the strength of it. A terminal answers with a whole number of
     /// character cells and so is a few pixels out on its very first answer
     /// and every one after it — which makes kitty, the ordinary tiled
     /// client, `declined` from the first frame of every seam drag.
-    /// `Fill::Hold` deliberately leaves an uncovered strip while a pane
-    /// grows, so what the user saw in place of their `stretch` was a band
+    /// `Fill::Hold` deliberately left an uncovered strip while a pane
+    /// grew, so what the user saw in place of their `stretch` was a band
     /// of background: a different wrong-looking frame rather than none, on
     /// the drag whose symptom is "frames with the wrong size".
     ///
@@ -10467,6 +10868,8 @@ end)"#,
             edge_at: (700.0, 500.0),
             edges: ResizeEdge::Right,
         };
+        // The user's stretch, which is what a rounding must not take away.
+        state.resizing.fill = crate::resizing::Fill::Stretch;
         state.begin_resize(&window);
         let outer = at(400, 300, 300, 200);
         tiled_frame(&mut state, &request, pane, outer, Duration::ZERO);
@@ -10492,7 +10895,7 @@ end)"#,
         tiled_frame(&mut state, &request, pane, outer, Duration::from_millis(16));
         assert_eq!(
             state.resize_fill(pane),
-            Some(crate::resizing::Fill::Stretch),
+            crate::resizing::Fill::Stretch,
             "six pixels on a three-hundred pixel pane is a rounding, and \
              the user's configured fill stands. Calling it a refusal costs \
              the stretch on every terminal drag there will ever be"
@@ -10512,7 +10915,7 @@ end)"#,
         tiled_frame(&mut state, &request, pane, outer, Duration::from_millis(32));
         assert_eq!(
             state.resize_fill(pane),
-            Some(crate::resizing::Fill::Hold),
+            crate::resizing::Fill::Anchor,
             "a client that has walked away from the ask still loses the \
              stretch: it will never bring the factor back to 1, and a \
              window that never un-stretches is the trap this module is \
@@ -10946,7 +11349,7 @@ end)"#,
 
         assert_eq!(
             state.resize_pins(pane),
-            Some((true, false)),
+            (true, false),
             "the left edge is the one that moved and the right one is \
              standing still, so a held picture has to stay against the \
              right. Measured from the client's committed 64x64 instead, \
@@ -17275,6 +17678,112 @@ end)
             }
         }
 
+        /// **#233: a neighbour growing into a closed window's tile keeps its
+        /// picture against the edge that does not move.**
+        ///
+        /// Since #128 the layout gives a closed window's tile back the
+        /// moment the close is asked for: the neighbour glides into it while
+        /// the closed window fades in place, in front of it. In tiling the
+        /// window closed is the left of two, so its neighbour grows to the
+        /// left -- its left edge moves, its right edge stands still -- and its
+        /// client has not drawn at the new size yet. Before #233 its
+        /// half-width picture was stretched across the rectangle the glide
+        /// had reached, its text up to twice as wide behind the fade. Under
+        /// the default fill the old picture is drawn at its own size against
+        /// the right edge, and the strip the neighbour has grown into is
+        /// `resize.background`'s, behind the fading window; once the client
+        /// answers, its new, wider picture stands against that edge too, cut
+        /// on the left until the glide gets there, so the neighbour's contents
+        /// do not move at all. `crop` keeps the picture at the rectangle's
+        /// left, going with the moving edge instead.
+        #[test]
+        fn a_neighbour_growing_into_a_closed_windows_tile_keeps_its_picture_against_its_far_edge() {
+            let mut desk = Desk::new();
+            let (dying, others) = closing_scene(&mut desk, "tiling");
+            for opened in others.iter().chain([&dying]) {
+                desk.answer(opened);
+            }
+            desk.state.clock.advance(Duration::from_secs(1));
+            let now = desk.state.clock.now();
+            desk.state.settle(now);
+            let survivor = close_and_see_who_moved(&mut desk, "tiling", &dying, &others);
+            let pane = survivor.pane;
+            let start = desk.state.clock.now();
+            assert!(
+                above(&mut desk.state, dying.pane, pane),
+                "the premise: the closed window fades in front of the neighbour"
+            );
+            assert_eq!(
+                desk.state.resize_pins(pane),
+                (true, false),
+                "the neighbour grows to the left: its left edge moves and its right \
+                 edge stands still"
+            );
+
+            // The neighbour's client picture at `at`, as `render::elements`
+            // places it, and the size it is placed from.
+            let placed = |state: &Solium, at: Duration| {
+                let held = state.panes.get(pane).expect("the pane is here");
+                let committed = held
+                    .client()
+                    .map(|window| window.geometry().size)
+                    .expect("the pane has its client");
+                let outer = state.pane_outer(held);
+                let frame = state.drawn_at(held, outer, at);
+                (
+                    committed,
+                    crate::render::place_client(state, held, &frame, outer.size, committed),
+                )
+            };
+            // How far the picture's right edge is from the rectangle's.
+            let off_the_right = |placed: &crate::render::Placed, committed: Size<i32, Logical>| {
+                placed.origin.x + f64::from(committed.w) * placed.fit.factor.x
+                    - (placed.client.loc.x + placed.client.size.w)
+            };
+
+            let half_way = start + Duration::from_millis(120);
+            let (committed, old) = placed(&desk.state, half_way);
+            assert!(
+                old.client.size.w > f64::from(committed.w) + 1.0,
+                "the glide has grown past the old picture, or this proves nothing: {old:?}"
+            );
+            assert_eq!(
+                old.fit.factor,
+                smithay::utils::Scale::from((1.0, 1.0)),
+                "the old picture at its own size, not stretched across the glide"
+            );
+            assert!(
+                off_the_right(&old, committed).abs() < 1e-9,
+                "and against the right edge, which is standing still: {old:?}"
+            );
+            let strips = crate::render::uncovered(old.client, old.origin, committed.to_f64(), 1.0);
+            assert!(
+                strips[2].size.w > 0 && strips[3].size.w == 0,
+                "the background is the strip it has grown into, on the left: {strips:?}"
+            );
+
+            desk.state.resizing.fill = crate::resizing::Fill::Crop;
+            let (_, cropped) = placed(&desk.state, half_way);
+            assert!(
+                (cropped.origin.x - cropped.client.loc.x).abs() < 1e-9,
+                "`crop` keeps the picture at the left edge, which is moving: {cropped:?}"
+            );
+            desk.state.resizing.fill = crate::resizing::Fill::Anchor;
+
+            desk.answer(survivor);
+            let (answered, new) = placed(&desk.state, half_way + Duration::from_millis(20));
+            assert!(
+                f64::from(answered.w) > new.client.size.w + 1.0,
+                "the premise: the client answered wider than the glide has reached: {new:?}"
+            );
+            assert_eq!(new.fit.factor, smithay::utils::Scale::from((1.0, 1.0)));
+            assert_eq!(new.fit.crop, Some(new.client), "cut to the rectangle");
+            assert!(
+                off_the_right(&new, answered).abs() < 1e-9,
+                "the answer against the right edge too, cut on the left: {new:?}"
+            );
+        }
+
         /// **A refused window fades back in front of the neighbour giving
         /// its space back.**
         ///
@@ -18258,6 +18767,12 @@ end)
         #[test]
         fn a_menu_past_the_tile_of_a_window_fading_out_is_the_windows_while_it_shows() {
             let mut desk = Desk::new();
+            // The neighbour's picture stretched over all of the space it is
+            // growing into, so that a press there has a client to land on
+            // once the menu has gone. Under the default since #233 its
+            // picture has not reached the point yet; that is asserted at the
+            // end.
+            desk.state.resizing.fill = crate::resizing::Fill::Stretch;
             let (dying, survivor, tile) = an_oversized_window_beside_another(&mut desk, "");
             let anchor = (tile.size.w - 20, 50);
             let _menu = drawn_popup(
@@ -18352,6 +18867,16 @@ end)
                 Some(neighbour),
                 "once the window is invisible its menu has no pixel, and the neighbour \
                  has the press"
+            );
+            // Under the default the neighbour's picture is still at its own
+            // size against its right edge, which is standing still, and the
+            // point is in the background it is growing over (#233): no
+            // client's pixel, so no client has the press.
+            desk.state.resizing.fill = crate::resizing::Fill::Anchor;
+            assert_eq!(
+                desk.state.surface_under(point).map(|(surface, _)| surface),
+                None,
+                "a press on the background a picture does not cover reached a client"
             );
         }
 

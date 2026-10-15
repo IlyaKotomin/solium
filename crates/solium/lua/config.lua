@@ -1047,35 +1047,79 @@ local defaults = {
         quiet_ms = 300,
     },
 
-    -- What a window looks like while you are dragging its edge.
+    -- What a window looks like while it is changing size: while you drag
+    -- its edge or a seam, while a layout glides it to a new tile, and while
+    -- it glides into or out of fullscreen or maximised.
     --
     -- A client cannot be resized; it can only be *asked*, and it answers when
     -- it gets round to it -- a few milliseconds for a terminal, rather more
-    -- for a browser. The compositor no longer waits for that answer: the
-    -- rectangle you are dragging is what it draws, from the first frame, and
-    -- the client's last picture fills it until the real one arrives. This
-    -- decides what that filling looks like, which is entirely taste.
+    -- for a browser. The compositor does not wait for that answer: the
+    -- rectangle you are dragging, or the glide has reached, is what it draws,
+    -- from the first frame, and the client's picture -- the old one, or its
+    -- answer while the glide is still on its way -- goes into it until the
+    -- two agree. This decides how, which is entirely taste.
     resize = {
-        -- "stretch" scales the last picture into the new rectangle. Smooth,
-        -- momentarily soft while a slow client catches up, and what most
-        -- compositors do. The default.
+        -- "anchor", the default: the picture at its own size, never scaled,
+        -- against the edges that are not moving -- the right edge of a window
+        -- you shrink from the left, the top-left when every edge moves. What
+        -- is larger than the window is cut off on the moving side, and what
+        -- it does not cover is `background` below. Text keeps its size on
+        -- every frame.
         --
-        -- "hold" leaves the picture at its own size where there is room for
-        -- it, so nothing is resampled and what you see uncovered as the window
-        -- grows is the pane underneath. Crisp instead of smooth. A window
-        -- being made *smaller* is still scaled down, because a picture larger
-        -- than the window it is in would spill over its neighbour.
+        -- "crop": the same, but always from the window's top-left corner,
+        -- whichever edge moves -- so the left of a left-aligned page, a
+        -- prompt or a gutter, moves with a left edge you drag, and what is
+        -- cut off or uncovered is on the right or the bottom.
+        --
+        -- "stretch": the picture scaled to fill the window, each way on its
+        -- own. Nothing is ever uncovered, but text is drawn wider or taller
+        -- than the application drew it until it catches up -- nearly twice
+        -- as wide on a glide that halves a terminal. What most compositors
+        -- do, and what Solium did before #233.
         --
         -- "scene" draws the window's QML scene over it -- the same one a
         -- window wears before its application has painted. Today that only
         -- reaches a window resized before its application ever arrived;
-        -- anywhere else it behaves as "hold".
+        -- anywhere else it behaves as "anchor".
         --
         -- Whatever this says, a client that *refuses* the size it is offered
-        -- -- Firefox will not go under its minimum width -- stops being
-        -- stretched the moment it says so, and the window takes the size the
-        -- client chose when you let go of the edge.
-        fill = "stretch",
+        -- -- Firefox will not go under its minimum width -- is never
+        -- stretched once it has said so, and the window takes the size the
+        -- client chose when you let go of the edge. Anything else is named in
+        -- the log and the default kept.
+        fill = "anchor",
+
+        -- What shows in the part of a window its picture does not cover
+        -- under "anchor", "crop" or "scene": "#rrggbb", or "#rrggbbaa" with
+        -- an alpha. The default is the theme's darkest grey, so the gap reads
+        -- as part of the window. "none" draws nothing there, so what is
+        -- behind the window -- or a style's own `behind` layer -- shows.
+        -- Anything else is named in the log and the default kept.
+        background = "#1c1c1c",
+
+        -- How long, in milliseconds, a window's picture waits at the
+        -- rectangle a change gave it for its application to draw at that
+        -- size, once the change is over: after you let go of an edge, after
+        -- a fullscreen or maximise glide lands, and after a layout's glide
+        -- lands -- when the picture stays against the edges the glide did not
+        -- move. Then the window is shown at the size the application has. 0
+        -- (do not wait) to 5000; anything else is named in the log and the
+        -- default kept.
+        -- `a_longer_patience_keeps_a_landed_glides_picture_where_it_was_for_longer`.
+        patience = 250,
+
+        -- A fill of its own for a mode (the names `modes.register` uses),
+        -- for every size change made while that mode is in charge: its
+        -- drags, its glides, and a fullscreen glide begun in it. A mode with
+        -- no entry takes `fill` above. Handed over whenever the mode
+        -- changes, as `focus.modes` is:
+        --
+        --     resize = { modes = { scrolling = "stretch" } },
+        --
+        -- An entry that is not a fill is named in the log and "anchor"
+        -- kept, as `fill`'s is.
+        -- `each_mode_fits_a_resize_by_its_own_fill_or_the_one_for_every_mode`.
+        modes = {},
     },
 
     -- A fullscreen window: what it covers, and how a window goes fullscreen
@@ -1101,17 +1145,18 @@ local defaults = {
         -- it was: from wherever it is drawn, as a window a layout moves
         -- glides, so pressing the key again half way turns it round where it
         -- is. The application is told its new size the moment the key is
-        -- pressed, and its last picture is stretched until it has drawn one
-        -- at that size: through the glide and after it, for a quarter of a
-        -- second past the landing at most, and then the window is shown at
-        -- the size the application has. Once it has answered the window is
-        -- drawn as it is, with nothing in between, so a game or a video can
-        -- be shown directly.
+        -- pressed, and its last picture goes into the new rectangle as
+        -- `resize.fill` above says until it has drawn one at that size:
+        -- through the glide and after it, for a quarter of a second past the
+        -- landing at most, and then the window is shown at the size the
+        -- application has. Once it has answered the window is drawn as it
+        -- is, with nothing in between, so a game or a video can be shown
+        -- directly.
         --
         -- `duration` is in milliseconds and `easing` is a curve, by name or
         -- as four numbers, as for every `motion` here (docs/animation.md).
-        -- `false` makes every change instant -- nothing is moved or
-        -- stretched, and the window is drawn as it is on the next frame --
+        -- `false` makes every change instant -- nothing is moved or held,
+        -- and the window is drawn as it is on the next frame --
         -- and `true` is the motion below again:
         --
         --     fullscreen = { animate = false },
@@ -1591,9 +1636,11 @@ local open_sections = {
     focus = { click = true, follow = true },
     -- Mode names are open-ended, the same as a key combination: a mode
     -- outside this file can register any name with `modes.register` and
-    -- give `focus.modes` and `focus.after_close` entries of its own.
+    -- give `focus.modes`, `focus.after_close` and `resize.modes` entries of
+    -- its own.
     ["focus.modes"] = true,
     ["focus.after_close"] = true,
+    ["resize.modes"] = true,
     -- `true` rather than a set of names: everything is accepted.
     bindings = true,
 }
@@ -1760,10 +1807,10 @@ end
 --   * `keyboard`, `cursor` and `bindings` are the sections above; the first
 --     two are checked against a list this file restates, the other two
 --     against nothing: `bindings` because any key combination is one, and
---     `focus.modes` and `focus.after_close` because mode names are
---     open-ended the same way (a mode outside this file can register any
---     name). `focus.modes.folating` merges in silently, exactly like a
---     misspelled binding.
+--     `focus.modes`, `focus.after_close` and `resize.modes` because mode
+--     names are open-ended the same way (a mode outside this file can
+--     register any name). `focus.modes.folating` merges in silently, exactly
+--     like a misspelled binding.
 --   * A value of the wrong *type* is not this check's business. `gap = "12"`
 --     is a recognised key and passes.
 for _, entry in ipairs(unrecognised) do

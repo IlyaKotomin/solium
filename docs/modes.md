@@ -931,10 +931,11 @@ the compositor's, whatever the listener says:
   glide lands
   (`state::tests::real_client::fullscreen_glides::the_client_is_told_its_new_size_on_the_toggle`),
   and the window is held at its new rectangle until the application draws at
-  that size, as a window whose edge you drag is: its last picture is stretched
-  into the rectangle the glide has reached, and after the glide lands, into the
-  rectangle it landed on
-  (`state::tests::real_client::fullscreen_glides::a_slow_client_is_drawn_stretched_until_it_answers`).
+  that size, as a window whose edge you drag is: its last picture goes into the
+  rectangle the glide has reached, and after the glide lands, into the
+  rectangle it landed on, as `resize.fill` says -- by default at its own size,
+  the rest of the rectangle `resize.background`
+  (`state::tests::real_client::fullscreen_glides::a_slow_client_is_held_at_its_new_rectangle_until_it_answers`).
   An application that says nothing is held a quarter of a second past the
   landing, and then shown at the size it has
   (`state::tests::real_client::fullscreen_glides::a_client_that_never_answers_is_drawn_as_it_is_once_its_patience_runs_out`);

@@ -134,6 +134,29 @@ local function apply_focus_mode(name)
     })
 end
 
+-- How a window's picture is fitted while it changes size in mode `name`
+-- (#233): your `config.resize.modes[name]`, or `config.resize.fill`, the one
+-- for every mode. `init.lua` hands `config.resize` over before any mode is
+-- known, which is all a configuration with no `resize.modes` entry needs, so
+-- nothing is handed over again for one; with an entry, the mode's own fill
+-- goes over with the background and the patience -- each call sets every key
+-- -- whenever the mode changes, and once below at this file's top level, for
+-- the reason `apply_focus_mode` gives.
+-- `each_mode_fits_a_resize_by_its_own_fill_or_the_one_for_every_mode`.
+local function apply_resize_mode(name)
+    local resize = config.resize
+    if type(resize) ~= "table" or type(resize.modes) ~= "table"
+        or next(resize.modes) == nil then
+        return
+    end
+    local own = resize.modes[name]
+    sol.resize({
+        fill = own ~= nil and own or resize.fill,
+        background = resize.background,
+        patience = resize.patience,
+    })
+end
+
 function modes.use(name)
     if kept.current == name then
         name = "floating"
@@ -165,6 +188,7 @@ function modes.use(name)
     end
     kept.current = name
     apply_focus_mode(name)
+    apply_resize_mode(name)
     local layout = modes.registered[name]
     if layout then
         layout.active = true
@@ -183,8 +207,9 @@ function modes.use(name)
 end
 
 -- The model for whatever mode this Lua state opens already in -- "floating"
--- at a fresh start, or the one a reload carried over.
+-- at a fresh start, or the one a reload carried over -- and its fill.
 apply_focus_mode(kept.current)
+apply_resize_mode(kept.current)
 
 -- Put the session back into the layout it was already in.
 --
