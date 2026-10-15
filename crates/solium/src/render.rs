@@ -273,8 +273,10 @@ pub(crate) struct Prepared {
     pub(crate) slots: crate::effect::plan::Slots,
     /// The first frame's gate holds this pass ([`hold_first_frame`]):
     /// [`elements`] draws only the clear colour, on every monitor and in
-    /// every screencopy.
-    /// `state::tests::real_client::a_held_first_frame_asks_for_the_next_pass`.
+    /// every screencopy. No unit test reaches `prepare` or `elements`:
+    /// `dev/effects-check.sh xray`'s `xray-first-on`, under
+    /// `SOLIUM_WARM_INJECT=3`, finds its first three frames only the clear
+    /// colour and the fourth drawn, the plate's backdrop already blurred.
     pub(crate) held: bool,
 }
 
@@ -4026,8 +4028,10 @@ pub(crate) fn elements(
     // out here and want completely different fixes.
     let _elements = crate::pacing::span(crate::pacing::Phase::Elements);
     // The first frame's gate holds: the frame is the clear colour, as a
-    // monitor with nothing on it is today, until what it shows is ready
-    // (`state::tests::real_client::a_held_first_frame_asks_for_the_next_pass`).
+    // monitor with nothing on it is today, until what it shows is ready.
+    // No unit test reaches this: `dev/effects-check.sh xray`'s
+    // `xray-first-on`, under `SOLIUM_WARM_INJECT=3`, finds its first three
+    // frames only the clear colour, and fails with this return removed.
     if prepared.held {
         return Vec::new();
     }

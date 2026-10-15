@@ -283,6 +283,12 @@ SOLIUM_XRAY_REBUILD=always
     again, as if what is behind the windows changed each time. The control
     of the `xray_builds` and `memo_runs` counts. For measuring on one build.
 
+SOLIUM_WARM_INJECT=<passes>
+    Hold the first desktop frame (`startup.first_frame`) for this many passes
+    as if what it waits for were not ready, at most its `max_ms`, so a check
+    sees the gate draw only the clear colour and then let go. The control of
+    `dev/effects-check.sh xray`'s first frames.
+
 SOLIUM_GEOMETRY_ORACLE=<effect>
     Debug builds only: the name of a geometry effect, `genie`, whose grid
     is built by Solium's Rust genie instead of its folder's `mesh`, for

@@ -278,6 +278,43 @@ fn sol_startup_configures_the_gate_and_a_refusal_keeps_what_ran() {
     assert!(said(&state).is_empty(), "{:?}", said(&state));
 }
 
+/// **An injected wait holds the first frame for its passes**
+/// (`SOLIUM_WARM_INJECT`, the control of `dev/effects-check.sh xray`'s
+/// first frames): with nothing pending the effects are ready, yet the first
+/// frame is not for the first passes injected, each held by
+/// `render::hold_first_frame` as `prepare` asks it, and is ready from then
+/// on, released as ready, not at the cap. With none injected, the first
+/// pass draws (spec §8.4).
+#[test]
+fn an_injected_wait_holds_the_first_frame_for_its_passes() {
+    let display = smithay::reexports::wayland_server::Display::<Solium>::new()
+        .expect("creating a test wayland display");
+    let mut state = Solium::new(display.handle());
+    assert!(state.effects_ready(), "the premise: nothing pending");
+    state.warm.inject(2);
+    for pass in 0..2 {
+        assert!(
+            !state.first_frame_ready(),
+            "pass {pass}: ready while injected"
+        );
+        assert!(
+            crate::render::hold_first_frame(&mut state),
+            "pass {pass}: not held"
+        );
+    }
+    assert!(state.first_frame_ready(), "not ready after its passes");
+    assert!(
+        !crate::render::hold_first_frame(&mut state),
+        "held past its injected passes"
+    );
+    assert!(!state.warm.capped(), "released at the cap, not as ready");
+    let mut plain = Solium::new(display.handle());
+    assert!(
+        !crate::render::hold_first_frame(&mut plain),
+        "held with nothing injected and nothing pending"
+    );
+}
+
 /// **A reload arms the first frame's gate again only with `on_reload`**:
 /// released at its first ready pass, a reload with `on_reload = false`
 /// draws at once, and one with `on_reload = true` holds until ready, the

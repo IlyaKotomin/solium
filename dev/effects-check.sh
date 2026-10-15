@@ -41,7 +41,8 @@
 #             once at rest, and on every pass with SOLIUM_XRAY_REBUILD=always;
 #             a moving wallpaper rendered once a pass with the rule as
 #             without it, at effects.xray.scale 0.5 too; and a plate there
-#             from the start, its backdrop blurred in the first frame drawn
+#             from the start, its backdrop blurred in the first frame drawn,
+#             after three held to the clear colour by SOLIUM_WARM_INJECT=3
 #
 # The player is ffplay's testsrc2, or a kitty printing the time when ffplay is
 # missing.
@@ -429,7 +430,8 @@ section_genie() {
 #       with the rule, as without it, and at effects.xray.scale 0.5 too,
 #       where a still one is still built once. And a plate there from the
 #       start, its backdrop already blurred in the first frame drawn (spec
-#       C14: nothing pops in after it).
+#       C14: nothing pops in after it), the first frame's gate held three
+#       passes by SOLIUM_WARM_INJECT=3, which draw only the clear colour.
 section_xray() {
     local name
     for name in xray-off xray-on xray-always xray-anim-off xray-anim-on xray-half xray-half-anim; do
@@ -516,26 +518,41 @@ section_xray() {
         fail "xray: at effects.xray.scale 0.5 nothing blurred behind the terminal ($sharp -> $soft)"
     fi
 
-    # The first frame drawn: a plate on `top` from the start, and the first
-    # four frames drawn captured; the first that is not only the clear colour
-    # (one the warm-up gate held) has the plate's backdrop blurred already.
+    # The first frames drawn, a plate on `top` from the start, every frame
+    # captured from the first, one a pass (SOLIUM_CAPTURE_INTERVAL=0). With
+    # nothing held (`-off`, no rule) the first is drawn. With the blur behind
+    # the plate, nested every pass is ready at once, so SOLIUM_WARM_INJECT=3
+    # (the control, Ruling F50) holds the first frame's gate three passes as
+    # if it were not: those three frames are only the clear colour, prepare
+    # setting `Prepared.held` and `elements` drawing nothing for it, and the
+    # fourth, the first drawn, has the plate's backdrop blurred already.
     for name in xray-first-off xray-first-on; do
         local extra=(VEIL=1)
-        [[ "$name" = xray-first-on ]] && extra+=(BLUR=1)
+        [[ "$name" = xray-first-on ]] && extra+=(BLUR=1 SOLIUM_WARM_INJECT=3)
         SECTION_EFFECTS="$root/crates/solium/effects/blur" SECTION_QML="$here/checker.qml $here/veil.qml" \
             run_scene "$name" xray.lua "${extra[@]}" \
-            SOLIUM_CAPTURE_AT=0 SOLIUM_CAPTURE_FRAMES=4 SOLIUM_CAPTURE_INTERVAL=1 || return
+            SOLIUM_CAPTURE_AT=0 SOLIUM_CAPTURE_FRAMES=5 SOLIUM_CAPTURE_INTERVAL=0 || return
         player effects-check-player
-        wait_frames 4 || return
+        wait_frames 5 || return
         stop
     done
     local first_off first_on
     first_off="$(judge first_lit "$out/xray-first-off")"
     first_on="$(judge first_lit "$out/xray-first-on")"
     if [[ -z "$first_off" || -z "$first_on" ]]; then
-        fail "xray: no frame of the first four drawn showed anything (off: '$first_off', on: '$first_on')"
+        fail "xray: no frame of the first five drawn showed anything (off: '$first_off', on: '$first_on')"
         return
     fi
+    for each in "$first_off" "$first_on"; do
+        [[ "$(judge size "$each")" = "1600 900" ]] \
+            || { fail "xray: $each is $(judge size "$each"), not 1600x900, so nothing here can be judged"; return; }
+    done
+    [[ "$(basename "$first_off")" = f-000 ]] \
+        && pass "xray: with nothing to wait for, the first frame drawn is the desktop" \
+        || fail "xray: with nothing to wait for, the first frame drawn is not the desktop (first lit: $(basename "$first_off"))"
+    [[ "$(basename "$first_on")" = f-003 ]] \
+        && pass "xray: SOLIUM_WARM_INJECT=3 held three frames to the clear colour and drew the fourth" \
+        || fail "xray: under SOLIUM_WARM_INJECT=3 the first frame drawn is $(basename "$first_on"), not f-003"
     sharp="$(judge sharpness "$first_off" 100px 460px 700px 340px)"
     soft="$(judge sharpness "$first_on" 100px 460px 700px 340px)"
     if (( soft * 2 < sharp )); then

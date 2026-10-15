@@ -256,6 +256,7 @@ reads one that file does not list.
 | `SOLIUM_FENCE_WAIT=off` | A window capture drops its fence instead of waiting for it on the CPU. The default waits, and each session's log says which it ran with. | |
 | `SOLIUM_RECAPTURE=always` | Draw every window capture (a warp's, a rounded client's, a self effect's part) on every pass, as before captures were kept until what they show changes, so every self effect's chain runs every pass too. For an A/B on one build, and the control of `dev/pacing-nested.sh`'s capture count. | |
 | `SOLIUM_XRAY_REBUILD=always` | Draw every wanted xray cut (the sharp picture of the layers behind the windows that T2 effects read) on every pass, and run every memo over it again, as if what is behind the windows changed each time. The control of the `xray_builds` and `memo_runs` counts. | |
+| `SOLIUM_WARM_INJECT=<passes>` | Hold the first desktop frame (`startup.first_frame`) for this many passes as if what it waits for were not ready, at most its `max_ms`: the frames drawn meanwhile are only the clear colour. Nested every pass is ready at once, so this is the control that shows the gate hold and let go (`dev/effects-check.sh xray`). | |
 | `SOLIUM_PACING` | Say where a pass's time went, on passes that overran the tightest monitor's frame; with it, GPU time, clocks and late flips. Misses are counted without it. | |
 | `SOLIUM_TRACE=<path>` | One JSON line per pass and per flip, and `SOLIUM_PACING` on. See *Measuring frame pacing on a TTY*. | |
 | `SOLIUM_QML=<mode>` | `auto`, `gpu` or `software`; see *QML on the GPU*. | |
@@ -600,13 +601,18 @@ the rule as without it: the `scenes` phase renders it at the size `elements`
 asks for. `XRAY_SCALE=0.5` sets `effects.xray.scale`: there too a moving
 wallpaper renders once a pass and a still one is built once, since a cut
 draws a scene from the picture the frame draws, scaled down. Last, a dark
-plate on `top` (`VEIL=1`) from the start with the blur behind it: the first
-frame drawn that is not only the clear colour (`judge.py first_lit`) must
-already have the plate's backdrop blurred, as nothing may pop in after it.
-Its fail-firsts: the plain run judged against itself (nothing blurred), and
-a build whose xray asked a scene for the cut's own size, which renders a
-moving wallpaper up to three times a pass and builds a still one's cut on
-every pass.
+plate on `top` (`VEIL=1`) from the start, every frame captured from the
+first, one a pass (`SOLIUM_CAPTURE_INTERVAL=0`): with no rule the first
+frame is the desktop, and with the blur behind the plate and
+`SOLIUM_WARM_INJECT=3`, the gate's control (nested, every pass is ready at
+once), the first three frames are only the clear colour and the fourth, the
+first drawn (`judge.py first_lit`), already has the plate's backdrop
+blurred, as nothing may pop in after it. Its fail-firsts: the plain run
+judged against itself (nothing blurred); a build whose xray asked a scene
+for the cut's own size, which renders a moving wallpaper up to three times
+a pass and builds a still one's cut on every pass; and a build whose
+`elements` ignores `Prepared.held`, or whose `prepare` never sets it, whose
+first frame under the control is drawn at once.
 
 `clipboard-check.sh` runs its X11 half in a container, so the host needs no
 `xclip`. **Run it more than once.** The bug it was

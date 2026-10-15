@@ -127,7 +127,8 @@ pub(crate) fn startup(options: &mlua::Table) -> mlua::Result<Result<FirstFrame, 
 }
 
 /// When the hold began, how many passes it has held, whether it is over for
-/// good, and whether the cap ended it.
+/// good, whether the cap ended it, and how many passes the dev control
+/// `SOLIUM_WARM_INJECT` says the frame is not ready for.
 /// `tests::the_first_frame_is_held_until_ready_then_never_again`.
 #[derive(Debug, Default)]
 pub(crate) struct Warm {
@@ -136,6 +137,7 @@ pub(crate) struct Warm {
     done: bool,
     held: u64,
     capped: bool,
+    inject: u64,
 }
 
 impl Warm {
@@ -143,6 +145,20 @@ impl Warm {
     /// `tests::hold_and_on_reload_are_obeyed`.
     pub(crate) fn configure(&mut self, config: FirstFrame) {
         self.config = config;
+    }
+
+    /// `SOLIUM_WARM_INJECT`'s passes: the first frame is not ready for that
+    /// many held passes of each hold (`dev::warm_inject`; 0, nothing).
+    /// `state::tests::an_injected_wait_holds_the_first_frame_for_its_passes`.
+    pub(crate) fn inject(&mut self, passes: u64) {
+        self.inject = passes;
+    }
+
+    /// Whether `SOLIUM_WARM_INJECT`'s passes are over, so the frame may be
+    /// ready: `Solium::first_frame_ready` asks it.
+    /// `state::tests::an_injected_wait_holds_the_first_frame_for_its_passes`.
+    pub(crate) fn injected_passes_over(&self) -> bool {
+        self.held >= self.inject
     }
 
     /// A reload succeeded: with `on_reload`, the gate holds again until

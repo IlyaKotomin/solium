@@ -1314,7 +1314,11 @@ impl Solium {
             store: crate::effect::store::Store::default(),
             xrays: crate::effect::xray::Xrays::default(),
             memos: crate::effect::memo::Memos::default(),
-            warm: crate::warm::Warm::default(),
+            warm: {
+                let mut warm = crate::warm::Warm::default();
+                warm.inject(crate::dev::warm_inject());
+                warm
+            },
             textures: None,
             focusing: false,
             closing: None,
@@ -2113,10 +2117,12 @@ impl Solium {
 
     /// What the first desktop frame waits for (`warm::Warm`): today the
     /// effects; U17 adds the shell's scenes and the services' first data
-    /// here, so there is one gate.
-    /// `tests::real_client::the_first_frame_waits_for_its_xray`.
+    /// here, so there is one gate. Not ready either for the passes the dev
+    /// control `SOLIUM_WARM_INJECT` names.
+    /// `tests::real_client::the_first_frame_waits_for_its_xray`,
+    /// `tests::an_injected_wait_holds_the_first_frame_for_its_passes`.
     pub(crate) fn first_frame_ready(&self) -> bool {
-        self.effects_ready()
+        self.effects_ready() && self.warm.injected_passes_over()
     }
 
     /// What `memory_report` counts that the compositor holds itself: the
