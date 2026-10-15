@@ -414,8 +414,9 @@ error at its line.
 | `sol_<name>(uv)`, `SOL_HAS_<name>` | another texture the effect reads, by name: `sol_self`, `sol_backdrop`, a name it saved, or a state's. One the pass does not list in its `uses` reads transparent and its `SOL_HAS_<name>` is 0, so one file can be written for both cases |
 | `sol_shape(uv)`, `sol_sdf(px)` | the part's shape: its coverage, and its signed distance in pixels, negative inside, exact for a rounded box |
 | `sol_content`, `sol_to_content(uv)`, `sol_to_uv(px)`, `sol_sdf_rrect(px, size, radii)` | the part's rectangle inside the box the pass draws, the maps between `uv` and the part's pixels, and the rounded-box distance itself |
+| `sol_box_px`, `sol_radii` | the box the pass draws, in pixels, and the part's four corner radii in pixels, top-left, top-right, bottom-left and bottom-right, which `sol_sdf` rounds it by |
 | `sol_progress`, `sol_clamped`, `sol_direction`, `sol_seed`, `sol_time` | in a transition: its progress, which a spring may carry past 1; the same clamped to 0..1; +1 arriving, −1 leaving, 0 resizing; a random number fixed for the transition; seconds |
-| `sol_noise(p)` | value noise |
+| `sol_noise(p)`, `sol_hash(p)` | value noise, and the hash in [0, 1) it is made from |
 
 A `p_` name the effect has no param for, and a `sol_` name that is none of
 these, are errors at their line, with the param you probably meant; reading a
@@ -510,3 +511,4 @@ the window.
 |---|---|
 | [`blur`](blur/README.md) | a dual Kawase blur, `passes` halvings and as many doublings back at `offset` texels; its input is the backdrop, what is behind the part from xray, or the part's own pixels with `source = "self"` |
 | [`genie`](genie/README.md) | the window pulled into its target like a sheet through a letterbox, the edge nearest the target first, `spread` drawing the tail out behind it; a geometry effect, held to Solium's Rust genie within 10⁻⁹ |
+| [`glass`](glass/README.md) | liquid glass, dark by default: the backdrop blurred and veiled, bent round the part's rounded edge across a rim, with a highlight along the edges facing the light |

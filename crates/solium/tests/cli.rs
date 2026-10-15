@@ -148,6 +148,17 @@ fn check_exits_0_on_a_good_effect_folder() {
     );
 }
 
+/// **The shipped `glass` passes `solium --check`**: its `effect.lua`, its
+/// params, `refract.frag`'s checks, and the shipped `blur` its `use` stage
+/// names, found beside it.
+#[test]
+fn check_exits_0_on_the_shipped_glass() {
+    let folder = concat!(env!("CARGO_MANIFEST_DIR"), "/effects/glass");
+    let (code, out, err) = run_args(&["--check", folder], "check-effect-glass");
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(out.contains("glass: ok"), "{out}");
+}
+
 /// **`--check <folder>` reads the configuration's `effects.sandbox`**, as
 /// the session loads the folder under it: one that builds 20 MiB exits 1
 /// with no configuration (the default 16 MiB) and 0 under one that gives

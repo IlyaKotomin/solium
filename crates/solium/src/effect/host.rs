@@ -3214,6 +3214,53 @@ pub(crate) mod tests {
         );
     }
 
+    /// **The shipped glass loads and binds, and checks its params**: at its
+    /// defaults the shipped blur's six steps, which read only the backdrop
+    /// and so are shared per monitor, then its refract pass, the part's own;
+    /// it reads the backdrop, 49 px around the part. A
+    /// value out of range is clamped with a warning, a param it does not have
+    /// is refused with the one meant, and `soften_passes = 0` is clear glass:
+    /// one pass, reaching 1 px.
+    #[test]
+    fn the_shipped_glass_loads_binds_and_checks_its_params() {
+        use solium_effects::spec::{Severity, Value};
+        let mut host: super::Host<u32> = super::Host::new(Library::with(None, shipped()));
+        host.want("rules", ["glass".to_owned()]);
+        assert_eq!(
+            per_part_of(&mut host, "glass"),
+            [false, false, false, false, false, false, true]
+        );
+        let bound = host.bind("glass", &[]).expect("binds at its defaults");
+        assert!((bound.reach - 49.0).abs() < f64::EPSILON, "{}", bound.reach);
+        assert!(bound.plans[0].reads.backdrop, "{:?}", bound.plans[0].reads);
+        assert!(bound.warnings.is_empty(), "{:?}", bound.warnings);
+
+        let clamped = host
+            .bind("glass", &[("zoom".to_owned(), Value::Number(2.0))])
+            .expect("clamped, not refused");
+        assert!(
+            clamped
+                .params
+                .contains(&("zoom".to_owned(), Value::Number(0.9))),
+            "{:?}",
+            clamped.params
+        );
+        assert_eq!(clamped.warnings.len(), 1, "{:?}", clamped.warnings);
+        assert_eq!(clamped.warnings[0].severity, Severity::Warning);
+
+        let refused = host
+            .bind("glass", &[("zom".to_owned(), Value::Number(0.2))])
+            .expect_err("a typo");
+        assert_eq!(refused.severity, Severity::Error);
+        assert!(refused.message.contains("`zoom`"), "{refused:?}");
+
+        let clear = host
+            .bind("glass", &[("soften_passes".to_owned(), Value::Int(0))])
+            .expect("clear glass binds");
+        assert_eq!(clear.plans[0].steps.len(), 1, "no blur: one pass");
+        assert!((clear.reach - 1.0).abs() < f64::EPSILON, "{}", clear.reach);
+    }
+
     /// **A user's `blur` folder shadows the shipped one**, which is there to
     /// be shadowed.
     #[test]
