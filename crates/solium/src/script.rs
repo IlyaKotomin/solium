@@ -9092,6 +9092,32 @@ mod tests {
         );
     }
 
+    /// **The shipped configuration frames every window in `glass`**: the
+    /// shipped `init.lua` hands the compositor `pane = "glass"` when a
+    /// `user.lua` says nothing, and the style a `user.lua` names when it
+    /// names one, which is how to go back to `top`.
+    #[test]
+    fn the_shipped_configuration_frames_windows_in_glass() {
+        for (user, wanted) in [("return {}", "glass"), ("return { pane = \"top\" }", "top")] {
+            let Some((directory, mut scripts)) =
+                shipped_init_with_user("solium-script-test-pane", user)
+            else {
+                return;
+            };
+            let handed: Vec<Option<String>> = scripts
+                .startup()
+                .commands
+                .into_iter()
+                .filter_map(|command| match command {
+                    Command::Decoration { name } => Some(name),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(handed, vec![Some(wanted.to_owned())], "{user}");
+            let _ = std::fs::remove_dir_all(&directory);
+        }
+    }
+
     /// **`fullscreen.covers` reaches the compositor from the shipped
     /// `init.lua`**: the default when a `user.lua` says nothing, `"none"` when
     /// it says that, and the default kept for a word that is neither.

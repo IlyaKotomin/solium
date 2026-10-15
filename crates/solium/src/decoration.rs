@@ -60,13 +60,20 @@ pub(crate) const TITLEBAR_HEIGHT: i32 = 32;
 
 /// The style drawn when nothing has named one.
 ///
-/// The same name `config.lua` carries, and it has to be a *name* rather than a
-/// path: every style this build ships is a folder under `panes/`, so the
-/// default has to be looked up where folders are. It is reached when no script
-/// has run or one set the style back to nothing — a session whose scripts
-/// failed to load still gets titlebars. And so it is the style a framed pane
-/// is in when nothing has named one, as a rule's `style` match reads it
+/// A *name* rather than a path: every style this build ships is a folder under
+/// `panes/`, so the default has to be looked up where folders are. It is
+/// reached when no script has run or one set the style back to nothing — a
+/// session whose scripts failed to load still gets titlebars. And so it is the
+/// style a framed pane is in when nothing has named one, as a rule's `style`
+/// match reads it
 /// (`state::tests::a_framed_panes_style_is_the_configured_one_or_the_default_and_a_bare_ones_is_none`).
+///
+/// **Not the shipped configuration's `glass`**
+/// (`script::tests::the_shipped_configuration_frames_windows_in_glass`), on
+/// purpose: this is the fallback for a session whose configuration is not
+/// running, and `top` is a bar that reads as one with nothing else working,
+/// opaque and needing no effect, where `glass` draws a clear bar over an
+/// effect behind the window.
 pub(crate) const DEFAULT_STYLE: &str = "top";
 
 /// What a frame button asked for.

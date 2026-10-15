@@ -118,7 +118,12 @@ return { pane = "left" }
 
 Twelve styles ship, and
 [the pane styles' README](../crates/solium/qml/panes/README.md#what-is-here)
-lists them with what each one is for. Reload and every open window is re-framed.
+lists them with what each one is for. The default is `glass`: each window and
+its bar one rounded piece of dark liquid glass, the bar along the bottom, and
+a thin dark shade just inside the rounded edge of a window that does not have
+the keyboard ([its numbers](../crates/solium/qml/panes/README.md#glass)).
+`pane = "top"` is the opaque titlebar above the window that was the default
+before it. Reload and every open window is re-framed.
 
 ### No frame at all
 

@@ -428,7 +428,11 @@ window and a reload button.
 
 The shipped styles, and the demonstrations kept with the tests, are listed
 once, in the [panes README](../crates/solium/qml/panes/README.md#what-is-here).
-`top` is the default.
+`glass` is the default: the window and its bar one rounded piece of dark
+liquid glass, the bar along the bottom
+([glass](../crates/solium/qml/panes/README.md#glass)).
+`pane = "top"` goes back to the opaque titlebar above the window that was the
+default before it.
 
 See also: **[ricing.md](ricing.md)** for the settings,
 **[animation.md](animation.md)** for the engine that moves the windows these

@@ -312,8 +312,8 @@ is the shipped one: the `glass` effect behind the whole pane.
 
 | folder | |
 |---|---|
-| `glass/` | the window and its bar one rounded piece of dark liquid glass, the bar along the bottom, a thin shade round the edge of a window without the keyboard ([below](#glass)) |
-| `top/` | the default: a titlebar above the window |
+| `glass/` | the default: the window and its bar one rounded piece of dark liquid glass, the bar along the bottom, a thin shade round the edge of a window without the keyboard ([below](#glass)) |
+| `top/` | a titlebar above the window, the default until `glass` |
 | `left/` | a vertical titlebar down the left side |
 | `bottom/` | a titlebar underneath |
 | `border/` | no bar at all, just a frame around the window |

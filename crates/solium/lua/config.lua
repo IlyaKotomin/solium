@@ -833,13 +833,15 @@ local defaults = {
     -- ~/.config/solium/qml/panes, which shadows a shipped one of the same
     -- name. A path is anywhere.
     --
-    --   "glass"      the window and its bar one rounded piece of dark
-    --                liquid glass, the bar along the bottom with the
+    --   "glass"      the default: the window and its bar one rounded piece of
+    --                dark liquid glass, the bar along the bottom with the
     --                buttons at its left, the title after them and the
     --                application's icon at its right; a thin dark shade just
     --                inside the window's rounded edge while it does not have
     --                the keyboard
-    --   "top"        a titlebar above the window (the default)
+    --   "top"        a titlebar above the window, opaque and square: the
+    --                default until glass, and `pane = "top"` in user.lua
+    --                goes back to it
     --   "left"       a titlebar down the left side
     --   "bottom"     a titlebar underneath
     --   "border"     no bar, just a frame
@@ -875,7 +877,7 @@ local defaults = {
     --
     -- This setting was called `decoration` when a style was one file. The old
     -- name is still read -- see the bottom of this file.
-    pane = "top",
+    pane = "glass",
 
     -- What a window does between being asked for and its application
     -- arriving. A window's life starts when you ask for it, not when the
@@ -1376,7 +1378,11 @@ local defaults = {
     -- Effects: folders of Lua and GLSL in ~/.config/solium/effects/ (yours)
     -- or shipped with Solium, put in a slot of a part of a window by a rule.
     -- See crates/solium/effects/README.md for the folders and docs/ricing.md
-    -- for rules. With no rules nothing changes, and costs nothing.
+    -- for rules. With no rules nothing changes, and costs nothing. The
+    -- default pane style, "glass" (`pane` above), brings one rule of its
+    -- own: the `glass` effect behind every window it frames. A rule of yours
+    -- for `{ style = "glass" }`, the `pane` part and its `behind` slot wins
+    -- over it; `effect = false` there takes it away.
     effects = {
         -- { match = { app_id = "mpv" }, part = "client", slot = "replace",
         --   effect = { "blur", source = "self" } },
