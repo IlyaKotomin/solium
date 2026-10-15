@@ -90,6 +90,10 @@ render_elements! {
     ClippedTiled = CropRenderElement<RescaleRenderElement<crate::clip::Clipped>>,
     /// The same inside a warp's capture, drawn at real size as `Window2` is.
     Clipped2 = crate::clip::Clipped,
+    /// A strip of a pane's background drawn through its client's rounded
+    /// rectangle, so it stops where the client's corners do (#233). See
+    /// [`background_strips`] and `crate::clip::ClippedSolid`.
+    ClippedSolid = crate::clip::ClippedSolid,
 }
 
 /// The two questions that together mean "will a later frame differ from this
@@ -1710,14 +1714,6 @@ fn panes(
         // Where the buffer's corner goes, which an anchored picture's offset
         // can move off the client's. See [`fit`].
         let origin = placed.origin.to_physical_precise_round(scale);
-        // And the pane's background where the picture does not reach, behind
-        // the client: a picture smaller than its rectangle under a fill that
-        // does not stretch (#233). See [`uncovered`].
-        let mut background = state
-            .panes
-            .get(pane)
-            .map(|held| background_elements(state, held, &placed, real.size, frame.opacity, scale))
-            .unwrap_or_default();
 
         // Popups go in ahead of the sandwich, which means above all of it.
         //
@@ -1765,6 +1761,28 @@ fn panes(
         // A style's rounding and its programs, asked once here, outside the
         // walk, which holds the state: `None` for every unstyled window.
         let rounded = clipped(state, pane);
+        // And the pane's background where the picture does not reach, behind
+        // the client: a picture smaller than its rectangle under a fill that
+        // does not stretch (#233), cut at the client's corners when the
+        // client is. See [`background_strips`].
+        let mut background = state
+            .panes
+            .get(pane)
+            .map(|held| {
+                background_elements(
+                    held,
+                    background_strips(
+                        state.resizing.background,
+                        &placed,
+                        real.size,
+                        frame.opacity,
+                        scale,
+                        rounded.as_ref().map(|(effect, _)| *effect),
+                    ),
+                    rounded.as_ref().map(|(_, programs)| programs),
+                )
+            })
+            .unwrap_or_default();
         pane_pieces(elements, |elements, piece| match piece {
             Piece::Layers(depth) => chrome(state, renderer, elements, pane, depth, drawing),
             Piece::Client => {
@@ -1807,8 +1825,8 @@ fn panes(
                         )
                         .map(Fitted::into_clipped)
                     }));
-                    // Square at a rounded style's corners: the strips are
-                    // plain solids, read and not tested, as the remains are.
+                    // Cut at the same corners: `background_strips` gave them
+                    // this clip, taken to the output's pixels.
                     elements.append(&mut background);
                     return;
                 }
@@ -2599,42 +2617,94 @@ pub(crate) fn background_colour(
     Some([channel(red), channel(green), channel(blue), alpha])
 }
 
+/// A pane's background strips, before they are elements (#233).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Strips {
+    /// [`uncovered`]'s four, in the output's pixels: empty where the picture
+    /// reaches that side.
+    pub(crate) rects: [Rectangle<i32, Physical>; 4],
+    /// [`background_colour`]'s, the frame's opacity in it.
+    pub(crate) colour: [f32; 4],
+    /// The rounded rectangle the client is drawn through, in the output's
+    /// pixels, when it is: the strips are drawn through it too.
+    pub(crate) clip: Option<crate::clip::Clip>,
+}
+
 /// The strips of a pane's background round a picture that does not cover its
-/// rectangle, as elements: [`uncovered`]'s strips in [`background_colour`],
-/// each under its own identity from `Pane::background`. Empty when the
-/// picture covers the rectangle or the background is `"none"`. The two it
-/// joins are tested (`tests::fitting::the_background_fills_what_the_picture_leaves_uncovered`,
-/// `tests::fitting::the_background_is_drawn_in_its_configured_colour`); this,
-/// which needs the renderer's element list, is read, as `remains_elements` is.
-fn background_elements(
-    state: &Solium,
-    pane: &Pane,
+/// rectangle: where they are, their colour, and their clip. `None` when the
+/// background is `"none"`.
+///
+/// **Cut at the client's corners when the client is.** `rounding` is the
+/// one `panes` draws the client through (a style's `client.radius`); the
+/// strips take the same rounded rectangle, the client's as drawn, with a
+/// `factor` of 1 because a strip is drawn in the output's pixels and never
+/// rescaled. Drawn square, a strip stood past a rounded window's corners in
+/// the background's colour for every frame of a glide or a drag, and covered
+/// what the style draws behind the cut corners (`rounded`'s bar).
+/// `tests::fitting::a_rounded_clients_background_is_cut_at_its_corners`.
+pub(crate) fn background_strips(
+    background: crate::resizing::Background,
     placed: &Placed,
     committed: Size<i32, Logical>,
     opacity: f32,
     scale: f64,
-) -> Vec<Element> {
-    let Some(colour) = background_colour(state.resizing.background, opacity) else {
-        return Vec::new();
-    };
+    rounding: Option<solium_effects::fragment::Effect>,
+) -> Option<Strips> {
+    let colour = background_colour(background, opacity)?;
     let picture = Size::from((
         f64::from(committed.w) * placed.fit.factor.x,
         f64::from(committed.h) * placed.fit.factor.y,
     ));
-    uncovered(placed.client, placed.origin, picture, scale)
+    let clip = rounding.map(|effect| {
+        drawn_clip(
+            Rectangle::new(
+                placed.client.loc.to_physical_precise_round(scale),
+                placed.client.size.to_physical_precise_round(scale),
+            ),
+            Point::default(),
+            Scale::from((1.0, 1.0)),
+            crate::pass::physical_radii(effect, scale),
+        )
+    });
+    Some(Strips {
+        rects: uncovered(placed.client, placed.origin, picture, scale),
+        colour,
+        clip,
+    })
+}
+
+/// [`background_strips`]' strips as elements, each under its own identity
+/// from `Pane::background`, the empty ones left out: plain solids, or solids
+/// through the client's clip when there is one and `programs`, the clip's
+/// compiled pair, to draw it with -- without them a rounded client is drawn
+/// square, and so are its strips. Nothing for no strips (`"none"`).
+pub(crate) fn background_elements(
+    pane: &Pane,
+    strips: Option<Strips>,
+    programs: Option<&crate::pass::ClipPrograms>,
+) -> Vec<Element> {
+    let Some(strips) = strips else {
+        return Vec::new();
+    };
+    strips
+        .rects
         .into_iter()
         .zip(pane.background())
         .filter(|(strip, _)| strip.size.w > 0 && strip.size.h > 0)
         .map(|(strip, id)| {
-            Element::Solid(
-                smithay::backend::renderer::element::solid::SolidColorRenderElement::new(
-                    id.clone(),
-                    strip,
-                    CommitCounter::default(),
-                    colour,
-                    Kind::Unspecified,
+            let solid = smithay::backend::renderer::element::solid::SolidColorRenderElement::new(
+                id.clone(),
+                strip,
+                CommitCounter::default(),
+                strips.colour,
+                Kind::Unspecified,
+            );
+            match (strips.clip, programs) {
+                (Some(clip), Some(programs)) => Element::ClippedSolid(
+                    crate::clip::ClippedSolid::new(solid, clip, programs.clone()),
                 ),
-            )
+                _ => Element::Solid(solid),
+            }
         })
         .collect()
 }
@@ -4037,6 +4107,137 @@ mod tests {
                 "half faded, half the alpha"
             );
             assert!((red - 0.5).abs() < f32::EPSILON && (green - 0.5).abs() < f32::EPSILON);
+        }
+
+        /// A 400x300 picture anchored to the right and the top of a 600x400
+        /// client at (100, 50), as an anchored shrink from the left leaves
+        /// it, and the background's strips round it: a strip on the left and
+        /// a band below.
+        fn anchored_right_and_top() -> (crate::render::Placed, Size<i32, Logical>) {
+            let client = logical(100.0, 50.0, 600.0, 400.0);
+            let committed = Size::from((400, 300));
+            let fitting = fit(
+                client,
+                AT_REST,
+                committed,
+                false,
+                Fill::Anchor,
+                (true, false),
+            );
+            (
+                crate::render::Placed {
+                    client,
+                    origin: client.loc + fitting.offset,
+                    fit: fitting,
+                },
+                committed,
+            )
+        }
+
+        /// **#233: a rounded client's background is cut at its corners.**
+        ///
+        /// The strips are drawn through the client's own rounded rectangle,
+        /// in the output's pixels where they are drawn: they claim none of a
+        /// corner's square, and the program reads each strip's pixels in the
+        /// client's coordinates, so it is the client's corners that are cut
+        /// and not the strip's own, which would cut it mid-window. Drawn
+        /// square, as they were, they stood past a rounded window's corners
+        /// in the background's colour on every frame of a glide or a drag,
+        /// over what its style draws behind them. At 2x the same, in twice
+        /// the pixels; a client its style does not round has no clip.
+        #[test]
+        fn a_rounded_clients_background_is_cut_at_its_corners() {
+            use solium_effects::fragment::{Corners, Effect};
+            let (placed, committed) = anchored_right_and_top();
+            let rounded = Effect::rounded(Corners::all(12.0));
+            let strips = |scale, rounding| {
+                crate::render::background_strips(
+                    Some([0x1c, 0x1c, 0x1c, 0xff]),
+                    &placed,
+                    committed,
+                    1.0,
+                    scale,
+                    rounding,
+                )
+                .expect("a colour draws strips")
+            };
+            let drawn = strips(1.0, Some(rounded));
+            let clip = drawn
+                .clip
+                .expect("a rounded client's strips are drawn through its clip");
+            assert_eq!(
+                clip.rect,
+                Rectangle::new((100.0, 50.0).into(), (600.0, 400.0).into()),
+                "the client's rectangle, in the output's pixels"
+            );
+            assert_eq!(clip.radii, crate::pass::physical_radii(rounded, 1.0));
+            assert_eq!(
+                clip.factor,
+                Scale::from((1.0, 1.0)),
+                "a strip is not rescaled"
+            );
+            let [top, bottom, left, right] = drawn.rects;
+            assert!(top.is_empty() && right.is_empty(), "{:?}", drawn.rects);
+            assert_eq!(left, physical(100, 50, 200, 300));
+            assert_eq!(bottom, physical(100, 350, 600, 100));
+
+            // The left strip holds the client's top-left corner and the band
+            // below both bottom corners; each claims all but those squares,
+            // in its own coordinates.
+            let claimed = |strip: Rectangle<i32, Physical>| {
+                crate::clip::claim(&[Rectangle::from_size(strip.size)], strip.loc, 1.0, &clip)
+            };
+            let corner = |claim: &[Rectangle<i32, Physical>], square: Rectangle<i32, Physical>| {
+                claim.iter().any(|claimed| claimed.overlaps(square))
+            };
+            let left_claim = claimed(left);
+            assert!(
+                !corner(&left_claim, physical(0, 0, 12, 12)),
+                "the client's top-left corner is not claimed: {left_claim:?}"
+            );
+            assert!(
+                corner(&left_claim, physical(0, 12, 12, 12)),
+                "{left_claim:?}"
+            );
+            let bottom_claim = claimed(bottom);
+            assert!(
+                !corner(&bottom_claim, physical(0, 88, 12, 12))
+                    && !corner(&bottom_claim, physical(588, 88, 12, 12)),
+                "nor are its bottom corners: {bottom_claim:?}"
+            );
+
+            // And the program measures the corners from the client's.
+            let to_client = |strip: Rectangle<i32, Physical>, (u, v): (f32, f32)| {
+                let matrix = crate::clip::solid_to_geo(strip, &clip).expect("an invertible strip");
+                (
+                    matrix[0] * u + matrix[3] * v + matrix[6],
+                    matrix[1] * u + matrix[4] * v + matrix[7],
+                )
+            };
+            let near = |(x, y): (f32, f32), (a, b): (f32, f32)| {
+                (x - a).abs() < 1e-3 && (y - b).abs() < 1e-3
+            };
+            assert!(
+                near(to_client(left, (0.0, 0.0)), (0.0, 0.0)),
+                "the left strip starts at the client's top-left corner"
+            );
+            assert!(
+                near(to_client(bottom, (0.0, 0.0)), (0.0, 300.0))
+                    && near(to_client(bottom, (1.0, 1.0)), (600.0, 400.0)),
+                "and the band below ends at its bottom-right"
+            );
+
+            let twice = strips(2.0, Some(rounded)).clip.expect("clipped at 2x too");
+            assert_eq!(
+                twice.rect,
+                Rectangle::new((200.0, 100.0).into(), (1200.0, 800.0).into())
+            );
+            assert_eq!(twice.radii, crate::pass::physical_radii(rounded, 2.0));
+            assert_eq!(
+                strips(1.0, None).clip,
+                None,
+                "a square client's strips are square"
+            );
         }
 
         /// **A popup reaches past its parent's tile.**
