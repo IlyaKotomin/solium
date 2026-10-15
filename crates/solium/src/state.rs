@@ -9,6 +9,7 @@ use std::time::Duration;
 use smithay::output::{Output, Scale};
 use smithay::reexports::wayland_server::Resource;
 use smithay::utils::{IsAlive as _, Logical, Point, Rectangle, SERIAL_COUNTER, Serial, Size};
+use smithay::wayland::content_type::ContentTypeState;
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::fractional_scale::{
     FractionalScaleHandler, FractionalScaleManagerState, with_fractional_scale,
@@ -654,6 +655,19 @@ pub(crate) struct Solium {
     )]
     pub(crate) single_pixel_buffer_state:
         smithay::wayland::single_pixel_buffer::SinglePixelBufferState,
+    /// A surface saying what it is showing -- a video, a game, a photo
+    /// (#71).
+    ///
+    /// No handler: smithay keeps what a client said as double-buffered state
+    /// on the surface, and `content_type_of` in `state/snapshot.rs` reads the
+    /// committed half of it into the window list scripts are handed, where
+    /// the decisions that care -- tearing, a refresh rate, keeping the screen
+    /// awake -- are made.
+    #[expect(
+        dead_code,
+        reason = "registers wp_content_type_manager_v1; dropping it would remove the global"
+    )]
+    pub(crate) content_type_state: ContentTypeState,
     /// Telling a surface what scale it is really being drawn at.
     ///
     /// Without it a client has only the integer scale from `wl_output`, so on
@@ -1199,6 +1213,7 @@ impl Solium {
             activation_state: XdgActivationState::new::<Self>(&display_handle),
             viewporter_state: ViewporterState::new::<Self>(&display_handle),
             single_pixel_buffer_state: crate::single_pixel::state(&display_handle),
+            content_type_state: ContentTypeState::new::<Self>(&display_handle),
             // 1 is CLOCK_MONOTONIC, which is the clock every timestamp in this
             // compositor comes from -- both the DRM page-flip time and our own
             // animation clock. Telling a client a different clock id than the

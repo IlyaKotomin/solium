@@ -561,7 +561,7 @@ issue #116, and both halves above are what it cost.
 ```lua
 sol.windows()          -- every window: id, x, y, w, h, title, focused, monitor,
                        --                modal, parent, leaving, app_id, min, max,
-                       --                cramped, shown
+                       --                cramped, shown, content_type
 sol.monitors()         -- every monitor: name, x, y, w, h, whole, scale,
                        --                 transform, focused, primary, power
                        --   (x, y, w, h: the work area, less layer-shell
@@ -626,6 +626,15 @@ yet: `false` for a window launched with `sol.spawn` from its `open` until its
 application's first frame, which is how a layout tells limits that arrive in
 time to decide where a window goes from limits that changed on a window
 already on screen.
+
+`content_type` is what the window says it is showing, through
+`wp_content_type_v1`: `"video"`, `"game"`, `"photo"`, or `"none"` for a window
+that said nothing -- which is every X11 window, and most Wayland ones. Like
+`min` and `max` it is what the client has *committed*. Nothing in the
+compositor acts on it; it is here so that a choice that would otherwise be one
+switch for every window -- tearing, a variable refresh rate, keeping the screen
+awake -- can be made for the window that is actually a game or a film. A change
+to it does not re-run `layout`: no layout arranges by it.
 
 `skip` on `window_at` exists because of one specific bug: a new window is
 already mapped and under the pointer, so asking "what am I pointing at" without

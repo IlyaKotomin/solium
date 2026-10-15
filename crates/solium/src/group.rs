@@ -1106,6 +1106,7 @@ mod desk {
             accepts_input: true,
             class: None,
             instance: None,
+            content_type: "none",
         }
     }
 

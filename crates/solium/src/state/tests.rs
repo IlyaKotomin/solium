@@ -1667,6 +1667,9 @@ mod real_client {
     use wayland_protocols::ext::session_lock::v1::client::{
         ext_session_lock_manager_v1, ext_session_lock_surface_v1, ext_session_lock_v1,
     };
+    use wayland_protocols::wp::content_type::v1::client::{
+        wp_content_type_manager_v1, wp_content_type_v1,
+    };
     use wayland_protocols::wp::idle_inhibit::zv1::client::{
         zwp_idle_inhibit_manager_v1, zwp_idle_inhibitor_v1,
     };
@@ -1751,6 +1754,9 @@ mod real_client {
         /// Every `zxdg_exported_v2.handle` this client has been sent: the
         /// string an application passes to a portal.
         exported_handles: Vec<String>,
+        /// #71: how a surface says what it contains -- a video, a game, a
+        /// photo -- which only its client can say.
+        content_types: Option<wp_content_type_manager_v1::WpContentTypeManagerV1>,
         /// For a window that asks to be brought forward with a token, as
         /// an application launched with one does as it opens -- GTK, Qt
         /// and winit all do. A raw client that never sends it cannot see
@@ -2068,6 +2074,9 @@ mod real_client {
                 "xdg_wm_dialog_v1" => state.dialogs = Some(registry.bind(name, 1, qh, ())),
                 "zxdg_exporter_v2" => state.exporter = Some(registry.bind(name, 1, qh, ())),
                 "zxdg_importer_v2" => state.importer = Some(registry.bind(name, 1, qh, ())),
+                "wp_content_type_manager_v1" => {
+                    state.content_types = Some(registry.bind(name, 1, qh, ()));
+                }
                 "xdg_activation_v1" => {
                     state.activation = Some(registry.bind(name, 1, qh, ()));
                 }
@@ -2194,6 +2203,8 @@ mod real_client {
     wayland_client::delegate_noop!(Client: ignore zxdg_exporter_v2::ZxdgExporterV2);
     wayland_client::delegate_noop!(Client: ignore zxdg_importer_v2::ZxdgImporterV2);
     wayland_client::delegate_noop!(Client: ignore zxdg_imported_v2::ZxdgImportedV2);
+    wayland_client::delegate_noop!(Client: ignore wp_content_type_manager_v1::WpContentTypeManagerV1);
+    wayland_client::delegate_noop!(Client: ignore wp_content_type_v1::WpContentTypeV1);
 
     /// See [`Client::exported_handles`].
     impl Dispatch<zxdg_exported_v2::ZxdgExportedV2, ()> for Client {
@@ -6030,6 +6041,123 @@ end)"#,
             Parentage::None,
             "the application withdrew the export, and the dialog still names \
              the window as its parent"
+        );
+    }
+
+    /// **#71: a window says what it contains, and a script can read it.**
+    ///
+    /// `wp_content_type_v1` is how a video player says "video" and a game says
+    /// "game". Nothing in the compositor decides anything with it yet; what is
+    /// under test is that the answer reaches the one place policy is written,
+    /// `sol.windows()`, so tearing (#37), a variable refresh rate or keeping a
+    /// screen awake can be decided per window rather than globally.
+    ///
+    /// The type is double-buffered state, so the request alone must change
+    /// nothing and the commit after it must; and destroying the object goes
+    /// back to `"none"`, on the commit after that, as the protocol says.
+    /// Read through Lua rather than off `WindowInfo` so the whole path is
+    /// what is checked. It fails on stage at the missing
+    /// `wp_content_type_manager_v1`.
+    #[test]
+    fn a_window_says_what_it_contains_and_a_script_reads_what_it_committed() {
+        let mut display = Display::<Solium>::new().expect("creating a test wayland display");
+        let mut state = Solium::new(display.handle());
+        // See the #99 test: a Qt scene in a process holding a libwayland
+        // connection of its own aborts the whole test binary.
+        state
+            .decorations
+            .set_style(&mut state.panes, Some("none".to_string()));
+        a_screen(&mut state, "content-type-test", (0, 0));
+        let (conn, mut queue, mut client) = connect(&mut display, &mut state);
+        let qh = queue.handle();
+        let (_window, _toplevel, surface) =
+            open_surface(&mut display, &mut state, &conn, &client, &qh);
+        state.sync_panes();
+        pump(
+            &mut display,
+            &mut state,
+            &conn,
+            &qh,
+            &mut queue,
+            &mut client,
+        );
+
+        let directory =
+            std::env::temp_dir().join(format!("solium-content-type-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&directory);
+        let entry = directory.join("init.lua");
+        std::fs::write(&entry, "").expect("writing the test script");
+        let scripts = Scripts::load(&entry).expect("loading the test script");
+        let _ = std::fs::remove_dir_all(&directory);
+        let said = |state: &Solium| {
+            scripts.evaluate_in(
+                state.snapshot(),
+                "return tostring(sol.windows()[1].content_type)",
+            )
+        };
+        assert_eq!(
+            said(&state),
+            "none",
+            "a window that said nothing about its content does not read \"none\""
+        );
+
+        let manager = client
+            .content_types
+            .clone()
+            .expect("wp_content_type_manager_v1 is advertised, so a window can say what it is");
+        let content_type = manager.get_surface_content_type(&surface, &qh, ());
+        content_type.set_content_type(wp_content_type_v1::Type::Video);
+        pump(
+            &mut display,
+            &mut state,
+            &conn,
+            &qh,
+            &mut queue,
+            &mut client,
+        );
+        assert_eq!(
+            said(&state),
+            "none",
+            "a content type asked for and not yet committed was read"
+        );
+
+        surface.commit();
+        pump(
+            &mut display,
+            &mut state,
+            &conn,
+            &qh,
+            &mut queue,
+            &mut client,
+        );
+        assert_eq!(said(&state), "video");
+
+        content_type.set_content_type(wp_content_type_v1::Type::Game);
+        surface.commit();
+        pump(
+            &mut display,
+            &mut state,
+            &conn,
+            &qh,
+            &mut queue,
+            &mut client,
+        );
+        assert_eq!(said(&state), "game");
+
+        content_type.destroy();
+        surface.commit();
+        pump(
+            &mut display,
+            &mut state,
+            &conn,
+            &qh,
+            &mut queue,
+            &mut client,
+        );
+        assert_eq!(
+            said(&state),
+            "none",
+            "the window took back what it said, and is still read as a game"
         );
     }
 

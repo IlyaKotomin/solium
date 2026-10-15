@@ -2,6 +2,8 @@
 //! script-facing id, title, application id, parent and modality.
 
 use super::*;
+use smithay::reexports::wayland_protocols::wp::content_type::v1::server::wp_content_type_v1;
+use smithay::wayland::content_type::ContentTypeSurfaceCachedState;
 
 pub(super) fn to_rect(rectangle: Rectangle<i32, Logical>) -> Rect {
     Rect {
@@ -84,6 +86,39 @@ pub(crate) fn limits_of(window: &Window) -> Limits {
         .map_or_else(Limits::default, |surface| {
             Limits::from_hints(surface.min_size(), surface.max_size())
         })
+}
+
+/// What a window says it is showing (#71), by the name a script reads it as:
+/// `"photo"`, `"video"`, `"game"`, or `"none"`.
+///
+/// **The surface's committed `ContentTypeSurfaceCachedState`.**
+/// `wp_content_type_v1.set_content_type` writes the pending half of it and a
+/// commit makes it current, so this is what the client has committed to,
+/// never what it has asked for and not yet drawn. Destroying the object puts
+/// `none` back on the next commit, which smithay does for us.
+///
+/// `"none"` is also every window that never said: an X11 window, whose
+/// `wl_surface` belongs to Xwayland and is never given a content type, and a
+/// Wayland one whose client does not speak the protocol -- which is most of
+/// them. A type the protocol grows later reads as `"none"` until it is named
+/// here, rather than as a word no script is looking for.
+pub(crate) fn content_type_of(window: &Window) -> &'static str {
+    let Some(surface) = window.wl_surface() else {
+        return "none";
+    };
+    let said = with_states(&surface, |states| {
+        *states
+            .cached_state
+            .get::<ContentTypeSurfaceCachedState>()
+            .current()
+            .content_type()
+    });
+    match said {
+        wp_content_type_v1::Type::Photo => "photo",
+        wp_content_type_v1::Type::Video => "video",
+        wp_content_type_v1::Type::Game => "game",
+        _ => "none",
+    }
 }
 
 /// A limit as a layout reads it: in the same terms as the window's own `w`
@@ -397,6 +432,10 @@ impl Solium {
                             .client()
                             .and_then(Window::x11_surface)
                             .map(|x11| x11.instance()),
+                        // Read live, like `min` and `max`: a client says it
+                        // with a commit, and the next snapshot has it. A
+                        // reserved slot has no client to have said anything.
+                        content_type: pane.client().map_or("none", content_type_of),
                     })
                 })
                 .collect();

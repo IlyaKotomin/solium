@@ -9,7 +9,7 @@ This page carries no status: a row leaves when its gap is closed.
 Written by asking the compositor rather than by remembering: the "have" list
 below is `wayland-info` against a running Solium, and the "missing" list is
 every protocol in `wayland-protocols`, `wayland-protocols-wlr` and
-`wayland-protocols-misc` that is not in it. Twenty-nine globals in, about
+`wayland-protocols-misc` that is not in it. Thirty globals in, about
 forty out; the list below is the count.
 
 Everything here is on the tracker: writing this page found thirty-one gaps
@@ -33,7 +33,8 @@ says otherwise.
 `wp_single_pixel_buffer_manager_v1` ·
 `zwp_relative_pointer_manager_v1` · `zwp_pointer_constraints_v1` ·
 `zwp_primary_selection_device_manager_v1` · `wp_cursor_shape_manager_v1` ·
-`zwp_text_input_manager_v3`, plus `xwayland_shell_v1` to the X server only.
+`zwp_text_input_manager_v3` · `wp_content_type_manager_v1`, plus
+`xwayland_shell_v1` to the X server only.
 
 ---
 
@@ -65,7 +66,6 @@ Not a whole day lost — one application, or one workflow, that does not work.
 | [#62](https://github.com/Lilium-Linux/solium/issues/62) `zwp_tablet_manager_v2` | drawing tablets, and the stylus on any 2-in-1 — which is a form factor this project is explicitly for |
 | [#70](https://github.com/Lilium-Linux/solium/issues/70) `wp_pointer_gestures` | touchpad pinch and swipe reaching clients. A browser cannot pinch-zoom |
 | [#37](https://github.com/Lilium-Linux/solium/issues/37) `tearing-control-v1` | a game that wants to opt out of vsync |
-| [#71](https://github.com/Lilium-Linux/solium/issues/71) `wp_content_type_v1` | lets a surface say "I am video" so VRR and tearing decisions can be made for it rather than guessed |
 | [#47](https://github.com/Lilium-Linux/solium/issues/47) `ext-image-copy-capture-v1` | the successor to `wlr-screencopy`. Nothing speaks it here yet; everything will |
 | [#73](https://github.com/Lilium-Linux/solium/issues/73) `xdg_toplevel_icon_v1` | window icons — which a task switcher needs and cannot get any other way |
 | [#75](https://github.com/Lilium-Linux/solium/issues/75) `wp_alpha_modifier_v1` | per-window opacity without asking the client to redraw. Free, given the render path already scales and warps |
