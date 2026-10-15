@@ -120,12 +120,14 @@ suite.
   `ext-idle-notify`, `idle-inhibit`, `cursor-shape`, `wp-viewporter`,
   `wp-fractional-scale`, `wp-presentation`, `wp-single-pixel-buffer`,
   `linux-dmabuf`, `relative-pointer`, `pointer-constraints`,
-  `primary-selection`, `text-input-v3` and `xwayland-shell`. A dialog another
-  program draws for a window, such as a portal's file chooser, belongs to that
-  window through `xdg-foreign` ([#67]). Both selections, copy and paste, cross
-  the X11 boundary. `text-input-v3` tells the compositor where the focused
-  text field's caret is; with no input method yet, no text is sent back
-  ([#26]).
+  `primary-selection`, `text-input-v3`, `content-type` and `xwayland-shell`. A
+  dialog another program draws for a window, such as a portal's file chooser,
+  belongs to that window through `xdg-foreign` ([#67]). A window that says it
+  is a video, a game or a photo through `content-type` is read that way by
+  scripts, as `content_type` in `sol.windows()` ([#71]). Both selections, copy
+  and paste, cross the X11 boundary. `text-input-v3` tells the compositor
+  where the focused text field's caret is; with no input method yet, no text
+  is sent back ([#26]).
 
 ## Not yet
 
@@ -544,6 +546,7 @@ other projects is listed, with its licence, in [THIRD_PARTY.md](THIRD_PARTY.md).
 [#66]: https://github.com/Lilium-Linux/solium/issues/66
 [#67]: https://github.com/Lilium-Linux/solium/issues/67
 [#69]: https://github.com/Lilium-Linux/solium/issues/69
+[#71]: https://github.com/Lilium-Linux/solium/issues/71
 [#72]: https://github.com/Lilium-Linux/solium/issues/72
 [#81]: https://github.com/Lilium-Linux/solium/issues/81
 [#83]: https://github.com/Lilium-Linux/solium/issues/83
