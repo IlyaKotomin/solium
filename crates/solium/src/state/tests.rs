@@ -17547,6 +17547,113 @@ end)
             }
         }
 
+        /// **#233: a neighbour growing into a closed window's tile keeps its
+        /// picture against the edge that does not move.**
+        ///
+        /// Since #128 the layout gives a closed window's tile back the
+        /// moment the close is asked for: the neighbour glides into it while
+        /// the closed window fades in place, in front of it. In tiling the
+        /// window closed is the left of two, so its neighbour grows to the
+        /// left -- its left edge moves, its right edge stands still -- and its
+        /// client has not drawn at the new size yet. Before #233 its
+        /// half-width picture was stretched across the rectangle the glide
+        /// had reached, its text up to twice as wide behind the fade. Under
+        /// the default fill the old picture is drawn at its own size against
+        /// the right edge, and the strip the neighbour has grown into is
+        /// `resize.background`'s, behind the fading window; once the client
+        /// answers, its new, wider picture stands against that edge too, cut
+        /// on the left until the glide gets there, so the neighbour's contents
+        /// do not move at all. `crop` keeps the picture at the rectangle's
+        /// left, going with the moving edge instead.
+        #[test]
+        fn a_neighbour_growing_into_a_closed_windows_tile_keeps_its_picture_against_its_far_edge()
+        {
+            let mut desk = Desk::new();
+            let (dying, others) = closing_scene(&mut desk, "tiling");
+            for opened in others.iter().chain([&dying]) {
+                desk.answer(opened);
+            }
+            desk.state.clock.advance(Duration::from_secs(1));
+            let now = desk.state.clock.now();
+            desk.state.settle(now);
+            let survivor = close_and_see_who_moved(&mut desk, "tiling", &dying, &others);
+            let pane = survivor.pane;
+            let start = desk.state.clock.now();
+            assert!(
+                above(&mut desk.state, dying.pane, pane),
+                "the premise: the closed window fades in front of the neighbour"
+            );
+            assert_eq!(
+                desk.state.resize_pins(pane),
+                (true, false),
+                "the neighbour grows to the left: its left edge moves and its right \
+                 edge stands still"
+            );
+
+            // The neighbour's client picture at `at`, as `render::elements`
+            // places it, and the size it is placed from.
+            let placed = |state: &Solium, at: Duration| {
+                let held = state.panes.get(pane).expect("the pane is here");
+                let committed = held
+                    .client()
+                    .map(|window| window.geometry().size)
+                    .expect("the pane has its client");
+                let outer = state.pane_outer(held);
+                let frame = state.drawn_at(held, outer, at);
+                (
+                    committed,
+                    crate::render::place_client(state, held, &frame, outer.size, committed),
+                )
+            };
+            // How far the picture's right edge is from the rectangle's.
+            let off_the_right = |placed: &crate::render::Placed, committed: Size<i32, Logical>| {
+                placed.origin.x + f64::from(committed.w) * placed.fit.factor.x
+                    - (placed.client.loc.x + placed.client.size.w)
+            };
+
+            let half_way = start + Duration::from_millis(120);
+            let (committed, old) = placed(&desk.state, half_way);
+            assert!(
+                old.client.size.w > f64::from(committed.w) + 1.0,
+                "the glide has grown past the old picture, or this proves nothing: {old:?}"
+            );
+            assert_eq!(
+                old.fit.factor,
+                smithay::utils::Scale::from((1.0, 1.0)),
+                "the old picture at its own size, not stretched across the glide"
+            );
+            assert!(
+                off_the_right(&old, committed).abs() < 1e-9,
+                "and against the right edge, which is standing still: {old:?}"
+            );
+            let strips = crate::render::uncovered(old.client, old.origin, committed.to_f64(), 1.0);
+            assert!(
+                strips[2].size.w > 0 && strips[3].size.w == 0,
+                "the background is the strip it has grown into, on the left: {strips:?}"
+            );
+
+            desk.state.resizing.fill = crate::resizing::Fill::Crop;
+            let (_, cropped) = placed(&desk.state, half_way);
+            assert!(
+                (cropped.origin.x - cropped.client.loc.x).abs() < 1e-9,
+                "`crop` keeps the picture at the left edge, which is moving: {cropped:?}"
+            );
+            desk.state.resizing.fill = crate::resizing::Fill::Anchor;
+
+            desk.answer(survivor);
+            let (answered, new) = placed(&desk.state, half_way + Duration::from_millis(20));
+            assert!(
+                f64::from(answered.w) > new.client.size.w + 1.0,
+                "the premise: the client answered wider than the glide has reached: {new:?}"
+            );
+            assert_eq!(new.fit.factor, smithay::utils::Scale::from((1.0, 1.0)));
+            assert_eq!(new.fit.crop, Some(new.client), "cut to the rectangle");
+            assert!(
+                off_the_right(&new, answered).abs() < 1e-9,
+                "the answer against the right edge too, cut on the left: {new:?}"
+            );
+        }
+
         /// **A refused window fades back in front of the neighbour giving
         /// its space back.**
         ///
