@@ -217,20 +217,25 @@ fn per_part_run(
 
 /// **Case 13b: a crop of the memo draws its own pixels.** The compositor's
 /// own `EffectElement` over 13a's memo, cropped to the part's box and then
-/// placed, as the walk places a slot whose suffix is empty
-/// (`EffectElement::new(..).cropped((200, 40, 120, 80)).at((0, 0, 120, 80),
-/// None, 1.0)`), drawn through `MASKED_TEXTURE` compiled as
-/// `Programs::masked` compiles it by `pool::paint` into a 120×80 pooled
-/// target: read back, every channel within 1 of the memo's own pixels in
-/// that box. The box is off the centre, and the memo's rows 240 to 320 (the
-/// box measured from the bottom edge) differ from its rows 40 to 120 by far
-/// more than 1, checked here, so a crop read upside down cannot pass.
+/// placed under a mask, as the walk places a slot whose suffix is empty with
+/// its part's mask (`EffectElement::new(..).cropped((200, 40, 120, 80))
+/// .at((0, 0, 120, 80), Some(the whole box, square), 1.0)`): a mask is what
+/// sends the draw through `MASKED_TEXTURE`, compiled as `Programs::masked`
+/// compiles it, with the crop mapping the mask (smithay draws one with no
+/// mask through its own program). Drawn by `pool::paint` into a 120×80
+/// pooled target and read back: every channel within 1 of the memo's own
+/// pixels in that box, so the mask, mapped through the crop, covers all of
+/// it. The box is off the centre, and the memo's rows 240 to 320 (the box
+/// measured from the bottom edge) differ from its rows 40 to 120 by far more
+/// than 1, checked here, so a crop read upside down cannot pass. Case 12h
+/// cuts under a crop.
 fn a_crop_of_the_memo_draws_its_own_pixels(renderer: &mut GlesRenderer, memo: &Memo) -> Result<()> {
     use smithay::backend::renderer::Bind as _;
     use smithay::backend::renderer::Frame as _;
     use smithay::backend::renderer::element::Id;
     use smithay::backend::renderer::utils::CommitCounter;
-    use solium_effects::fragment::MASKED_TEXTURE;
+    use smithay::utils::Physical;
+    use solium_effects::fragment::{Corners, MASKED_TEXTURE};
     println!("\n=== FX3: a crop of the memo draws its own pixels ===");
     let want = sub(&memo.bytes, MONITOR.0, PART);
     let mirrored = (PART.0, MONITOR.1 - PART.1 - PART.3, PART.2, PART.3);
@@ -253,7 +258,11 @@ fn a_crop_of_the_memo_draws_its_own_pixels(renderer: &mut GlesRenderer, memo: &M
         (to_f64(PART.2), to_f64(PART.3)).into(),
     );
     let side = (to_i32(PART.2), to_i32(PART.3));
-    // Cropped, then placed, as the walk places a memo's crop.
+    // The whole box, square: every pixel's centre half a pixel or more
+    // inside it, so fully covered.
+    let mask =
+        Rectangle::<f64, Physical>::new((0.0, 0.0).into(), (to_f64(PART.2), to_f64(PART.3)).into());
+    // Cropped, then placed under the mask, as the walk places a memo's crop.
     let placed = element::EffectElement::new(
         Id::new(),
         CommitCounter::default(),
@@ -261,7 +270,11 @@ fn a_crop_of_the_memo_draws_its_own_pixels(renderer: &mut GlesRenderer, memo: &M
         program,
     )
     .cropped(crop)
-    .at(Rectangle::from_size(side.into()), None, 1.0);
+    .at(
+        Rectangle::from_size(side.into()),
+        Some((mask, Corners::all(0.0))),
+        1.0,
+    );
     let mut pool = pool::Pool::new(0);
     let mut carrier = pool
         .carrier(renderer)
@@ -298,7 +311,7 @@ fn a_crop_of_the_memo_draws_its_own_pixels(renderer: &mut GlesRenderer, memo: &M
     }
     println!(
         "  the 120×80 crop at (200, 40), drawn by smithay: at most {off} from the memo there; \
-         its mirror in y differs by {apart}"
+         its mirror in y differs by {apart}; through MASKED_TEXTURE under a mask of the box"
     );
     Ok(())
 }
