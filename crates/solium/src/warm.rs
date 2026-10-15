@@ -161,11 +161,14 @@ impl Warm {
         self.held >= self.inject
     }
 
-    /// A reload succeeded: with `on_reload`, the gate holds again until
-    /// ready, at most `max_ms` from the next pass asked.
-    /// `tests::hold_and_on_reload_are_obeyed`.
+    /// A reload succeeded: with `on_reload`, a gate that has let its frame
+    /// through holds again until ready, at most `max_ms` from the next pass
+    /// asked. A gate still holding is left as it is, so `max_ms` caps the
+    /// clear colour however many reloads come while it shows.
+    /// `tests::hold_and_on_reload_are_obeyed`,
+    /// `tests::a_reload_during_a_hold_keeps_its_cap`.
     pub(crate) fn reloaded(&mut self) {
-        if self.config.on_reload {
+        if self.config.on_reload && self.done {
             self.done = false;
             self.since = None;
             self.held = 0;
@@ -342,6 +345,31 @@ mod tests {
             !once.holding(ms(100), false),
             "on_reload = false held after a reload"
         );
+    }
+
+    /// **A reload during a hold keeps its cap**: `on_reload` arms a gate
+    /// that has let its frame through, and a reload while it still holds
+    /// changes nothing, so `max_ms` caps the screen's clear colour however
+    /// often the configuration is reloaded while it shows (an editor saving
+    /// as it types, with auto-reload).
+    #[test]
+    fn a_reload_during_a_hold_keeps_its_cap() {
+        let ms = Duration::from_millis;
+        let mut warm = Warm::default();
+        warm.configure(FirstFrame {
+            on_reload: true,
+            ..FirstFrame::default()
+        });
+        assert!(warm.holding(ms(0), false));
+        for at in [500, 1000, 1500, 1999] {
+            warm.reloaded();
+            assert!(warm.holding(ms(at), false), "released early at {at} ms");
+        }
+        assert!(
+            !warm.holding(ms(2000), false),
+            "the reloads during the hold moved its cap"
+        );
+        assert!(warm.capped());
     }
 
     /// **`startup.first_frame` is read and checked.**
