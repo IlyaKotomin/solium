@@ -2678,6 +2678,7 @@ pub(crate) fn background_strips(
 /// through the client's clip when there is one and `programs`, the clip's
 /// compiled pair, to draw it with -- without them a rounded client is drawn
 /// square, and so are its strips. Nothing for no strips (`"none"`).
+/// `tests::fitting::the_background_is_drawn_where_the_picture_does_not_reach`.
 pub(crate) fn background_elements(
     pane: &Pane,
     strips: Option<Strips>,
@@ -4237,6 +4238,64 @@ mod tests {
                 strips(1.0, None).clip,
                 None,
                 "a square client's strips are square"
+            );
+        }
+
+        /// **The background is drawn where the picture does not reach, and
+        /// only there** (#233): one solid per strip that is not empty, in the
+        /// background's colour, each under the pane's own identity for that
+        /// side so a strip that moves is damaged where it was; and nothing at
+        /// all for `"none"`. `panes` puts them behind the client, which needs
+        /// a renderer and is read.
+        #[test]
+        fn the_background_is_drawn_where_the_picture_does_not_reach() {
+            let (placed, committed) = anchored_right_and_top();
+            let pane = crate::pane::Pane::loading(
+                "kitty",
+                None,
+                Rectangle::new((100, 50).into(), (600, 400).into()),
+                std::path::PathBuf::new(),
+                None,
+                std::time::Duration::ZERO,
+            );
+            let colour = Some([0x10, 0x20, 0x30, 0xff]);
+            let elements = crate::render::background_elements(
+                &pane,
+                crate::render::background_strips(colour, &placed, committed, 1.0, 1.0, None),
+                None,
+            );
+            let drawn: Vec<(Rectangle<i32, Physical>, [f32; 4], Id)> = elements
+                .iter()
+                .map(|element| match element {
+                    crate::render::Element::Solid(solid) => {
+                        let painted = solid.color();
+                        (
+                            solid.geometry(Scale::from(1.0)),
+                            [painted.r(), painted.g(), painted.b(), painted.a()],
+                            solid.id().clone(),
+                        )
+                    }
+                    _ => panic!("a square client's strip is a plain solid"),
+                })
+                .collect();
+            let [_, below, beside, _] = pane.background();
+            let wanted = background_colour(colour, 1.0).expect("a colour");
+            assert_eq!(
+                drawn,
+                vec![
+                    (physical(100, 350, 600, 100), wanted, below.clone()),
+                    (physical(100, 50, 200, 300), wanted, beside.clone()),
+                ],
+                "the band below and the strip on the left, and no empty strip"
+            );
+            assert!(
+                crate::render::background_elements(
+                    &pane,
+                    crate::render::background_strips(None, &placed, committed, 1.0, 1.0, None),
+                    None,
+                )
+                .is_empty(),
+                "\"none\" draws nothing"
             );
         }
 

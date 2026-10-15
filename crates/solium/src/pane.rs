@@ -556,8 +556,8 @@ pub(crate) struct Pane {
     /// (#233): one each for the band above, the band below and the two sides,
     /// so a strip that moves from one frame to the next is damaged where it
     /// was and where it is, rather than being a new element every frame.
-    /// Read by `render::background_elements`, which needs a renderer and is
-    /// not tested.
+    /// Read by `render::background_elements`:
+    /// `render::tests::fitting::the_background_is_drawn_where_the_picture_does_not_reach`.
     background: [smithay::backend::renderer::element::Id; 4],
 }
 
