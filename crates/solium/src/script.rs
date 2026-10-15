@@ -9370,7 +9370,7 @@ mod tests {
                     Command::Resize(settings) => Some(settings),
                     _ => None,
                 })
-                .last()
+                .next_back()
         };
         let fill = |fill: Fill| {
             Some(Settings {
