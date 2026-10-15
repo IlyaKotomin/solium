@@ -3261,6 +3261,45 @@ pub(crate) mod tests {
         assert!((clear.reach - 1.0).abs() < f64::EPSILON, "{}", clear.reach);
     }
 
+    /// **The shipped `shade` loads, binds and checks its params**: one pass
+    /// reading only the part's shape, so a rule of it is T0 and runs once
+    /// per size; nothing read past the part; a param out of range clamped
+    /// with a warning, and one it does not have refused with the one meant.
+    #[test]
+    fn the_shipped_shade_loads_binds_and_checks_its_params() {
+        use crate::effect::rules::{Tier, tier};
+        use solium_effects::spec::{Severity, Value};
+        let mut host: super::Host<u32> = super::Host::new(Library::with(None, shipped()));
+        host.want("rules", ["shade".to_owned()]);
+        let bound = host.bind("shade", &[]).expect("binds at its defaults");
+        let plan = &bound.plans[0];
+        assert_eq!(plan.steps.len(), 1, "one pass");
+        assert!(plan.reads.shape, "{:?}", plan.reads);
+        assert!(!plan.reads.backdrop, "{:?}", plan.reads);
+        assert_eq!(tier(plan.reads, None), Tier::Generated, "{:?}", plan.reads);
+        assert!(bound.reach.abs() < f64::EPSILON, "{}", bound.reach);
+        assert!(bound.warnings.is_empty(), "{:?}", bound.warnings);
+
+        let clamped = host
+            .bind("shade", &[("strength".to_owned(), Value::Number(3.0))])
+            .expect("clamped, not refused");
+        assert!(
+            clamped
+                .params
+                .contains(&("strength".to_owned(), Value::Number(1.0))),
+            "{:?}",
+            clamped.params
+        );
+        assert_eq!(clamped.warnings.len(), 1, "{:?}", clamped.warnings);
+        assert_eq!(clamped.warnings[0].severity, Severity::Warning);
+
+        let refused = host
+            .bind("shade", &[("widht".to_owned(), Value::Number(6.0))])
+            .expect_err("a typo");
+        assert_eq!(refused.severity, Severity::Error);
+        assert!(refused.message.contains("`width`"), "{refused:?}");
+    }
+
     /// **A user's `blur` folder shadows the shipped one**, which is there to
     /// be shadowed.
     #[test]

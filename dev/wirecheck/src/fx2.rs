@@ -313,6 +313,21 @@ pub(crate) fn shipped_blur(passes: u32, offset: f64) -> Fixture {
     }
 }
 
+/// The shipped `shade/` with `params` (the glass style's are its defaults),
+/// as its `effect.lua` makes it (no Lua here): its one pass, its input the
+/// part's shape alone. FX3's case 13j draws it.
+pub(crate) fn shipped_shade(params: Vec<(String, Value)>) -> Fixture {
+    Fixture {
+        inputs: &["shape"],
+        stages: vec![pass("shade.frag", 1.0, &[])],
+        params,
+        frags: &[(
+            "shade.frag",
+            include_str!("../../../crates/solium/effects/shade/shade.frag"),
+        )],
+    }
+}
+
 /// `three/`: a state drawing green, and one pass reading `self`'s red, the
 /// state's green and the analytic shape's coverage as blue.
 fn three() -> Fixture {

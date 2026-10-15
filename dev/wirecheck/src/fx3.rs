@@ -1,6 +1,6 @@
 //! FX3's GPU cases: the memo a T2 slot reads and the crop of it a part draws,
-//! and a backdrop drawn beneath a warp with the hole its capture keeps (13i),
-//! which no unit test can reach. Run alone with `WIRECHECK_ONLY=fx3`, and after
+//! a backdrop drawn beneath a warp with the hole its capture keeps (13i), and
+//! the shipped shade's edge (13j), which no unit test can reach. Run alone with `WIRECHECK_ONLY=fx3`, and after
 //! FX2's cases in a full run. Each prints a `=== FX3:` heading. The effect
 //! programs, the executor and the effect element are the compositor's own, as
 //! FX2's cases include them (`crate::fx2::{gl, run, element}`).
@@ -33,6 +33,111 @@ pub(crate) fn all(renderer: &mut GlesRenderer) -> Result<()> {
     let memo = the_memo_matches_a_whole_monitor_blur(renderer)?;
     a_crop_of_the_memo_draws_its_own_pixels(renderer, &memo)?;
     a_backdrop_beneath_a_mesh_and_its_hole(renderer)?;
+    the_shipped_shade_is_a_dark_edge_round_the_outline(renderer)?;
+    Ok(())
+}
+
+/// **Case 13j: the shipped shade is a dark edge just inside the part's
+/// rounded outline.** `shade/` at its defaults (the `glass` style's width 12,
+/// strength 0.5, black), run once as `render::run_slots` runs a T0 chain:
+/// its first input the pool's blank, over a 400×300 part with 16-pixel
+/// corners and no reach. Read back, premultiplied: on all four sides the
+/// very edge is dark (alpha 100 or more, no channel above 8); 6 px in it is
+/// fainter by more than 24 and not gone; 14 px in, and in the middle,
+/// nothing; and at the top-left corner nothing outside its curve at (1, 1)
+/// and dark on it at (5, 5). What the style's `Shade.qml` drew in QML until
+/// 2026-10-15, now one pass on the GPU, run once per size. With `width = 0`,
+/// nothing anywhere, and with `strength = 1` darker at the edge.
+fn the_shipped_shade_is_a_dark_edge_round_the_outline(renderer: &mut GlesRenderer) -> Result<()> {
+    use solium_effects::spec::Value;
+    println!("\n=== FX3: the shipped shade, a dark edge just inside the outline ===");
+    let defaults = || {
+        vec![
+            ("color".to_owned(), Value::Vec4([0.0, 0.0, 0.0, 1.0])),
+            ("falloff".to_owned(), Value::Number(2.0)),
+            ("radius".to_owned(), Value::Number(-1.0)),
+            ("strength".to_owned(), Value::Number(0.5)),
+            ("width".to_owned(), Value::Number(12.0)),
+        ]
+    };
+    let with = |name: &str, value: f64| {
+        let mut params = defaults();
+        for (each, given) in &mut params {
+            if each == name {
+                *given = Value::Number(value);
+            }
+        }
+        params
+    };
+    let size = (400_usize, 300_usize);
+    // RGBA at (x, y) of the shade drawn with `params`.
+    let draw = |renderer: &mut GlesRenderer, params| -> Result<Vec<u8>> {
+        let (plan, programs) = fx2::build(renderer, fx2::shipped_shade(params))?;
+        let mut pool = pool::Pool::new(0);
+        let blank = pool.blank(renderer).ok_or_else(|| anyhow!("no blank texture"))?;
+        let textures = [(plan.first_input.as_str(), blank, run::BoxMap::WHOLE)];
+        let inputs = run::Inputs {
+            radii: [16.0; 4],
+            ..fx2::whole(size, &textures)
+        };
+        let mut held = run::Held::default();
+        let outcome = fx2::run_once(
+            renderer,
+            &mut pool,
+            &|key| fx2::lookup(&programs, key),
+            &plan,
+            &mut held,
+            &inputs,
+        )?;
+        let run::Outcome::Done(texture, _) = outcome else {
+            return Err(anyhow!("the shade did not run: {outcome:?}"));
+        };
+        let bytes = fx2::read_rgba(renderer, &texture)?;
+        drop(held);
+        pool.sweep(renderer);
+        fx2::free(renderer, programs)?;
+        Ok(bytes)
+    };
+    let pixel = |bytes: &[u8], x: usize, y: usize| -> [u8; 4] {
+        let at = (y * size.0 + x) * 4;
+        bytes
+            .get(at..at + 4)
+            .and_then(|pixel| <[u8; 4]>::try_from(pixel).ok())
+            .unwrap_or_default()
+    };
+    let shade = draw(renderer, defaults())?;
+    for (x, y) in [(200, 0), (0, 150), (399, 150), (200, 299)] {
+        let [r, g, b, a] = pixel(&shade, x, y);
+        if a < 100 || r.max(g).max(b) > 8 {
+            return Err(anyhow!("({x}, {y}) is {:?}, not a dark edge", [r, g, b, a]));
+        }
+    }
+    let (edge, inward) = (pixel(&shade, 200, 0)[3], pixel(&shade, 200, 6)[3]);
+    if inward == 0 || inward + 24 >= edge {
+        return Err(anyhow!("it does not fall away inward: {edge} at the edge, {inward} 6 px in"));
+    }
+    for (x, y) in [(200, 14), (14, 150), (200, 150)] {
+        let a = pixel(&shade, x, y)[3];
+        if a != 0 {
+            return Err(anyhow!("it reaches ({x}, {y}): alpha {a}"));
+        }
+    }
+    let (outside, on) = (pixel(&shade, 1, 1)[3], pixel(&shade, 5, 5)[3]);
+    if outside > 8 || on < 60 {
+        return Err(anyhow!("it does not follow the round corner: {outside} outside it, {on} on it"));
+    }
+    let none = draw(renderer, with("width", 0.0))?;
+    if let Some(at) = none.chunks_exact(4).position(|pixel| pixel[3] != 0) {
+        return Err(anyhow!("width 0 drew at ({}, {})", at % size.0, at / size.0));
+    }
+    let strong = pixel(&draw(renderer, with("strength", 1.0))?, 200, 0)[3];
+    if strong <= edge {
+        return Err(anyhow!("strength 1 is no darker at the edge: {strong} against {edge}"));
+    }
+    println!(
+        "  edge alpha {edge}, 6 px in {inward}, none 14 px in or in the middle, round at the \
+         corner ({outside} outside, {on} on it); width 0 draws nothing; strength 1 gives {strong}"
+    );
     Ok(())
 }
 
