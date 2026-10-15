@@ -451,6 +451,16 @@ draw and the hole on the GPU.
 `dev/effects-check.sh blur` blurs a video player's own pixels through a rule
 and shows a still window's chain run only on the passes that captured it.
 
+A rule with a `fade` eases its slot in and out as it comes and goes
+(`effect::fade`): `build_slots` steps each slot through `Solium::slot_fades`
+at the pass's instant, so a slot whose rule has just matched is wanted from
+opacity 0, and one whose rule has stopped is still wanted, its result drawn
+as it is at a falling opacity, until it reaches 0 and is wanted no more. The
+opacity is the walk's (`Slots::opacity`, multiplied in `slot_element` and in
+a beneath draw's alpha), and nothing is run for it; a pass a fade moves asks
+for the next. The glass style's shade is one: a T0 `shade` in front of the
+pane, matching `focused = false`.
+
 The first desktop frame waits for what it shows (spec C14: nothing pops in
 after it). Once a pass, at the end of `prepare`, `render::hold_first_frame`
 asks `warm::Warm` whether to hold, given `Solium::first_frame_ready`: today

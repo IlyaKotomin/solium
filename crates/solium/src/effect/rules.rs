@@ -131,10 +131,29 @@ pub(crate) enum CutChoice {
     Background,
 }
 
+/// How a rule's slot comes and goes, its `fade` (amended 2026-10-15, the
+/// glass shade): the slot's result is composited at an opacity that eases
+/// from 0 to 1 over `duration` on `curve` when the rule starts to fill the
+/// slot, its match coming true, and from 1 back to 0 when it stops, the
+/// result drawn as it is and nothing run again for it. A fade turned round
+/// part of the way goes back from where it got to, in that share of
+/// `duration`. With none the slot is filled and emptied at once.
+/// `tests::rules_read_fade`, `effect::fade::tests`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Fade {
+    pub(crate) duration: std::time::Duration,
+    pub(crate) curve: solium_animation::Curve,
+}
+
+/// The longest `fade` a rule may ask for, in milliseconds: a minute, past
+/// which a fade is a slot that never settles. `tests::rules_read_fade`.
+const FADE_MAX_MS: f64 = 60_000.0;
+
 /// One rule, read. `memo = false` never shares its chain's backdrop-only
-/// part per monitor (Ruling F30), and `cut` picks the xray it reads.
+/// part per monitor (Ruling F30), `cut` picks the xray it reads, and `fade`
+/// eases the slot in and out as the rule comes and goes.
 /// `tests::a_rule_reads_its_part_slot_match_and_chain`,
-/// `tests::rules_read_memo_and_cut`.
+/// `tests::rules_read_memo_and_cut`, `tests::rules_read_fade`.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Rule {
     pub(crate) matches: Match,
@@ -145,6 +164,7 @@ pub(crate) struct Rule {
     pub(crate) mask: MaskKind,
     pub(crate) memo: bool,
     pub(crate) cut: CutChoice,
+    pub(crate) fade: Option<Fade>,
 }
 
 /// Where a list of rules came from, in the order a later one wins for one
@@ -174,9 +194,10 @@ const KINDS: [&str; 4] = ["layer", "region", "surface", "layer_shell"];
 const PART_LIST: &str =
     "pane, client, popup, layer:<name>, region:titlebar, surface:<name> or layer_shell:<namespace>";
 const SLOTS: [&str; 3] = ["behind", "front", "replace"];
-const KEYS: [&str; 8] = [
-    "match", "part", "slot", "effect", "source", "mask", "memo", "cut",
+const KEYS: [&str; 9] = [
+    "match", "part", "slot", "effect", "source", "mask", "memo", "cut", "fade",
 ];
+const FADE_KEYS: [&str; 2] = ["duration", "easing"];
 const CUTS: [&str; 2] = ["below", "background"];
 const WINDOW_KEYS: [&str; 6] = [
     "app_id",
@@ -365,7 +386,7 @@ fn rule(each: &Tree) -> Result<Rule, Refused> {
                 None => (
                     "rule",
                     format!(
-                        "`{key}` is not a rule key: match, part, slot, effect, source, mask, memo or cut"
+                        "`{key}` is not a rule key: match, part, slot, effect, source, mask, memo, cut or fade"
                     ),
                 ),
             });
@@ -472,6 +493,12 @@ fn rule(each: &Tree) -> Result<Rule, Refused> {
         }
         Some(_) => return Err(("cut", "`cut` is below or background".to_owned())),
     };
+    let fade = each
+        .field("fade")
+        .map(read_fade)
+        .transpose()
+        .map_err(|message| ("fade", message))?
+        .flatten();
     Ok(Rule {
         matches,
         part,
@@ -481,7 +508,56 @@ fn rule(each: &Tree) -> Result<Rule, Refused> {
         mask,
         memo,
         cut,
+        fade,
     })
+}
+
+/// `fade`: `{ duration = <ms>, easing = "<curve>" }`, the curve `outCubic`
+/// when not given; `false` is none. `tests::rules_read_fade`.
+fn read_fade(fade: &Tree) -> Result<Option<Fade>, String> {
+    const SHAPE: &str = "`fade` is { duration = <ms>, easing = \"<curve>\" }, or false";
+    let fields = match fade {
+        Tree::Bool(false) => return Ok(None),
+        Tree::Table { list, fields } if list.is_empty() => fields,
+        _ => return Err(SHAPE.to_owned()),
+    };
+    if let Some(key) = fields.keys().find(|key| !FADE_KEYS.contains(&key.as_str())) {
+        return Err(format!(
+            "`{key}` is not a key of `fade`: duration or easing{}",
+            meant(key, &FADE_KEYS)
+        ));
+    }
+    let ms = match fields.get("duration") {
+        None => return Err(format!("`fade` needs `duration`: {SHAPE}")),
+        Some(Tree::Number(number)) => *number,
+        #[expect(clippy::cast_precision_loss, reason = "milliseconds, far below 2^52")]
+        Some(Tree::Int(int)) => *int as f64,
+        Some(_) => f64::NAN,
+    };
+    if !(0.0..=FADE_MAX_MS).contains(&ms) {
+        return Err(format!(
+            "`fade.duration` is a number of milliseconds from 0 to {FADE_MAX_MS}"
+        ));
+    }
+    let curve = match fields.get("easing") {
+        None => solium_animation::Curve::OutCubic,
+        Some(Tree::Text(name)) => solium_animation::Curve::from_name(name).ok_or_else(|| {
+            let names: Vec<&str> = solium_animation::Curve::all()
+                .iter()
+                .map(|(name, _)| *name)
+                .collect();
+            format!(
+                "`{name}` is not a curve: {}{}",
+                names.join(", "),
+                meant(name, &names)
+            )
+        })?,
+        Some(_) => return Err("`fade.easing` is a curve's name, such as \"outCubic\"".to_owned()),
+    };
+    Ok(Some(Fade {
+        duration: std::time::Duration::from_secs_f64(ms / 1000.0),
+        curve,
+    }))
 }
 
 /// `match`: `"*"`, or a table of the keys the part's family has.
@@ -745,7 +821,10 @@ impl Resolved {
         }
     }
 
-    /// `tests::with_no_rules_nothing_resolves_and_no_fact_is_asked`.
+    /// `tests::with_no_rules_nothing_resolves_and_no_fact_is_asked`. A
+    /// frame steps every part's slots, a part that resolved nothing
+    /// included, since one may be fading out (`effect::fade`).
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.behind.is_none() && self.front.is_none() && self.replace.is_none()
     }
@@ -1280,6 +1359,69 @@ mod tests {
         ] {
             let refused = parse(&rules(&format!("{{ {lua} }}"))).expect_err(lua);
             assert_eq!(refused[0].key, key, "{lua}");
+            assert!(
+                refused[0].message.contains(says),
+                "{lua}: {}",
+                refused[0].message
+            );
+        }
+    }
+
+    /// **A rule reads its `fade`**: a duration in milliseconds and a curve
+    /// by name, `outCubic` when not given; none when it is left out or
+    /// `false`; and each way it can be wrong refused at `fade`, a curve or a
+    /// key misspelled with the one meant.
+    #[test]
+    fn rules_read_fade() {
+        use super::Fade;
+        use solium_animation::Curve;
+        use std::time::Duration;
+        let read = parse(&rules(
+            r#"{ { match = "*", part = "pane", slot = "front", effect = "blur" },
+                 { match = "*", part = "pane", slot = "front", effect = "blur", fade = false },
+                 { match = "*", part = "pane", slot = "front", effect = "blur", fade = { duration = 240 } },
+                 { match = "*", part = "pane", slot = "front", effect = "blur",
+                   fade = { duration = 90.5, easing = "linear" } } }"#,
+        ))
+        .expect("parses");
+        assert_eq!((read[0].fade, read[1].fade), (None, None));
+        assert_eq!(
+            read[2].fade,
+            Some(Fade {
+                duration: Duration::from_millis(240),
+                curve: Curve::OutCubic
+            })
+        );
+        assert_eq!(
+            read[3].fade,
+            Some(Fade {
+                duration: Duration::from_micros(90_500),
+                curve: Curve::Linear
+            })
+        );
+        for (fade, says) in [
+            ("240", "`fade` is { duration"),
+            ("true", "`fade` is { duration"),
+            ("{ easing = \"linear\" }", "needs `duration`"),
+            ("{ duration = -1 }", "from 0 to 60000"),
+            ("{ duration = 60001 }", "from 0 to 60000"),
+            ("{ duration = \"slow\" }", "from 0 to 60000"),
+            (
+                "{ duration = 100, easing = \"outCubik\" }",
+                "did you mean `outCubic`",
+            ),
+            ("{ duration = 100, easing = 3 }", "a curve's name"),
+            (
+                "{ duration = 100, curve = \"linear\" }",
+                "duration or easing",
+            ),
+            ("{ durations = 100 }", "did you mean `duration`"),
+        ] {
+            let lua = format!(
+                r#"{{ {{ match = "*", part = "pane", slot = "front", effect = "blur", fade = {fade} }} }}"#
+            );
+            let refused = parse(&rules(&lua)).expect_err(&lua);
+            assert_eq!(refused[0].key, "fade", "{lua}");
             assert!(
                 refused[0].message.contains(says),
                 "{lua}: {}",

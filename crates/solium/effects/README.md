@@ -56,6 +56,7 @@ return {
 | `mask` | how the result is cut: `"shape"`, the part's own shape (the default: the client's own rectangle and rounded corners for `client`; the whole window rounded at its largest corner for `pane`; the band, as above, for `region:titlebar`; the rectangle for the rest), or `"alpha"`, the alpha of the part's own pixels, which needs `source = "self"` |
 | `memo` | `false` shares nothing of this rule's chain per monitor: each part runs its whole chain over xray, whatever `effects.memo.split` says (see *The memo*). `true` unless you say so |
 | `cut` | which xray a chain reading the `backdrop` reads: `"below"` (the default), every layer `effects.xray.layers` names below the part's own; or `"background"`, the wallpaper alone, even where `layers` has `"bottom"` |
+| `fade` | how the slot comes and goes as the rule starts and stops matching (a window gaining or losing the keyboard, say): `{ duration = 240, easing = "outCubic" }`, a duration in milliseconds from 0 to 60000 and a curve by name, `outCubic` when not given. The slot's result is drawn at an opacity that eases from 0 to 1 when the rule starts to fill the slot, and from 1 to 0 when it stops, the result drawn as it is and nothing run again for it; turned round part of the way, it goes back from where it got to. Left out, or `false`, the slot is filled and emptied at once |
 
 A link may also give `reach` and `bleed`, in pixels, in place of the
 effect's own. A chain reads as far around its part as its first link

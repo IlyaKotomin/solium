@@ -490,6 +490,7 @@ function sol.problems() end
 ---@field mask? "shape"|"alpha" How the result is cut: the part's shape (the default), or the alpha of the part's own pixels, which needs `source = "self"`.
 ---@field memo? boolean `false`: never share this rule's backdrop-only part per monitor, whatever `effects.memo.split` says; each part runs its whole chain. Default `true`.
 ---@field cut? "below"|"background" Which layers a T2 chain reads: every configured layer below the part's own (`"below"`, the default) or the wallpaper alone (`"background"`), even when `effects.xray.layers` has `"bottom"`.
+---@field fade? { duration: number, easing?: string }|false How the slot comes and goes as the rule starts and stops matching: its result drawn at an opacity that eases from 0 to 1 over `duration` milliseconds (0 to 60000) on `easing` (a curve's name, `"outCubic"` when not given) when the rule starts to fill the slot, and back to 0 when it stops, nothing run again for it; turned round part of the way it goes back from where it got to. Left out, or `false`: filled and emptied at once.
 
 ---What T2 effects read as the backdrop, `sol.effects`' `xray`: a sharp
 ---picture of the layers below a part, per monitor, rebuilt only when what is

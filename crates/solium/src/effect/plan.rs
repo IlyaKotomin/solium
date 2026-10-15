@@ -478,6 +478,9 @@ pub(crate) struct Slots {
     screened: HashMap<(Owner, Slot, String), crate::effect::beneath::Screened>,
     reach: HashMap<PaneId, i32>,
     facts: u32,
+    /// A slot fading in or out with its rule, at the opacity its fade has
+    /// reached this pass; every other slot is whole (`effect::fade`).
+    opacity: HashMap<(Owner, Slot), f32>,
 }
 
 impl Slots {
@@ -490,6 +493,26 @@ impl Slots {
     /// `tests::a_slot_is_wanted_by_its_owner_and_slot_and_ready_apart`.
     pub(crate) fn want(&mut self, owner: Owner, slot: Slot, key: RuleKey) {
         self.wants.insert((owner, slot), key);
+    }
+
+    /// A wanted slot fading in or out with its rule: its result is drawn at
+    /// `opacity` this pass, over whatever its part is drawn at.
+    /// `state::tests::real_client::a_rule_with_a_fade_eases_its_slot_in_and_out_with_the_focus`.
+    pub(crate) fn set_opacity(&mut self, owner: Owner, slot: Slot, opacity: f32) {
+        self.opacity.insert((owner, slot), opacity);
+    }
+
+    /// How opaque a slot's result is drawn this pass: 1 but while its rule's
+    /// fade moves it (`effect::fade`).
+    /// `state::tests::real_client::a_rule_with_a_fade_eases_its_slot_in_and_out_with_the_focus`.
+    pub(crate) fn opacity(&self, owner: &Owner, slot: Slot) -> f32 {
+        if self.opacity.is_empty() {
+            return 1.0;
+        }
+        self.opacity
+            .get(&(owner.clone(), slot))
+            .copied()
+            .unwrap_or(1.0)
     }
 
     /// `tests::a_slot_is_wanted_by_its_owner_and_slot_and_ready_apart`.

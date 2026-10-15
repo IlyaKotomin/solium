@@ -1661,6 +1661,7 @@ fn unders(
                 mask: mask.clone(),
                 id: t2.id.clone(),
                 commit: t2.under_commit(warp, screened.rerun),
+                opacity: slots.opacity(owner, *slot),
             });
         }
     }
@@ -1711,18 +1712,16 @@ pub(crate) fn style_rules(frame: &crate::pane::Frame) -> (&[crate::effect::rules
 /// `state::tests::real_client::a_rule_on_focused_follows_the_keyboard`,
 /// `state::tests::real_client::a_surface_has_a_slot_per_monitor_and_a_layer_surface_one_of_its_own`.
 pub(crate) fn build_slots(state: &mut Solium) -> crate::effect::plan::Slots {
-    use crate::effect::plan::{self, PaneSlot, Slots};
-    use crate::effect::rules::{Facts, PartRef};
-    use smithay::reexports::wayland_server::Resource as _;
-    let state: &Solium = state;
-    let mut slots = Slots::default();
+    use crate::effect::plan::{Owner, Slots};
     if state.rules.is_empty()
         && state
             .panes
             .iter()
             .all(|pane| style_rules(pane.frame()).0.is_empty())
     {
-        return slots;
+        // No rule is left to fade a slot either.
+        state.slot_fades.clear();
+        return Slots::default();
     }
     // While the session is locked no slot of the session is wanted, T1 or
     // T2: nothing of it is captured (a self or a mask capture), run or read
@@ -1730,8 +1729,39 @@ pub(crate) fn build_slots(state: &mut Solium) -> crate::effect::plan::Slots {
     // pointer's own scene keeps its slots from Task 61 on.
     // `state::tests::real_client::nothing_of_the_session_is_captured_while_locked`.
     if state.lock.is_some() {
-        return slots;
+        return Slots::default();
     }
+    // At the pass's instant, as the walk draws: a slot fading in or out with
+    // its rule (`effect::fade`) is shown at its opacity then.
+    let now = pass_now(state);
+    let mut fades = std::mem::take(&mut state.slot_fades);
+    let slots = resolve_slots(state, &mut fades, now);
+    // A slot whose pane is out of sight this pass keeps its fade; one whose
+    // owner has gone does not.
+    fades.sweep(|owner| match owner {
+        Owner::Pane(pane, _) => state.panes.get(*pane).is_some(),
+        Owner::Surface(..) | Owner::LayerShell(_) => false,
+    });
+    // A fade draws no new picture and damages nothing, so its frames are
+    // asked for here or it stops where it stands.
+    // `state::tests::real_client::a_rule_with_a_fade_eases_its_slot_in_and_out_with_the_focus`.
+    if fades.moving(now) {
+        state.redraw = true;
+    }
+    state.slot_fades = fades;
+    slots
+}
+
+/// [`build_slots`]' walk, its slots stepped through `fades` at `now`.
+fn resolve_slots(
+    state: &Solium,
+    fades: &mut crate::effect::fade::Fades,
+    now: std::time::Duration,
+) -> crate::effect::plan::Slots {
+    use crate::effect::plan::{self, PaneSlot, Slots};
+    use crate::effect::rules::{Facts, PartRef};
+    use smithay::reexports::wayland_server::Resource as _;
+    let mut slots = Slots::default();
     for held in state.panes.iter() {
         let pane = held.id();
         if !shown(state, pane) {
@@ -1753,8 +1783,9 @@ pub(crate) fn build_slots(state: &mut Solium) -> crate::effect::plan::Slots {
             want_resolved(
                 &mut slots,
                 state,
+                (&mut *fades, now),
                 &plan::Owner::Pane(pane, slot_of),
-                state.rules.resolve(style, generation, part, &view),
+                (style, state.rules.resolve(style, generation, part, &view)),
             );
         };
         want(PaneSlot::Pane, PartRef::Pane);
@@ -1793,14 +1824,13 @@ pub(crate) fn build_slots(state: &mut Solium) -> crate::effect::plan::Slots {
                     ..Facts::default()
                 };
                 let resolved = state.rules.resolve(&[], 0, PartRef::Surface(name), &facts);
-                if !resolved.is_empty() {
-                    want_resolved(
-                        &mut slots,
-                        state,
-                        &plan::Owner::Surface(surface.id(), output.name()),
-                        resolved,
-                    );
-                }
+                want_resolved(
+                    &mut slots,
+                    state,
+                    (&mut *fades, now),
+                    &plan::Owner::Surface(surface.id(), output.name()),
+                    (&[], resolved),
+                );
             }
         }
         // And one per client layer surface, matched by its namespace.
@@ -1815,41 +1845,65 @@ pub(crate) fn build_slots(state: &mut Solium) -> crate::effect::plan::Slots {
             let resolved = state
                 .rules
                 .resolve(&[], 0, PartRef::LayerShell(namespace), &facts);
-            if !resolved.is_empty() {
-                want_resolved(
-                    &mut slots,
-                    state,
-                    &plan::Owner::LayerShell(layer.wl_surface().id()),
-                    resolved,
-                );
-            }
+            want_resolved(
+                &mut slots,
+                state,
+                (&mut *fades, now),
+                &plan::Owner::LayerShell(layer.wl_surface().id()),
+                (&[], resolved),
+            );
         }
     }
     slots
 }
 
-/// Want each slot a part resolved to whose chain is bound.
-/// `state::tests::real_client::a_rule_whose_chain_is_not_bound_wants_no_slot`.
+/// Want each slot a part resolved to whose chain is bound, stepped through
+/// `fades` at `now`: a rule with a `fade` is wanted at the opacity its fade
+/// has reached, and still wanted, fading out, once it stops matching, until
+/// it is gone (`effect::fade`); one without is wanted whole while it matches.
+/// `style` is the pane's style's rules, which a key of the style's names.
+/// `state::tests::real_client::a_rule_whose_chain_is_not_bound_wants_no_slot`,
+/// `state::tests::real_client::a_rule_with_a_fade_eases_its_slot_in_and_out_with_the_focus`.
 fn want_resolved(
     slots: &mut crate::effect::plan::Slots,
     state: &Solium,
+    (fades, now): (&mut crate::effect::fade::Fades, std::time::Duration),
     owner: &crate::effect::plan::Owner,
-    resolved: crate::effect::rules::Resolved,
+    (style, resolved): (
+        &[crate::effect::rules::Rule],
+        crate::effect::rules::Resolved,
+    ),
 ) {
     use crate::effect::rules::Slot;
     for slot in [Slot::Behind, Slot::Front, Slot::Replace] {
-        if let Some(key) = resolved.get(slot)
-            && let Some(chain) = state.chains.get(key)
-        {
-            // A T2 chain on a part no xray layer lies below (a part on
-            // `background`) reads nothing: no slot, and no problem (Ruling
-            // F29). `effect::xray::tests::a_part_reads_the_xray_layers_strictly_below_its_band`.
-            if chain.tier == crate::effect::rules::Tier::Xray
-                && t2_cut(state, owner, chain).is_none()
-            {
-                continue;
-            }
-            slots.want(owner.clone(), slot, key);
+        let bound = resolved
+            .get(slot)
+            .filter(|key| state.chains.get(*key).is_some());
+        let with_fade = bound.map(|key| {
+            let fade = state.rules.rule(style, key).and_then(|rule| rule.fade);
+            (key, fade)
+        });
+        let Some(shown) = fades.step(
+            owner,
+            slot,
+            with_fade,
+            |key| state.chains.get(key).is_some(),
+            now,
+        ) else {
+            continue;
+        };
+        let Some(chain) = state.chains.get(shown.key) else {
+            continue;
+        };
+        // A T2 chain on a part no xray layer lies below (a part on
+        // `background`) reads nothing: no slot, and no problem (Ruling
+        // F29). `effect::xray::tests::a_part_reads_the_xray_layers_strictly_below_its_band`.
+        if chain.tier == crate::effect::rules::Tier::Xray && t2_cut(state, owner, chain).is_none() {
+            continue;
+        }
+        slots.want(owner.clone(), slot, shown.key);
+        if shown.opacity < 1.0 {
+            slots.set_opacity(owner.clone(), slot, shown.opacity);
         }
     }
 }
@@ -4049,10 +4103,12 @@ fn slot_element(
         ready.reach,
         corners_times(radii, scale),
     );
+    // A slot fading in or out with its rule is drawn at its fade's opacity,
+    // its result as it is (`effect::fade`).
     Some(Element::Effect(ready.element.at(
         dst,
         cut.then_some(mask),
-        alpha,
+        alpha * slots.opacity(owner, slot),
     )))
 }
 

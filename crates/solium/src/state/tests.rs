@@ -10880,6 +10880,72 @@ end)"#,
         assert!(!slots.wanted(&Owner::Pane(first, PaneSlot::Client), Slot::Behind));
     }
 
+    /// **A rule with a fade eases its slot in and out with the focus**: on
+    /// the window without the keyboard the slot is wanted from opacity 0 and
+    /// reaches 1 over the rule's 200 ms; once that window has the keyboard
+    /// its slot is still wanted, fading from 1, and wanted no more 200 ms on,
+    /// while the other window's comes in. A frame is asked for on every pass
+    /// a fade has yet to arrive, and on none once both have.
+    #[test]
+    fn a_rule_with_a_fade_eases_its_slot_in_and_out_with_the_focus() {
+        use crate::effect::plan::{Owner, PaneSlot, Slots};
+        use crate::effect::rules::Slot;
+        use std::time::Duration;
+        fx2_fixture!(fixture, "rule-fade");
+        let (first, second) = side_by_side_windows(&mut fixture);
+        with_tint_folder(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = { focused = false }, part = "pane", slot = "front", effect = "tint",
+                   fade = { duration = 200, easing = "linear" } } }"#,
+        );
+        // How opaque each window's front slot is drawn, `None` when it is not
+        // wanted, a pass at a time, 100 ms apart.
+        let pass = |fixture: &mut Fixture, after: u64| {
+            fixture.state.clock.advance(Duration::from_millis(after));
+            fixture.state.redraw = false;
+            let slots: Slots = crate::render::build_slots(&mut fixture.state);
+            let on = |pane| {
+                let owner = Owner::Pane(pane, PaneSlot::Pane);
+                slots
+                    .wanted(&owner, Slot::Front)
+                    .then(|| slots.opacity(&owner, Slot::Front))
+            };
+            (on(first), on(second), fixture.state.redraw)
+        };
+        // Within 0.1: the clock goes on running between the passes.
+        let near = |seen: Option<f32>, wanted: Option<f32>| match (seen, wanted) {
+            (Some(seen), Some(wanted)) => (seen - wanted).abs() < 0.1,
+            (seen, wanted) => seen.is_none() && wanted.is_none(),
+        };
+        focus(&mut fixture, first);
+        for (after, wanted) in [
+            (0, (None, Some(0.0), true)),
+            (100, (None, Some(0.5), true)),
+            (100, (None, Some(1.0), false)),
+            (100, (None, Some(1.0), false)),
+        ] {
+            let seen = pass(&mut fixture, after);
+            assert!(
+                near(seen.0, wanted.0) && near(seen.1, wanted.1) && seen.2 == wanted.2,
+                "{after} ms on, fading in: {seen:?}, wanted {wanted:?}"
+            );
+        }
+        focus(&mut fixture, second);
+        for (after, wanted) in [
+            (0, (Some(0.0), Some(1.0), true)),
+            (100, (Some(0.5), Some(0.5), true)),
+            (100, (Some(1.0), None, false)),
+            (100, (Some(1.0), None, false)),
+        ] {
+            let seen = pass(&mut fixture, after);
+            assert!(
+                near(seen.0, wanted.0) && near(seen.1, wanted.1) && seen.2 == wanted.2,
+                "{after} ms on, the focus moved: {seen:?}, wanted {wanted:?}"
+            );
+        }
+    }
+
     /// **A rule on `fullscreen` applies from the configure that sets it**,
     /// the state the compositor last told the client.
     #[test]

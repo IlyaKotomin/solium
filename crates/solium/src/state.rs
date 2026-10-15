@@ -728,6 +728,11 @@ pub(crate) struct Solium {
     pub(crate) rules: crate::effect::rules::Rules,
     /// Every rule's chain, bound at config load, by its key.
     pub(crate) chains: crate::effect::plan::Chains,
+    /// The slots on their way in or out, for a rule with a `fade`, kept from
+    /// one pass to the next by `render::build_slots`.
+    /// `effect::fade::tests::a_slot_fades_in_as_its_rule_comes_and_out_as_it_goes`,
+    /// `tests::real_client::a_rule_with_a_fade_eases_its_slot_in_and_out_with_the_focus`.
+    pub(crate) slot_fades: crate::effect::fade::Fades,
     /// The user's rules' generation: a set taken is a new one, so a key of
     /// the set it replaced finds nothing.
     pub(crate) rules_generation: u32,
@@ -1313,6 +1318,7 @@ impl Solium {
             problems_told: 0,
             rules: crate::effect::rules::Rules::default(),
             chains: crate::effect::plan::Chains::default(),
+            slot_fades: crate::effect::fade::Fades::default(),
             rules_generation: 0,
             rebind: false,
             timer: None,

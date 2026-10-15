@@ -123,6 +123,9 @@ pub(crate) struct Under {
     pub(crate) mask: BeneathMask,
     pub(crate) id: Id,
     pub(crate) commit: CommitCounter,
+    /// The slot's opacity this pass, 1 but while its rule's fade moves it
+    /// (`effect::fade`), over the warp's own alpha.
+    pub(crate) opacity: f32,
 }
 
 /// A part's rest rectangle in its pane's capture, at the capture's scale.
@@ -185,7 +188,7 @@ impl Beneath {
             mesh,
             map,
             mask: *mask,
-            alpha,
+            alpha: alpha * under.opacity,
             program,
         }
     }

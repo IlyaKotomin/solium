@@ -8,6 +8,7 @@
 
 pub(crate) mod beneath;
 pub(crate) mod element;
+pub(crate) mod fade;
 pub(crate) mod geometry;
 pub(crate) mod gl;
 pub(crate) mod host;
