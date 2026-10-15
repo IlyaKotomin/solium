@@ -4171,8 +4171,10 @@ fn chrome(
     drawing: crate::decoration::Drawing,
 ) {
     let title = state.pane_title(pane);
+    let app_id = state.pane_app_id(pane);
     let look = crate::decoration::Look {
         title: &title,
+        app_id: &app_id,
         focused: state.looks_focused(pane),
         pointer_inside: state.pointer_over(pane),
         // `text_input::tests::only_the_pane_whose_window_has_the_caret_is_given_it`.
@@ -4253,8 +4255,10 @@ pub(crate) fn one_layer(
         .find(|(each, ..)| *each == index)?;
     let drawing = layer_drawing_at(canvas, outer, at, scale);
     let title = state.pane_title(pane);
+    let app_id = state.pane_app_id(pane);
     let look = crate::decoration::Look {
         title: &title,
+        app_id: &app_id,
         focused: state.looks_focused(pane),
         pointer_inside: state.pointer_over(pane),
         caret: state.caret_in(pane),

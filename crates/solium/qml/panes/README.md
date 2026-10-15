@@ -122,6 +122,7 @@ Every frame:
 | property | |
 |---|---|
 | `title` | the window's title |
+| `appId` | the window's application id, as `sol.windows()` and a rule's `app_id` read it: its xdg `app_id`, or an X11 window's class; empty while its application has not arrived. A bar shows the application's icon by it, `image://solium/icon/<appId>?size=16`, and hides the icon while `Image.status` is not `Image.Ready`. A window that went keeps its own while it fades |
 | `focused` | whether it has the keyboard |
 | `pointerInside` | whether the pointer is anywhere over the window |
 | `contentWidth`, `contentHeight` | the client's size, inside the insets |

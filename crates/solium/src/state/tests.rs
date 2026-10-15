@@ -22931,6 +22931,34 @@ end)
             );
         }
 
+        /// **A window that went keeps its app id for its frame**: what its
+        /// frame is told as `appId` while it fades is what it was told while
+        /// the window was here, so a bar showing the application's icon fades
+        /// out with it, as it keeps its title
+        /// (`a_window_that_left_is_nobodys_to_find`).
+        #[test]
+        fn a_window_that_left_keeps_its_app_id_for_its_frame() {
+            let mut desk = Desk::new();
+            let opened = desk.open_surface();
+            opened.toplevel.set_app_id("the-app-that-went".to_owned());
+            desk.pump();
+            land(&mut desk);
+            assert_eq!(
+                desk.state.pane_app_id(opened.pane),
+                "the-app-that-went",
+                "the premise: the frame is told the client's app id"
+            );
+
+            opened.toplevel.destroy();
+            desk.pump();
+            let _ = left_of(&desk.state, opened.pane);
+            assert_eq!(
+                desk.state.pane_app_id(opened.pane),
+                "the-app-that-went",
+                "the frame fading out lost its app id"
+            );
+        }
+
         /// **#126: a window whose client has gone is drawn, and is nothing
         /// else.**
         ///

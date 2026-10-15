@@ -166,6 +166,13 @@ Item {
     property int contentWidth: 0
     property int contentHeight: 0
 
+    // The window's application id, as `sol.windows()` and a rule's `app_id`
+    // read it (an X11 window's class), and empty while its application has
+    // not arrived: data only, written when it changes. A bar shows the
+    // application's icon by it, `image://solium/icon/<appId>?size=16`.
+    // `decoration::tests::a_layer_is_told_the_app_id_and_told_again_when_it_changes`.
+    property string appId: ""
+
     // The focused text field's caret, when this pane's window has it, in the
     // pane's own space: `{ valid, x, y, width, height }`, written in place as
     // the caret moves and with `valid: false` when the field goes. A layer

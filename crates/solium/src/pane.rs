@@ -212,6 +212,10 @@ pub(crate) struct Left {
     /// read back in `a_window_that_left_is_nobodys_to_find`.
     pub(crate) title: String,
     pub(crate) focused: bool,
+    /// Its application id, which its frame was told as `appId`, so a bar
+    /// showing the application's icon fades out with it
+    /// (`a_window_that_left_keeps_its_app_id_for_its_frame`).
+    pub(crate) app_id: String,
     /// What it is drawn from.
     pub(crate) remains: Remains,
     /// The fill's identity for the damage tracker, for [`Remains::Lost`].
@@ -1577,6 +1581,7 @@ mod tests {
             over: Vec::new(),
             title: String::new(),
             focused: false,
+            app_id: String::new(),
             remains: Remains::Lost,
             fill: smithay::backend::renderer::element::Id::new(),
         }

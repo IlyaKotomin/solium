@@ -184,6 +184,11 @@ impl Insets {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Look<'a> {
     pub(crate) title: &'a str,
+    /// The window's application id, as `sol.windows()` and a rule's `app_id`
+    /// read it (an X11 window's class), empty while it has none: `appId` on
+    /// every layer, which a bar can show the application's icon by.
+    /// `tests::a_layer_is_told_the_app_id_and_told_again_when_it_changes`.
+    pub(crate) app_id: &'a str,
     pub(crate) focused: bool,
     /// Whether the pointer is anywhere over the window, frame or client.
     pub(crate) pointer_inside: bool,
@@ -200,6 +205,7 @@ pub(crate) struct Look<'a> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Shown {
     title: String,
+    app_id: String,
     focused: bool,
     /// Whether the pointer is anywhere over the window, frame or client. A
     /// border that lights up when you approach the window needs to know this
@@ -895,8 +901,8 @@ impl Decoration {
     /// Hand every layer everything it is told about its window.
     ///
     /// Compared field by field rather than by building a `Shown`: this runs for
-    /// every window of every frame, and the title is the one thing here that
-    /// allocates.
+    /// every window of every frame, and the title and the app id are the only
+    /// things here that allocate.
     ///
     /// Every layer and not only the frame: a glow behind a window that cannot
     /// tell whether the window is focused is a glow that is always on. The
@@ -913,6 +919,7 @@ impl Decoration {
     fn tell(&mut self, look: &Look<'_>, width: i32, height: i32) {
         let Look {
             title,
+            app_id,
             focused,
             pointer_inside,
             caret,
@@ -940,6 +947,7 @@ impl Decoration {
             self.shown.values = values.generation;
         }
         if self.shown.title == title
+            && self.shown.app_id == app_id
             && self.shown.focused == focused
             && self.shown.pointer_inside == pointer_inside
             && self.shown.size == (width, height)
@@ -954,6 +962,8 @@ impl Decoration {
         );
         for layer in &mut self.layers {
             layer.scene.set_string("title", title);
+            // `tests::a_layer_is_told_the_app_id_and_told_again_when_it_changes`.
+            layer.scene.set_string("appId", app_id);
             layer.scene.set_bool("focused", focused);
             layer.scene.set_bool("pointerInside", pointer_inside);
             layer.scene.set_int("contentWidth", content.0);
@@ -965,6 +975,8 @@ impl Decoration {
         }
         self.shown.title.clear();
         self.shown.title.push_str(title);
+        self.shown.app_id.clear();
+        self.shown.app_id.push_str(app_id);
         self.shown.focused = focused;
         self.shown.pointer_inside = pointer_inside;
         self.shown.size = (width, height);
@@ -2601,6 +2613,7 @@ mod tests {
             decoration.tell(
                 &Look {
                     title: "",
+                    app_id: "",
                     focused: false,
                     pointer_inside: false,
                     caret: None,
@@ -3087,6 +3100,7 @@ mod tests {
                 decoration.tell(
                     &Look {
                         title: "",
+                        app_id: "",
                         focused: true,
                         pointer_inside: false,
                         caret: None,
@@ -3266,6 +3280,96 @@ mod tests {
         });
     }
 
+    /// **A layer is told the app id, and told again when it changes**: the
+    /// window's application id reaches a delegated layer's root and an inline
+    /// layer's `PaneStyle` as `appId`, as `title` does, and a new one, or
+    /// none, reaches both again. Read through bindings, for the reason
+    /// `a_delegated_layer_is_told_the_styles_insets` gives.
+    #[test]
+    fn a_layer_is_told_the_app_id_and_told_again_when_it_changes() {
+        on_the_qt_thread(|| {
+            let dir = fixture(
+                "told-app-id",
+                &[
+                    (
+                        "Pane.qml",
+                        r#"
+                        import QtQuick
+                        import Solium
+
+                        PaneStyle {
+                            readonly property bool sawKitty: appId === "kitty"
+                            readonly property int sawLength: appId.length
+
+                            Layer { depth: "frame"; name: "bar"; source: "Frame.qml" }
+                            Layer { depth: "above"; name: "inline"; Item {} }
+                        }
+                        "#,
+                    ),
+                    (
+                        "Frame.qml",
+                        r#"
+                        import QtQuick
+
+                        Item {
+                            property string appId: ""
+                            readonly property bool sawKitty: appId === "kitty"
+                            readonly property bool sawFoot: appId === "org.codeberg.dnkl.foot"
+                            readonly property int sawLength: appId.length
+                        }
+                        "#,
+                    ),
+                ],
+            );
+            let style = crate::style::load(&dir).expect("the fixture loads");
+            let mut decoration = Decoration::from_style(&style, 60, 88).expect("two scenes");
+            let values = Values::default();
+            let tell = |decoration: &mut Decoration, app_id: &str| {
+                decoration.tell(
+                    &Look {
+                        title: "a terminal",
+                        app_id,
+                        focused: true,
+                        pointer_inside: false,
+                        caret: None,
+                        values: &values,
+                    },
+                    60,
+                    88,
+                );
+            };
+            let read = |decoration: &mut Decoration| {
+                let [delegated, inline] = &mut decoration.layers[..] else {
+                    panic!("two layers")
+                };
+                (
+                    [
+                        delegated.scene.get_bool("sawKitty"),
+                        delegated.scene.get_bool("sawFoot"),
+                    ],
+                    delegated.scene.get_int("sawLength"),
+                    inline.scene.get_bool("sawKitty"),
+                    inline.scene.get_int("sawLength"),
+                )
+            };
+
+            tell(&mut decoration, "kitty");
+            assert_eq!(read(&mut decoration), ([true, false], 5, true, 5));
+
+            tell(&mut decoration, "org.codeberg.dnkl.foot");
+            assert_eq!(
+                read(&mut decoration),
+                ([false, true], 22, false, 22),
+                "changed, with nothing else told"
+            );
+
+            tell(&mut decoration, "");
+            assert_eq!(read(&mut decoration), ([false, false], 0, false, 0), "none");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
     /// **A layer is told the caret, and told again when it goes**: the
     /// focused field's caret, in the pane's own space, reaches a delegated
     /// layer's root and an inline layer's `PaneStyle` as `caret`, moves in
@@ -3314,6 +3418,7 @@ mod tests {
             let values = Values::default();
             let look = |caret| Look {
                 title: "",
+                app_id: "",
                 focused: true,
                 pointer_inside: false,
                 caret,
@@ -3406,6 +3511,7 @@ mod tests {
                 decoration.tell(
                     &Look {
                         title: "",
+                        app_id: "",
                         focused: true,
                         pointer_inside: false,
                         caret: None,
@@ -3496,6 +3602,7 @@ mod tests {
             decoration.tell(
                 &Look {
                     title: "",
+                    app_id: "",
                     focused: true,
                     pointer_inside: false,
                     caret: Some(Rectangle::new((25, 7).into(), (2, 16).into())),
@@ -4564,6 +4671,7 @@ mod tests {
                 decoration.tell(
                     &Look {
                         title: "before the reload",
+                        app_id: "",
                         focused: true,
                         pointer_inside: false,
                         caret: None,

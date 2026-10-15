@@ -1804,6 +1804,23 @@ impl Solium {
         })
     }
 
+    /// What a pane's frame is told its application is, as `appId`: its
+    /// client's, as `sol.windows()` gives it (an X11 window's class), the one
+    /// it had for a window that went and is fading, so its bar fades with the
+    /// icon it showed, and none for a window whose application has not
+    /// arrived. `decoration::tests::a_layer_is_told_the_app_id_and_told_again_when_it_changes`,
+    /// `tests::real_client::reflow_on_close::a_window_that_left_keeps_its_app_id_for_its_frame`.
+    pub(crate) fn pane_app_id(&self, id: crate::pane::PaneId) -> String {
+        self.panes.get(id).map_or_else(String::new, |pane| {
+            if let Some(left) = pane.left() {
+                return left.app_id.clone();
+            }
+            pane.client()
+                .map(|window| self.script_app_id(window))
+                .unwrap_or_default()
+        })
+    }
+
     /// A pane's facts, which rules match a window against: the costly ones
     /// (`app_id`, `title`, `monitor`) only when some rule reads them
     /// (`effect::rules::Rules::uses`), left empty otherwise. `focused` is what

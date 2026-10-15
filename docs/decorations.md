@@ -121,14 +121,16 @@ and the compositor hands the same four numbers to every layer as `insetTop`,
 `insetRight`, `insetBottom` and `insetLeft`. Reserve nothing and the style
 becomes an overlay: it draws over the client and never moves it.
 
-**`focused`, `pointerInside`, `title` and the sizes are written for you** when
-they change, so reacting to focus or to the cursor is a binding rather than a
-subscription. `pointerInside` is true while the pointer is anywhere over the
-window, *including over the client*, which is how a border can follow a cursor
-that is over a text editor. So are `caret`, where the focused text field's
-caret is when this window has it, and `values`, whatever the configuration
-handed every pane with `sol.pane_values{ ... }`; the `Keyboard` singleton is
-there to read as well. The panes README says what each holds.
+**`focused`, `pointerInside`, `title`, `appId` and the sizes are written for
+you** when they change, so reacting to focus or to the cursor is a binding
+rather than a subscription. `pointerInside` is true while the pointer is
+anywhere over the window, *including over the client*, which is how a border
+can follow a cursor that is over a text editor. `appId` is the window's
+application id, which a bar can show the application's icon by, through
+`image://solium/icon/<appId>?size=16`. So are `caret`, where the focused text
+field's caret is when this window has it, and `values`, whatever the
+configuration handed every pane with `sol.pane_values{ ... }`; the `Keyboard`
+singleton is there to read as well. The panes README says what each holds.
 
 **`action` is how a button asks for something.** Set it to `"close"` or
 `"maximize"`; the compositor takes it and clears it, so a press is acted on
