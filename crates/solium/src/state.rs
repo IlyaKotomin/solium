@@ -1884,6 +1884,11 @@ impl Solium {
         // answers would be held until something else drew one.
         // `a_client_that_never_answers_is_drawn_as_it_is_once_its_patience_runs_out`.
         animating |= self.settle_answering(now);
+        // And a glide that has landed with its client's picture still held
+        // against the edges it pinned, until `resize.patience` lets it go
+        // (#233): that frame has to be drawn too.
+        // `a_landed_glide_keeps_the_frames_coming_until_its_patience_runs_out`.
+        animating |= self.landed_waiting(now);
         // And the selections, which animate on the same clock and damage
         // nothing either. Not folded into the loop above: a group is not a
         // pane, and one that has landed has to be released exactly once.

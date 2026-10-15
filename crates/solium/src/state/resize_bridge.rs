@@ -383,6 +383,34 @@ impl Solium {
             .map_or((false, false), |(from, to)| crate::resizing::pins(from, to))
     }
 
+    /// Whether a glide that has landed still holds its client's picture
+    /// against an edge it pinned, which [`Self::resize_pins`] does for
+    /// `resize.patience` past the landing while the client has not drawn at
+    /// the size the glide landed on.
+    ///
+    /// **The frame after the patience runs out is the one that lets the
+    /// picture go to the corner**, so until then the frames keep coming, as
+    /// [`Self::settle_answering`] keeps them for a fullscreen hold. Without
+    /// them nothing asked for that frame: a client that never answered was
+    /// moved on whatever frame came next, a pointer motion or a minute later.
+    /// A glide whose client has answered, or that pinned no edge, keeps
+    /// nothing coming. `a_landed_glide_keeps_the_frames_coming_until_its_patience_runs_out`.
+    pub(crate) fn landed_waiting(&self, now: Duration) -> bool {
+        self.panes.iter().any(|pane| {
+            let Some((from, to)) = crate::present::landed_course(pane, now, self.resizing.patience)
+            else {
+                return false;
+            };
+            if crate::resizing::pins(from, to) == (false, false) {
+                return false;
+            }
+            let Some(window) = pane.client() else {
+                return false;
+            };
+            window.geometry().size != inner(to.to_i32_round(), self.insets_of(pane.id())).size
+        })
+    }
+
     /// The slot a held window's pane is keeping, if this is that window.
     ///
     /// `sync_panes` asks: the space is normally the authority it copies into

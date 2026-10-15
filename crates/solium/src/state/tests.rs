@@ -8495,6 +8495,81 @@ end)"#,
         );
     }
 
+    /// **#233: a landed glide keeps the frames coming until its patience
+    /// runs out.** `Solium::settle` says whether anything needs the next
+    /// frame. A glide that has landed with its client silent holds its
+    /// picture against the edge it pinned until `resize.patience` is out, and
+    /// it is the frame after that which moves it to the corner -- so until
+    /// then something does: before, nothing did, and the picture moved on
+    /// whatever frame something else happened to ask for. Once the patience
+    /// is out nothing is waiting, and a glide whose client already has the
+    /// size it lands on keeps nothing coming at all.
+    #[test]
+    fn a_landed_glide_keeps_the_frames_coming_until_its_patience_runs_out() {
+        tiled_fixture!(display, state, conn, queue, client, qh);
+        let (window, _surface, pane, tile) = filled_tile(
+            &mut display,
+            &mut state,
+            &conn,
+            &qh,
+            &mut queue,
+            &mut client,
+        );
+        let right = Rectangle::new(
+            (tile.loc.x + tile.size.w / 2, tile.loc.y).into(),
+            (tile.size.w / 2, tile.size.h).into(),
+        );
+        let start = state.clock.now();
+        glide(
+            &mut state,
+            &window,
+            right,
+            Duration::from_millis(240),
+            present::Curve::Linear,
+            start,
+        );
+        state.clock.advance(Duration::from_millis(260));
+        assert!(
+            state.settle(state.clock.now()),
+            "landed with its client silent, the frames keep coming"
+        );
+        assert!(
+            state
+                .panes
+                .get(pane)
+                .and_then(crate::present::course)
+                .is_none(),
+            "the premise: its transform is gone, so the transform is not what keeps them"
+        );
+        state.clock.advance(crate::resizing::PATIENCE);
+        assert!(
+            !state.settle(state.clock.now()),
+            "once its patience is out, nothing is waiting"
+        );
+
+        // Back to the whole tile, whose width the client has had committed
+        // all along: this glide lands on the size the client already has.
+        let start = state.clock.now();
+        glide(
+            &mut state,
+            &window,
+            tile,
+            Duration::from_millis(240),
+            present::Curve::Linear,
+            start,
+        );
+        assert_eq!(
+            state.resize_pins(pane),
+            (true, false),
+            "the premise: this glide pins an edge too"
+        );
+        state.clock.advance(Duration::from_millis(260));
+        assert!(
+            !state.settle(state.clock.now()),
+            "a client already at the size its glide landed on keeps nothing coming"
+        );
+    }
+
     /// **And a press on a gliding window lands on the pixel under it.**
     ///
     /// `surface_under` used to map a point through `to_window_space`,
