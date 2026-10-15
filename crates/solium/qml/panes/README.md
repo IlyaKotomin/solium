@@ -32,8 +32,8 @@ own in `~/.config/solium/qml/` is meant to restyle all of them without
 touching anything that ships, and does not yet, because the shipped module is
 found first ([#88](https://github.com/Lilium-Linux/solium/issues/88)).
 
-The styles with buttons -- `top`, `bottom`, `left`, `reveal`, `reactive` and
-`pulse` -- tell close from maximise without a colour: under the pointer each
+The styles with buttons -- `glass`, `top`, `bottom`, `left`, `reveal`,
+`reactive` and `pulse` -- tell close from maximise without a colour: under the pointer each
 turns its own grey (`Theme.danger`, the lighter, and `Theme.warning`) and shows
 its glyph on it in `Theme.accentInk`, `×` to close and `+` to maximise.
 `crates/solium/tests/scenarios/pane-buttons-drawn.lua` points at each and
@@ -63,9 +63,9 @@ PaneStyle {
 |---|---|
 | `insets.top`, `.right`, `.bottom`, `.left` | what the style reserves from the client, **once, for the whole style** |
 | `requires` | what the style needs from the machine. `["gpu"]` is the only term today: the software scene graph does not implement `ShaderEffect`, and `Canvas` does not appear to paint on it, so a style using either says so. A style whose terms this session cannot meet, or that names one this build has never heard of, is refused rather than drawn wrong: its windows are left bare, and the log names the term. A nested session renders in software under the default `qml.renderer = "auto"` |
-| `client.radius` | rounds the client's own surfaces, in logical pixels. The compositor cuts the corners as it draws the client, at no extra cost: no pass and no copy of the window (see "What it costs"). `0` is no effect at all, and so is leaving the key out — which is what nine of the eleven bundles that ship do. The example fixture writes `0`, to show the key exists and costs nothing; `rounded/` and `flush/` are the two that round |
-| `client.radiusTopLeft`, `.radiusTopRight`, `.radiusBottomLeft`, `.radiusBottomRight` | one corner each, in logical pixels. Every one of them defaults to `client.radius`, so a style that wants four the same writes one key and these never come up. **A `0` has to be written out**: squaring a corner is half of what these are for, so an absent corner follows `radius` rather than being square. `flush/` is the shipped example |
-| `client.shadow` | reserved for the shadow cast by the client's silhouette; declared, and read by nobody yet |
+| `client.radius` | rounds the client's own surfaces, in logical pixels. The compositor cuts the corners as it draws the client, at no extra cost: no pass and no copy of the window (see "What it costs"). `0` is no effect at all, and so is leaving the key out — which is what nine of the twelve bundles that ship do. The example fixture writes `0`, to show the key exists and costs nothing; `glass/`, `rounded/` and `flush/` are the three that round |
+| `client.radiusTopLeft`, `.radiusTopRight`, `.radiusBottomLeft`, `.radiusBottomRight` | one corner each, in logical pixels. Every one of them defaults to `client.radius`, so a style that wants four the same writes one key and these never come up. **A `0` has to be written out**: squaring a corner is half of what these are for, so an absent corner follows `radius` rather than being square. `flush/` and `glass/` are the shipped examples |
+| `client.shadow` | reserved, and read by nobody: a shadow is an effect rule in the style's `effects.lua` (below) |
 | the `Layer` children | the layers, in declaration order |
 
 Insets are on the style and never on a layer. The client is placed once and
@@ -122,6 +122,7 @@ Every frame:
 | property | |
 |---|---|
 | `title` | the window's title |
+| `appId` | the window's application id, as `sol.windows()` and a rule's `app_id` read it: its xdg `app_id`, or an X11 window's class; empty while its application has not arrived. A bar shows the application's icon by it, `image://solium/icon/<appId>?size=16`, and hides the icon while `Image.status` is not `Image.Ready`. A window that went keeps its own while it fades |
 | `focused` | whether it has the keyboard |
 | `pointerInside` | whether the pointer is anywhere over the window |
 | `contentWidth`, `contentHeight` | the client's size, inside the insets |
@@ -166,6 +167,8 @@ Read back by the compositor:
 | `action` | set to `"close"` or `"maximize"` to ask for it; cleared once taken |
 | `onButton` | `true` while the pointer is over a button. A press on the frame starts a window drag unless some layer says this |
 | `dormant` | `true` while the layer has nothing to draw, so it is not drawn, and in software keeps no image. An inline layer binds it on its `Layer` and `PaneStyle` hands it on; a delegated layer declares `property bool dormant` on its own root |
+| `layerOpacity` | how opaque the compositor draws the layer's picture, from 0 to 1, over the window's own opacity; 1 when not declared. Applied as the layer is composited, so animating it draws no new picture: a fade by it is one blend per frame and nothing of Qt's, where a fade of an item's `opacity` draws the whole layer again on every frame of it. An inline layer binds it on its `Layer`; a delegated layer declares `property real layerOpacity` on its own root |
+| `resizeHz` | how often, at most, the compositor draws the layer again for a new size while the window's size keeps changing (a drag on its edge, a layout's sweep), in times a second, from 5 to 1000; 0, or not declared, draws it at every size. Between, its last picture is drawn stretched to the window, as the application's own is until it has drawn at the new size, and the last size is drawn within a `1 / resizeHz` second of the window stopping. A layer with something new to draw (a title, a focus change, an animation of its own) is drawn at once. Told no new size while it is held, so a layer laid out by `paneWidth` lays out nothing it is not drawn at. An inline layer binds it on its `Layer`; a delegated layer declares `property real resizeHz` on its own root |
 
 A layer declares only the ones it uses; one that positions nothing against the
 window declares no `bleedTop` and is handed a property it ignores.
@@ -259,11 +262,61 @@ compositor at about a tenth of a core with `pulse` animating at the screen's
 full rate. Bind an endless animation to `focused`, as `pulse` and the `wave`
 demonstration do, and an unfocused window costs nothing.
 
+## effects.lua
+
+A style folder may hold `effects.lua` beside its `Pane.qml`: a list of effect
+rules for the windows this style frames, and for no others.
+
+```lua
+-- ~/.config/solium/qml/panes/mine/effects.lua
+return {
+    { match = "*", part = "pane", slot = "behind", effect = { "glow", spread = 24 } },
+}
+```
+
+Each rule is the rule `effects.rules` takes in your configuration, with every
+key it has ([the effects reference](../../effects/README.md#rules)), and the
+effects it names are effect folders, yours or the shipped ones: a style ships
+rules, not effects of its own. Your own `effects.rules` win over a style's,
+for the same part and slot. A window the style does not frame gets none of
+them: a fullscreen window, a window that draws its own decorations, and every
+window under `pane = "none"` are bare, and only your own rules reach those
+(`match = { style = "none" }` names them).
+
+A rule's `part = "region:titlebar"` is read from the insets: the band along
+the one side the style reserves most for, `top/`'s 32 pixels across the
+whole window above the client, its two outer corners rounded as the
+client's largest, or `left/`'s 34 down its side, square. A style that
+reserves its most on two sides or more (`border/` and `proximity/`, the same
+all round) or nothing at all has no titlebar region. Its slots go around
+the style's layer named `bar`, or its first `frame` layer when none is:
+`behind` just under that layer, `front` just over it. A `layer:<name>`
+rule's go around that layer the same way, inside its depth.
+
+The file runs in an effect's Lua, not your configuration's: `math`, `table`
+and `string`, and no `sol`, no files and no `require`, stopped if it runs
+longer than 100 ms. It is read when the style is applied (at startup, at each
+`sol.pane`, at every reload), once for as long as it does not change, and
+every effect it names is loaded and every rule bound then. What is wrong with
+it is named in the top-right corner of your primary monitor, under
+`style:<folder>` and at `effects.lua`'s line: a file that does not run keeps
+the rules that ran before it, and a rule that cannot be bound (a key
+misspelled, an effect nobody ships, a param it does not have) is named by its
+number, its slot is left empty, and the rest run. `solium --check` reads the
+`effects.lua` of each style of your own and fails on the same things.
+
+As with your own rules, each is drawn in its slot as far as its tier allows
+([the effects reference](../../effects/README.md#tiers)). `glass/effects.lua`
+is the shipped one: the `glass` effect behind the whole pane, and the `shade`
+in front of it while the window does not have the keyboard, fading with the
+focus (a rule's `fade`).
+
 ## What is here
 
 | folder | |
 |---|---|
-| `top/` | the default: a titlebar above the window |
+| `glass/` | the default: the window and its bar one rounded piece of dark liquid glass, the bar along the bottom, a thin shade round the edge of a window without the keyboard ([below](#glass)) |
+| `top/` | a titlebar above the window, the default until `glass` |
 | `left/` | a vertical titlebar down the left side |
 | `bottom/` | a titlebar underneath |
 | `border/` | no bar at all, just a frame around the window |
@@ -275,17 +328,18 @@ demonstration do, and an unfocused window costs nothing.
 `none` is not a folder: `pane = "none"` draws no frame and builds no scene per
 window.
 
-Each of those eight is one `frame` layer, which is what every decoration was
-before styles had layers, and the keyboard pill's layer, described below. The
-rest are here to show what layers add:
+Each of those nine is one `frame` layer, which is what every decoration was
+before styles had layers, and the keyboard pill's layer, described below;
+`glass`'s shade is not a layer but an effect its `effects.lua` puts in front
+of the pane. The rest are here to show what layers add:
 
 | folder | |
 |---|---|
 | `rounded/` | `client.radius`: the compositor cuts all four of the client's corners with a fragment program, and the bar -- at `behind`, reaching `clientRadius` past its band -- shows through the two it cut inside the window |
-| `flush/` | the same seam the other way up: `radiusTopLeft` and `radiusTopRight` at `0`, so the client's top is square, the bar's own rounded top is the window's top, and the two meet flat. The only shipped bundle whose four corners differ |
+| `flush/` | the same seam the other way up: `radiusTopLeft` and `radiusTopRight` at `0`, so the client's top is square, the bar's own rounded top is the window's top, and the two meet flat. `glass/` squares the other two, for its bar along the bottom |
 | `shadow/` | `behind` plus `bleed`: stacked rectangles standing in for a blur |
 
-And four demonstrations, which are not shipped and are never offered by name.
+And five demonstrations, which are not shipped and are never offered by name.
 They live with the test fixtures in a checkout, in
 `crates/solium/tests/fixtures/panes/`, and `SOLIUM_PANE=<that path>/<name>`
 puts one on every window:
@@ -296,6 +350,65 @@ puts one on every window:
 | `sandwich/` | one layer behind the client and one above it, in colours that cannot be confused |
 | `wave/` | sine waves flowing round the whole window, outside it, all `bleed` at `behind` and nothing reserved |
 | `bleedy/` | what bleed does to hit-testing, and to the window next door |
+| `frosted/` | a translucent bar, and an `effects.lua` putting an effect behind the titlebar |
+
+## glass
+
+The window and its bar are one rounded piece of dark liquid glass: `effects.lua` puts the shipped [`glass`](../../effects/glass/README.md)
+effect behind the whole pane, frame and client together, cut to the window's
+outline with every corner at the window's radius, so there is one rim round
+the window and no seam where the bar meets the client. A fullscreen window has
+no frame and no glass, and keeps direct scanout.
+
+The bar runs along the bottom with no fill, so the glass shows through it: the
+buttons at its left, close at the outer edge, the title right after them, and
+the application's icon at its right, `image://solium/icon/<appId>`, which
+shows nothing when the window has no app id or the theme has no icon for it
+(the theme's fallback icon included).
+
+A window without the keyboard has a thin dark shade just inside its rounded
+outline, on all four sides and through the corners, and a dimmer title. The
+shade is the shipped [`shade`](../../effects/shade/README.md) effect, which
+`effects.lua` puts in front of the whole pane, frame and client, for a window
+that is not `focused`: so it darkens the window's own edge, an opaque
+application's too, and takes no input. It reads only the window's shape (tier
+T0), so it is one pass on the GPU, run once per size of the window and never
+for what the application draws. Its rule's `fade` brings it in as the window
+loses the keyboard and takes it away as the window gets it back, 240 ms on
+`outCubic`: the compositor blends the edge it has at another opacity on each
+frame and runs nothing for it, and once it has faded out nothing is held or
+drawn for it, so the window being typed in costs nothing for it. The bar draws
+one new picture per focus change, with nothing in it animated, and while the
+window's size keeps changing it is drawn again at most `resizeHz` times a
+second, 30, stretched with the window between.
+`tests/scenarios/pane-glass-drawn.lua` reads the bar off its pixels, and
+wirecheck's case 13j the shade's.
+
+The client's top two corners are the window's, cut by the compositor; its
+bottom two are square where the bar meets it, and the glass behind the bar is
+rounded to the same number, which every layer is told as `clientRadius`.
+
+Its numbers, each a line to change in a copy of the folder,
+`~/.config/solium/qml/panes/glass/`:
+
+| where | | default |
+|---|---|---|
+| `Pane.qml` | `client.radius`: the window's corners, in logical pixels | `16` |
+| `Pane.qml` | `insets.bottom`: the bar's height | `Theme.titlebarHeight`, 32 |
+| `Frame.qml` | `iconSize`: the application's icon, in logical pixels | `16` |
+| `Frame.qml` | `resizeHz`: how often, at most, the bar is drawn again for a new size while the window's size keeps changing, in times a second; 0 at every size | `30` |
+| `effects.lua` | the shade's `width`: how far in it reaches, in pixels, fading to nothing there | `12` |
+| `effects.lua` | the shade's `strength`: how opaque it is at the window's very edge, 0 for no shade | `0.5` |
+| `effects.lua` | the shade's `color` | `{ 0, 0, 0, 1 }` |
+| `effects.lua` | the shade rule's `fade`: how long it takes to come and go with the focus, in milliseconds, and on which curve | `{ duration = 240, easing = "outCubic" }` |
+
+The glass and the shade are effects, and their params are changed where a rule
+names them: a rule of your own for `{ style = "glass" }` and `part = "pane"`
+wins over the style's for the same slot. At `slot = "behind"`, the glass:
+other params, `tint = { 1, 1, 1, 0.11 }` for light glass, or `effect = false`
+for no glass. At `slot = "front"`, with `focused = false` in its `match`, the
+shade: `effect = { "shade", width = 6, strength = 0.7 }`, a `fade` of its own,
+or `effect = false` for no shade.
 
 ## The keyboard pill
 
@@ -353,9 +466,10 @@ is the only place those numbers can live. It has no manifest to add
 `KeyboardPillLayer {}` to either, so with `keyboard.indicator.show = "pane"`
 its windows show no keyboard pill: draw one at `caret` yourself (with
 `property bool overlay: true`, since it paints over the client), or set
-`show = "surface"`.
+`show = "surface"`. Nor has it a folder to keep an `effects.lua` in, so it
+gives its windows no effect rules.
 
-Nothing ships as one any more: the eight above were single files until the
-pane-styles work moved them into folders. The path stays because those files
+Nothing ships as one any more: the eight in the first table besides `glass`
+were single files until the pane-styles work moved them into folders. The path stays because those files
 exist on people's machines, and because a style needing neither layers nor
 bleed should not have to become a folder to say so.

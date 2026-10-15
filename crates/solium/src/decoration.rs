@@ -58,14 +58,29 @@ use crate::{
 /// client area.
 pub(crate) const TITLEBAR_HEIGHT: i32 = 32;
 
+/// The bounds a layer's `resizeHz` is held to, in times a second: below 5 a
+/// window resized and let go would show its layer stretched for over a fifth
+/// of a second, and above 1000 it is drawn at every size of any monitor
+/// anyway. `tests::a_layer_is_drawn_again_for_a_new_size_at_most_resize_hz_times_a_second`.
+const RESIZE_HZ: std::ops::RangeInclusive<f64> = 5.0..=1000.0;
+
 /// The style drawn when nothing has named one.
 ///
-/// The same name `config.lua` carries, and it has to be a *name* rather than a
-/// path: every style this build ships is a folder under `panes/`, so the
-/// default has to be looked up where folders are. It is reached when no script
-/// has run or one set the style back to nothing — a session whose scripts
-/// failed to load still gets titlebars.
-const DEFAULT_STYLE: &str = "top";
+/// A *name* rather than a path: every style this build ships is a folder under
+/// `panes/`, so the default has to be looked up where folders are. It is
+/// reached when no script has run or one set the style back to nothing — a
+/// session whose scripts failed to load still gets titlebars. And so it is the
+/// style a framed pane is in when nothing has named one, as a rule's `style`
+/// match reads it
+/// (`state::tests::a_framed_panes_style_is_the_configured_one_or_the_default_and_a_bare_ones_is_none`).
+///
+/// **Not the shipped configuration's `glass`**
+/// (`script::tests::the_shipped_configuration_frames_windows_in_glass`), on
+/// purpose: this is the fallback for a session whose configuration is not
+/// running, and `top` is a bar that reads as one with nothing else working,
+/// opaque and needing no effect, where `glass` draws a clear bar over an
+/// effect behind the window.
+pub(crate) const DEFAULT_STYLE: &str = "top";
 
 /// What a frame button asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,6 +197,11 @@ impl Insets {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Look<'a> {
     pub(crate) title: &'a str,
+    /// The window's application id, as `sol.windows()` and a rule's `app_id`
+    /// read it (an X11 window's class), empty while it has none: `appId` on
+    /// every layer, which a bar can show the application's icon by.
+    /// `tests::a_layer_is_told_the_app_id_and_told_again_when_it_changes`.
+    pub(crate) app_id: &'a str,
     pub(crate) focused: bool,
     /// Whether the pointer is anywhere over the window, frame or client.
     pub(crate) pointer_inside: bool,
@@ -198,20 +218,12 @@ pub(crate) struct Look<'a> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Shown {
     title: String,
+    app_id: String,
     focused: bool,
     /// Whether the pointer is anywhere over the window, frame or client. A
     /// border that lights up when you approach the window needs to know this
     /// even while the pointer is over the client, which is not ours.
     pointer_inside: bool,
-    /// The pane's outer size, in logical pixels.
-    ///
-    /// Here because [`Decoration::tell`] hands QML four numbers derived from it
-    /// — `contentWidth`, `contentHeight`, `paneWidth`, `paneHeight` — and
-    /// returns early when nothing it shows has changed. Without the size in
-    /// that comparison a window resized without being retitled or refocused
-    /// keeps the sizes it had when its title last changed, which
-    /// `panes/reactive/Frame.qml` reads to size its own content.
-    size: (i32, i32),
     /// The caret last written, `None` once it was taken away.
     caret: Option<Rectangle<i32, Logical>>,
     /// Which generation of the configuration's values was last written.
@@ -262,6 +274,10 @@ pub(crate) struct Drawing {
     pub(crate) alpha: f32,
     /// Device pixels per logical one, on the monitor this is drawn on.
     pub(crate) scale: f64,
+    /// The instant this is drawn at, the pass's: what a layer drawn again for
+    /// a new size at most `resizeHz` times a second goes by
+    /// ([`LayerScene::holds`]).
+    pub(crate) now: std::time::Duration,
 }
 
 /// The rectangle a layer is rasterised into: the pane, grown by its bleed.
@@ -401,6 +417,10 @@ struct LayerScene {
     depth: Depth,
     /// Which layer this is, for diagnostics and for the order tests.
     name: String,
+    /// Its place among the style's layers (`LayerSpec.index`), which a
+    /// `layer:<name>` rule's slots are kept under and the walk's hook is told
+    /// (`render::tests::around_a_layer_its_own_slots_are_outermost_and_the_titlebars_inside`).
+    index: usize,
     scene: qml::Scene,
     backing: Backing,
     /// How far past the pane this layer may paint, as it declared.
@@ -438,6 +458,16 @@ struct LayerScene {
     /// and so has let go of what it is drawn with: see [`LayerScene::sleeps`].
     /// `tests::a_dormant_layer_draws_nothing_and_holds_no_buffer`.
     asleep: bool,
+    /// The pane's outer size this layer was last told, in logical pixels:
+    /// `paneWidth` and `paneHeight`, and the client's share of it as
+    /// `contentWidth` and `contentHeight`. Per layer, and told only as the
+    /// layer is drawn at that size, so a layer whose picture is held at the
+    /// size it has ([`LayerScene::holds`]) lays nothing out again for one it
+    /// is not drawing. `tests::a_layer_is_drawn_again_for_a_new_size_at_most_resize_hz_times_a_second`.
+    told: (i32, i32),
+    /// When this layer was last drawn at a new size, for its `resizeHz`.
+    /// `tests::a_layer_is_drawn_again_for_a_new_size_at_most_resize_hz_times_a_second`.
+    resized_at: Option<std::time::Duration>,
 }
 
 /// A decoration animates on its own clock -- a border easing to a new colour, a
@@ -511,6 +541,14 @@ pub(crate) struct Decoration {
     /// style declares nothing here is drawn exactly as it was before any of
     /// this existed, and every window on an unstyled machine is that window.
     effects: Vec<solium_effects::fragment::Effect>,
+    /// The effect rules the style's `effects.lua` gives this pane, and the
+    /// generation they were read at, copied from the `Style` for the reason
+    /// `effects` is: a frame resolves the pane's slots from here. Shared,
+    /// not copied, between the panes of one style
+    /// (`style::tests::effects_lua_is_read_once_per_content`); empty for a
+    /// single-file decoration. `tests::a_decoration_carries_the_styles_rules`.
+    rules: std::sync::Arc<[crate::effect::rules::Rule]>,
+    rules_generation: u32,
     /// The device-pixel size the frame was last drawn at.
     ///
     /// Kept on both paths, because `client_size` is asked for it while a style
@@ -602,6 +640,7 @@ impl Decoration {
                 // moved into bundles without changing a pixel.
                 depth: Depth::Frame,
                 name: String::new(),
+                index: 0,
                 scene,
                 backing: Backing::for_host(on_gpu),
                 // A single QML file has no manifest to declare one in, so a
@@ -611,12 +650,16 @@ impl Decoration {
                 overlay,
                 buffer_size: (0, 0),
                 asleep: false,
+                told: (0, 0),
+                resized_at: None,
             }],
             insets,
             // A single QML file has no manifest either, and `client.radius` is
             // declared on `PaneStyle`. So a decoration that is one file runs
             // no effects and costs no pass, which is what it has always cost.
             effects: Vec::new(),
+            rules: std::sync::Arc::from(Vec::new()),
+            rules_generation: 0,
             buffer_size: (0, 0),
             shown: Shown::default(),
         })
@@ -659,6 +702,8 @@ impl Decoration {
             // is declared on `PaneStyle` once, and every layer is *told* it
             // rather than asked for it. See `LayerScene::build`.
             effects: style.effects.clone(),
+            rules: std::sync::Arc::clone(&style.rules),
+            rules_generation: style.rules_generation,
             buffer_size: (0, 0),
             shown: Shown::default(),
         })
@@ -684,6 +729,18 @@ impl Decoration {
     /// `Option<Effect>`, and answering costs a pointer and a length.
     pub(crate) fn effects(&self) -> &[solium_effects::fragment::Effect] {
         &self.effects
+    }
+
+    /// The effect rules this pane's style gives it, every one for this
+    /// style's panes only (Ruling 15). `tests::a_decoration_carries_the_styles_rules`.
+    pub(crate) fn rules(&self) -> &[crate::effect::rules::Rule] {
+        &self.rules
+    }
+
+    /// The generation [`Self::rules`] were read at, which their keys carry.
+    /// `tests::a_decoration_carries_the_styles_rules`.
+    pub(crate) fn rules_generation(&self) -> u32 {
+        self.rules_generation
     }
 
     /// The layers of this style at one depth, drawn into `into`, topmost first.
@@ -717,6 +774,12 @@ impl Decoration {
     /// Returns whether any layer drawn here is still animating, which comes out
     /// of the draw rather than from a question after it — see
     /// [`crate::render::Drawn`].
+    ///
+    /// `around(into, index, before)` is called just before and just after each
+    /// layer drawn, with its place among the style's layers: where an
+    /// effect's slots around that layer go (`render::around_layer`). With
+    /// nothing to add it pushes nothing, so the list is what it was
+    /// (`render::tests::with_no_slots_the_pane_walk_is_pane_order`).
     pub(crate) fn layer_elements(
         &mut self,
         renderer: &mut GlesRenderer,
@@ -724,6 +787,7 @@ impl Decoration {
         look: &Look<'_>,
         drawing: Drawing,
         into: &mut Vec<Element>,
+        around: &mut dyn FnMut(&mut Vec<Element>, usize, bool),
     ) -> bool {
         let width = drawing.outer.w.max(1);
         let height = drawing.outer.h.max(1);
@@ -746,7 +810,8 @@ impl Decoration {
         // not the ones about to be drawn. This runs once per depth and the
         // write is guarded by `shown`, so telling only this depth's layers
         // would tell whichever depth came first and silently skip the rest.
-        self.tell(look, width, height);
+        // The size is each layer's own, below, told as it is drawn at it.
+        self.tell_look(look);
         // The **pane's** pixels and not any layer's canvas. `client_size` reads
         // this to size a client while a style is being swapped, and a bleeding
         // layer's canvas would tell it the window is larger than it is.
@@ -758,7 +823,13 @@ impl Decoration {
             // Per layer, because this is the whole of bleed: its own canvas,
             // its own buffer, and its own rectangle on screen.
             let spread = spread(drawing, layer.bleed);
-            let size = (pixels(spread.canvas.size.w), pixels(spread.canvas.size.h));
+            let wanted = (pixels(spread.canvas.size.w), pixels(spread.canvas.size.h));
+            // While its pane's size keeps changing, a layer is drawn again for
+            // it at most `resizeHz` times a second, and between those its last
+            // picture is drawn stretched to the new size, as the client's is
+            // until it has drawn one at that size:
+            // `tests::a_layer_is_drawn_again_for_a_new_size_at_most_resize_hz_times_a_second`.
+            let (size, held) = layer.size_for(drawing.now, wanted, (width, height), insets);
             // The drawn size scales the layer with the window it belongs to.
             #[expect(
                 clippy::cast_possible_truncation,
@@ -777,12 +848,20 @@ impl Decoration {
                     spread.drawn.loc.y * drawing.scale,
                 ),
                 size: drawn_size,
-                alpha: drawing.alpha,
+                // The window's opacity, and the layer's own on top of it,
+                // applied here rather than drawn by Qt: a layer fading by
+                // `layerOpacity` is blended at a new alpha and not drawn again
+                // (`tests::a_layer_fading_by_its_opacity_draws_no_new_picture`).
+                alpha: drawing.alpha * layer.opacity(),
                 kind: Kind::Unspecified,
             };
             let drawn = layer.element(renderer, insets, size, placement, drawing.scale);
+            around(into, layer.index, true);
             into.extend(drawn.element);
-            animating |= drawn.animating;
+            around(into, layer.index, false);
+            // A layer held at the picture it has is owed the frame that draws
+            // it at its pane's size, whether or not the size moves again.
+            animating |= drawn.animating || held;
         }
         animating
     }
@@ -816,27 +895,72 @@ impl Decoration {
         at(self.layers.iter(), depth).map(|layer| layer.name.as_str())
     }
 
-    /// Hand every layer everything it is told about its window.
+    /// Every layer's place among the style's layers, its depth and its name,
+    /// in declaration order: what `render::titlebar_layer` picks the
+    /// titlebar's layer from (`render::tests::titlebar_slots_bracket_the_bar_layer`).
+    pub(crate) fn layer_places(&self) -> impl Iterator<Item = (usize, Depth, &str)> {
+        self.layers
+            .iter()
+            .map(|layer| (layer.index, layer.depth, layer.name.as_str()))
+    }
+
+    /// Where the layer at `index` is drawn for `drawing`: its canvas, the
+    /// pane grown by its bleed, scaled with the window, as
+    /// [`Self::layer_elements`] places it ([`spread`]). What a slot around it
+    /// is placed over.
+    pub(crate) fn layer_canvas(
+        &self,
+        index: usize,
+        drawing: Drawing,
+    ) -> Option<Rectangle<f64, Logical>> {
+        self.layers
+            .iter()
+            .find(|layer| layer.index == index)
+            .map(|layer| spread(drawing, layer.bleed).drawn)
+    }
+
+    /// Every layer's name with its place among the style's layers
+    /// (`LayerSpec.index`: the scenes are built in declaration order, every
+    /// one or none), in declaration order and whatever its depth: what a
+    /// `layer:<name>` rule is resolved against, once a pass.
+    /// `tests::every_layer_is_named_with_its_place_among_the_styles_layers`.
+    pub(crate) fn layer_names(&self) -> impl Iterator<Item = (usize, &str)> {
+        self.layers
+            .iter()
+            .enumerate()
+            .map(|(index, layer)| (index, layer.name.as_str()))
+    }
+
+    /// Hand every layer everything it is told about its window: its look,
+    /// and the pane's size.
+    ///
+    /// What a frame tells, as [`Self::layer_elements`] tells it apart: the
+    /// look to every layer at once, and the size to each layer as it is drawn
+    /// at it ([`LayerScene::tell_size`]). What a test tells a decoration it
+    /// does not draw.
+    #[cfg(test)]
+    fn tell(&mut self, look: &Look<'_>, width: i32, height: i32) {
+        self.tell_look(look);
+        let insets = self.insets;
+        for layer in &mut self.layers {
+            layer.tell_size((width, height), insets);
+        }
+    }
+
+    /// Hand every layer what it is told about its window but its size.
     ///
     /// Compared field by field rather than by building a `Shown`: this runs for
-    /// every window of every frame, and the title is the one thing here that
-    /// allocates.
+    /// every window of every frame, and the title and the app id are the only
+    /// things here that allocate.
     ///
     /// Every layer and not only the frame: a glow behind a window that cannot
     /// tell whether the window is focused is a glow that is always on. The
     /// properties are declared on `PaneStyle` as well as on a delegated layer's
     /// own root, so an inline layer can bind to them too.
-    ///
-    /// The **size** is in the comparison as well as the look, and that is not
-    /// tidiness. `paneWidth` and `paneHeight` are how a bleeding layer finds
-    /// the window's own rectangle inside a canvas larger than it — with
-    /// `bleedLeft` and `bleedTop`, which never change and are written once at
-    /// build. Leaving the size out would mean a window that is resized without
-    /// being retitled keeps the numbers it had at its last title change, which
-    /// puts a spike-throwing bar's spikes at the width the window used to be.
-    fn tell(&mut self, look: &Look<'_>, width: i32, height: i32) {
+    fn tell_look(&mut self, look: &Look<'_>) {
         let Look {
             title,
+            app_id,
             focused,
             pointer_inside,
             caret,
@@ -864,34 +988,25 @@ impl Decoration {
             self.shown.values = values.generation;
         }
         if self.shown.title == title
+            && self.shown.app_id == app_id
             && self.shown.focused == focused
             && self.shown.pointer_inside == pointer_inside
-            && self.shown.size == (width, height)
         {
             return;
         }
-        // The client's own size, so a layer can place things against the
-        // window rather than against itself.
-        let content = (
-            width - self.insets.horizontal(),
-            height - self.insets.vertical(),
-        );
         for layer in &mut self.layers {
             layer.scene.set_string("title", title);
+            // `tests::a_layer_is_told_the_app_id_and_told_again_when_it_changes`.
+            layer.scene.set_string("appId", app_id);
             layer.scene.set_bool("focused", focused);
             layer.scene.set_bool("pointerInside", pointer_inside);
-            layer.scene.set_int("contentWidth", content.0);
-            layer.scene.set_int("contentHeight", content.1);
-            // The pane, which is not the canvas a bleeding layer is laid out
-            // in and not the client either.
-            layer.scene.set_int("paneWidth", width);
-            layer.scene.set_int("paneHeight", height);
         }
         self.shown.title.clear();
         self.shown.title.push_str(title);
+        self.shown.app_id.clear();
+        self.shown.app_id.push_str(app_id);
         self.shown.focused = focused;
         self.shown.pointer_inside = pointer_inside;
-        self.shown.size = (width, height);
     }
 
     /// Tell the frame the pointer has left the window altogether.
@@ -1013,7 +1128,7 @@ impl Decoration {
             // The client is in the order because the order is the frame's, and
             // a walk that left it out would be a second list. It has no
             // property to take.
-            crate::render::Piece::Client => {}
+            crate::render::Piece::Client | crate::render::Piece::Slot(..) => {}
         });
         asked.first().copied()
     }
@@ -1046,6 +1161,15 @@ impl Decoration {
     /// Tell every layer what a frame tells it.
     pub(crate) fn tell_as_a_frame_would(&mut self, look: &Look<'_>, width: i32, height: i32) {
         self.tell(look, width, height);
+    }
+
+    /// Every layer's `layerOpacity` now, by name: how opaque the next frame
+    /// composites its picture ([`LayerScene::opacity`]).
+    pub(crate) fn layer_opacities(&self) -> Vec<(String, f32)> {
+        self.layers
+            .iter()
+            .map(|layer| (layer.name.clone(), layer.opacity()))
+            .collect()
     }
 
     /// The name of every layer whose scene says it is `dormant` now: what
@@ -1291,13 +1415,117 @@ impl LayerScene {
         Ok(Self {
             depth: spec.depth,
             name: spec.name.clone(),
+            index: spec.index,
             scene,
             backing: Backing::for_host(on_gpu),
             bleed: spec.bleed,
             overlay,
             buffer_size: (0, 0),
             asleep: false,
+            told: (0, 0),
+            resized_at: None,
         })
+    }
+
+    /// How opaque the compositor draws this layer's picture: its root's
+    /// `layerOpacity`, 0 to 1, and 1 for a root that declares none. Applied
+    /// as the layer is composited, over the window's own opacity, so a layer
+    /// that fades by it draws no new picture while it fades: the picture Qt
+    /// drew last is blended at another alpha. Read every frame, as `dormant`
+    /// is; a number out of range is clamped, and one that is not a number
+    /// reads 1. `tests::a_layers_opacity_is_its_roots_and_one_when_it_has_none`,
+    /// `tests::a_layer_fading_by_its_opacity_draws_no_new_picture`.
+    fn opacity(&self) -> f32 {
+        let read = self.scene.get_real("layerOpacity", 1.0);
+        if read.is_nan() {
+            return 1.0;
+        }
+        #[expect(clippy::cast_possible_truncation, reason = "an alpha, clamped to 0..1")]
+        let alpha = read.clamp(0.0, 1.0) as f32;
+        alpha
+    }
+
+    /// How often, at most, this layer is drawn again for a new size while its
+    /// pane's size keeps changing: its root's `resizeHz`, in times a second,
+    /// held to [`RESIZE_HZ`]; 0, or a root that declares none, draws it at
+    /// every size. Read on a frame its size has changed, as `dormant` is.
+    /// `tests::a_layer_is_drawn_again_for_a_new_size_at_most_resize_hz_times_a_second`.
+    fn resize_hz(&self) -> f64 {
+        let read = self.scene.get_real("resizeHz", 0.0);
+        if !read.is_finite() || read <= 0.0 {
+            return 0.0;
+        }
+        read.clamp(*RESIZE_HZ.start(), *RESIZE_HZ.end())
+    }
+
+    /// Whether to draw the picture this layer has, stretched to its pane's
+    /// new size, rather than draw it again at `wanted`: while it was drawn at
+    /// a new size less than a `1 / resizeHz` second ago (`resized_at`), so a
+    /// window resized by a drag or a layout's sweep draws its layer again at
+    /// most `resizeHz` times a second, and at its last size within that once
+    /// it stops. Never a layer with something new to draw (a new title, a
+    /// focus change, an animation of its own), which is drawn at once at its
+    /// pane's size; never its first picture; never at a size it has.
+    /// `tests::a_layer_is_drawn_again_for_a_new_size_at_most_resize_hz_times_a_second`.
+    fn holds(&self, now: std::time::Duration, wanted: (i32, i32)) -> bool {
+        if self.buffer_size == wanted || self.buffer_size == (0, 0) || self.scene.needs_render() {
+            return false;
+        }
+        let Some(at) = self.resized_at else {
+            return false;
+        };
+        let hz = self.resize_hz();
+        hz > 0.0 && now.saturating_sub(at).as_secs_f64() < 1.0 / hz
+    }
+
+    /// What this layer is drawn at this frame for a canvas of `wanted`
+    /// pixels on a pane of `pane` logical ones: `wanted`, its pane's size
+    /// told to it ([`Self::tell_size`]); or, while it [`holds`](Self::holds),
+    /// the size of the picture it has, and nothing told. And whether it held.
+    /// `tests::a_layer_is_drawn_again_for_a_new_size_at_most_resize_hz_times_a_second`.
+    fn size_for(
+        &mut self,
+        now: std::time::Duration,
+        wanted: (i32, i32),
+        pane: (i32, i32),
+        insets: Insets,
+    ) -> ((i32, i32), bool) {
+        if self.holds(now, wanted) {
+            return (self.buffer_size, true);
+        }
+        if self.buffer_size != wanted {
+            self.resized_at = Some(now);
+        }
+        self.tell_size(pane, insets);
+        (wanted, false)
+    }
+
+    /// Tell this layer its pane's outer size, `paneWidth` and `paneHeight`,
+    /// and the client's share of it inside `insets`, `contentWidth` and
+    /// `contentHeight`, when it has changed since the layer was last told:
+    /// as the layer is drawn at that size, so a layer held at the picture it
+    /// has ([`Self::holds`]) lays nothing out for a size it is not drawn at.
+    ///
+    /// **The size is told at all**, and that is not tidiness: `paneWidth`
+    /// and `paneHeight` are how a bleeding layer finds the window's own
+    /// rectangle inside a canvas larger than it — with `bleedLeft` and
+    /// `bleedTop`, which never change and are written once at build — and
+    /// `panes/reactive/Frame.qml` sizes its own content by `contentWidth`.
+    fn tell_size(&mut self, (width, height): (i32, i32), insets: Insets) {
+        if self.told == (width, height) {
+            return;
+        }
+        // The client's own size, so a layer can place things against the
+        // window rather than against itself.
+        self.scene
+            .set_int("contentWidth", width - insets.horizontal());
+        self.scene
+            .set_int("contentHeight", height - insets.vertical());
+        // The pane, which is not the canvas a bleeding layer is laid out in
+        // and not the client either.
+        self.scene.set_int("paneWidth", width);
+        self.scene.set_int("paneHeight", height);
+        self.told = (width, height);
     }
 
     /// Whether this layer has nothing to draw this frame, as its root's
@@ -1852,6 +2080,7 @@ fn say_what_was_built(dir: &Path, decoration: &Decoration) {
     crate::render::pane_pieces(&mut order, |into, piece| match piece {
         crate::render::Piece::Layers(depth) => into.extend(decoration.layers_at(depth)),
         crate::render::Piece::Client => into.push("<the client>"),
+        crate::render::Piece::Slot(..) => {}
     });
     // The reach as well as the order, because a style that looks wrong raises
     // two questions and neither is answerable from the screen. "The spikes are
@@ -1874,6 +2103,19 @@ pub(crate) fn style_file(style: Option<&str>) -> Option<PathBuf> {
         Some(dir) => Some(dir.join("Pane.qml")),
         None => qml_path(style),
     }
+}
+
+/// The style folder a window's frame is built from, by the lookup [`build`]
+/// takes (the default style when none is named), or `None` for `none`, a
+/// single-file decoration or a name that is nowhere: where
+/// `Solium::apply_style_rules` reads `effects.lua` from.
+/// `state::tests::the_formats_probe_rebinds_the_styles_rules_too`,
+/// `state::tests::sol_pane_binds_the_styles_rules_and_a_reload_binds_them_again`.
+pub(crate) fn style_dir(style: Option<&str>) -> Option<PathBuf> {
+    if bare(style) {
+        return None;
+    }
+    bundle(Some(style.unwrap_or(DEFAULT_STYLE)))
 }
 
 /// The style bundle this setting asks for, if it asks for one at all.
@@ -2510,6 +2752,7 @@ mod tests {
             decoration.tell(
                 &Look {
                     title: "",
+                    app_id: "",
                     focused: false,
                     pointer_inside: false,
                     caret: None,
@@ -2996,6 +3239,7 @@ mod tests {
                 decoration.tell(
                     &Look {
                         title: "",
+                        app_id: "",
                         focused: true,
                         pointer_inside: false,
                         caret: None,
@@ -3175,6 +3419,96 @@ mod tests {
         });
     }
 
+    /// **A layer is told the app id, and told again when it changes**: the
+    /// window's application id reaches a delegated layer's root and an inline
+    /// layer's `PaneStyle` as `appId`, as `title` does, and a new one, or
+    /// none, reaches both again. Read through bindings, for the reason
+    /// `a_delegated_layer_is_told_the_styles_insets` gives.
+    #[test]
+    fn a_layer_is_told_the_app_id_and_told_again_when_it_changes() {
+        on_the_qt_thread(|| {
+            let dir = fixture(
+                "told-app-id",
+                &[
+                    (
+                        "Pane.qml",
+                        r#"
+                        import QtQuick
+                        import Solium
+
+                        PaneStyle {
+                            readonly property bool sawKitty: appId === "kitty"
+                            readonly property int sawLength: appId.length
+
+                            Layer { depth: "frame"; name: "bar"; source: "Frame.qml" }
+                            Layer { depth: "above"; name: "inline"; Item {} }
+                        }
+                        "#,
+                    ),
+                    (
+                        "Frame.qml",
+                        r#"
+                        import QtQuick
+
+                        Item {
+                            property string appId: ""
+                            readonly property bool sawKitty: appId === "kitty"
+                            readonly property bool sawFoot: appId === "org.codeberg.dnkl.foot"
+                            readonly property int sawLength: appId.length
+                        }
+                        "#,
+                    ),
+                ],
+            );
+            let style = crate::style::load(&dir).expect("the fixture loads");
+            let mut decoration = Decoration::from_style(&style, 60, 88).expect("two scenes");
+            let values = Values::default();
+            let tell = |decoration: &mut Decoration, app_id: &str| {
+                decoration.tell(
+                    &Look {
+                        title: "a terminal",
+                        app_id,
+                        focused: true,
+                        pointer_inside: false,
+                        caret: None,
+                        values: &values,
+                    },
+                    60,
+                    88,
+                );
+            };
+            let read = |decoration: &mut Decoration| {
+                let [delegated, inline] = &mut decoration.layers[..] else {
+                    panic!("two layers")
+                };
+                (
+                    [
+                        delegated.scene.get_bool("sawKitty"),
+                        delegated.scene.get_bool("sawFoot"),
+                    ],
+                    delegated.scene.get_int("sawLength"),
+                    inline.scene.get_bool("sawKitty"),
+                    inline.scene.get_int("sawLength"),
+                )
+            };
+
+            tell(&mut decoration, "kitty");
+            assert_eq!(read(&mut decoration), ([true, false], 5, true, 5));
+
+            tell(&mut decoration, "org.codeberg.dnkl.foot");
+            assert_eq!(
+                read(&mut decoration),
+                ([false, true], 22, false, 22),
+                "changed, with nothing else told"
+            );
+
+            tell(&mut decoration, "");
+            assert_eq!(read(&mut decoration), ([false, false], 0, false, 0), "none");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
     /// **A layer is told the caret, and told again when it goes**: the
     /// focused field's caret, in the pane's own space, reaches a delegated
     /// layer's root and an inline layer's `PaneStyle` as `caret`, moves in
@@ -3223,6 +3557,7 @@ mod tests {
             let values = Values::default();
             let look = |caret| Look {
                 title: "",
+                app_id: "",
                 focused: true,
                 pointer_inside: false,
                 caret,
@@ -3315,6 +3650,7 @@ mod tests {
                 decoration.tell(
                     &Look {
                         title: "",
+                        app_id: "",
                         focused: true,
                         pointer_inside: false,
                         caret: None,
@@ -3405,6 +3741,7 @@ mod tests {
             decoration.tell(
                 &Look {
                     title: "",
+                    app_id: "",
                     focused: true,
                     pointer_inside: false,
                     caret: Some(Rectangle::new((25, 7).into(), (2, 16).into())),
@@ -3814,6 +4151,55 @@ mod tests {
         });
     }
 
+    /// **A pane carries its style's effect rules**, read once with the style
+    /// (`style::tests::a_styles_effects_lua_is_read_with_it`), because a
+    /// frame resolves a pane's slots from its decoration and nothing else
+    /// keeps the `Style`; `render::style_rules` reads them back off the
+    /// pane's frame.
+    #[test]
+    fn a_decoration_carries_the_styles_rules() {
+        on_the_qt_thread(|| {
+            let dir = Path::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/panes/frosted"
+            ));
+            let style = crate::style::load(dir).expect("the fixture loads");
+            let decoration = Decoration::from_style(&style, 60, 88).expect("one scene");
+            assert_eq!(decoration.rules(), &style.rules[..]);
+            assert_eq!(decoration.rules_generation(), style.rules_generation);
+            let frame = crate::pane::Frame::Styled(decoration);
+            let (rules, generation) = crate::render::style_rules(&frame);
+            assert_eq!(
+                (rules.len(), generation),
+                (1, style.rules_generation),
+                "the rules did not reach the renderer"
+            );
+        });
+    }
+
+    /// **Every layer is named with its place among the style's layers**
+    /// (`LayerSpec.index`), whatever its depth: what a `layer:<name>` rule is
+    /// resolved against, and how a frame tells two layers of one name apart.
+    #[test]
+    fn every_layer_is_named_with_its_place_among_the_styles_layers() {
+        on_the_qt_thread(|| {
+            let dir = Path::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/panes/example"
+            ));
+            let style = crate::style::load(dir).expect("the fixture loads");
+            let decoration = Decoration::from_style(&style, 60, 88).expect("three scenes");
+            let named: Vec<(usize, &str)> = decoration.layer_names().collect();
+            let declared: Vec<(usize, &str)> = style
+                .layers
+                .iter()
+                .map(|spec| (spec.index, spec.name.as_str()))
+                .collect();
+            assert_eq!(named, [(0, "glow"), (1, "bar"), (2, "spikes")]);
+            assert_eq!(named, declared);
+        });
+    }
+
     /// **A name that is nowhere names the name, not a path nobody asked for.**
     ///
     /// `qml_path` used to fabricate `<shipped>/decorations/<name>.qml` for a
@@ -4003,6 +4389,7 @@ mod tests {
             outer: (800, 600).into(),
             alpha: 1.0,
             scale: 1.0,
+            now: std::time::Duration::ZERO,
         }
     }
 
@@ -4081,6 +4468,7 @@ mod tests {
             outer: (800, 600).into(),
             alpha: 1.0,
             scale: 1.0,
+            now: std::time::Duration::ZERO,
         };
         let spread = super::spread(
             half,
@@ -4424,6 +4812,7 @@ mod tests {
                 decoration.tell(
                     &Look {
                         title: "before the reload",
+                        app_id: "",
                         focused: true,
                         pointer_inside: false,
                         caret: None,
@@ -4948,9 +5337,10 @@ mod tests {
     fn a_narrow_tile_hides_the_titlebars_pieces_in_every_shipped_style() {
         // The style, whether its bar runs across the window, and the extent
         // along the bar below which the title goes.
-        const STYLES: [(&str, bool, i32); 6] = [
+        const STYLES: [(&str, bool, i32); 7] = [
             ("top", true, 174),
             ("bottom", true, 174),
+            ("glass", true, 117),
             ("pulse", true, 174),
             ("reactive", true, 144),
             ("reveal", true, 164),
@@ -5006,6 +5396,409 @@ mod tests {
                         && source.contains("frame.roomForMaximize")
                         && source.contains("frame.roomForClose"),
                     "{name}: a piece is no longer bound to the room it has"
+                );
+            }
+        });
+    }
+
+    /// Run QML's clock `ms` on from a moment of this test's own, a frame at a
+    /// time, as a compositor's frames run it (`scenario`'s player does the
+    /// same).
+    fn run_qml_clock(clock: &mut std::time::Duration, ms: u64) {
+        use std::time::Duration;
+        let until = *clock + Duration::from_millis(ms);
+        while *clock < until {
+            std::thread::sleep(Duration::from_millis(16));
+            *clock += Duration::from_millis(16);
+            crate::qml::tick(*clock);
+        }
+    }
+
+    /// What `Decoration::tell` is handed by a frame, focused or not.
+    fn look_with(values: &Values, focused: bool) -> Look<'_> {
+        Look {
+            title: "terminal",
+            app_id: "",
+            focused,
+            pointer_inside: false,
+            caret: None,
+            values,
+        }
+    }
+
+    /// **A layer's opacity is its root's `layerOpacity`, and 1 when it has
+    /// none**: a delegated layer's own, an inline layer's through
+    /// `PaneStyle`, clamped to 0..1, and 1 for a root that never says.
+    #[test]
+    fn a_layers_opacity_is_its_roots_and_one_when_it_has_none() {
+        on_the_qt_thread(|| {
+            let dir = fixture(
+                "layer-opacity",
+                &[
+                    (
+                        "Pane.qml",
+                        r#"
+                        import QtQuick
+                        import Solium
+
+                        PaneStyle {
+                            Layer { depth: "frame"; name: "quarter"; source: "Quarter.qml" }
+                            Layer { depth: "above"; name: "half"; layerOpacity: 0.5; Item {} }
+                            Layer { depth: "above"; name: "over"; layerOpacity: 2; Item {} }
+                            Layer { depth: "behind"; name: "plain"; source: "Plain.qml" }
+                        }
+                        "#,
+                    ),
+                    (
+                        "Quarter.qml",
+                        "import QtQuick\nItem { property real layerOpacity: 0.25 }\n",
+                    ),
+                    ("Plain.qml", "import QtQuick\nItem {}\n"),
+                ],
+            );
+            let style = crate::style::load(&dir).expect("the fixture loads");
+            let decoration = Decoration::from_style(&style, 60, 88).expect("four scenes");
+            let seen: Vec<(String, f32)> = decoration.layer_opacities();
+            assert_eq!(
+                seen,
+                [
+                    ("quarter".to_owned(), 0.25),
+                    ("half".to_owned(), 0.5),
+                    ("over".to_owned(), 1.0),
+                    ("plain".to_owned(), 1.0),
+                ]
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// **A layer fading by its opacity draws no new picture**: while a
+    /// `Behavior` takes `layerOpacity` from 1 to 0 the scene is never dirty,
+    /// though it animates and its opacity falls on every frame, so the
+    /// compositor blends the picture it has at each new alpha. The control,
+    /// the same fade on its `Item.opacity`, is dirty on its frames: what
+    /// this would read if the fade were drawn by Qt.
+    #[test]
+    fn a_layer_fading_by_its_opacity_draws_no_new_picture() {
+        on_the_qt_thread(|| {
+            if crate::qml::on_gpu() {
+                return;
+            }
+            const BY_LAYER: &str = r##"
+                import QtQuick
+
+                Item {
+                    property bool focused: false
+                    property real layerOpacity: focused ? 0 : 1
+                    Behavior on layerOpacity { NumberAnimation { duration: 160 } }
+                    Rectangle { anchors.fill: parent; color: "#ff0000" }
+                }
+            "##;
+            const BY_ITEM: &str = r##"
+                import QtQuick
+
+                Item {
+                    property bool focused: false
+                    opacity: focused ? 0 : 1
+                    Behavior on opacity { NumberAnimation { duration: 160 } }
+                    Rectangle { anchors.fill: parent; color: "#ff0000" }
+                }
+            "##;
+            let dir = fixture(
+                "layer-opacity-fade",
+                &[
+                    (
+                        "Pane.qml",
+                        r#"
+                        import QtQuick
+                        import Solium
+
+                        PaneStyle {
+                            Layer { depth: "above"; name: "layer"; source: "ByLayer.qml" }
+                            Layer { depth: "above"; name: "item"; source: "ByItem.qml" }
+                        }
+                        "#,
+                    ),
+                    ("ByLayer.qml", BY_LAYER),
+                    ("ByItem.qml", BY_ITEM),
+                ],
+            );
+            let style = crate::style::load(&dir).expect("the fixture loads");
+            let mut decoration = Decoration::from_style(&style, 60, 88).expect("two scenes");
+            let values = Values::default();
+            let mut clock = std::time::Duration::from_secs(5_000_000);
+            for layer in &mut decoration.layers {
+                let _ = layer.scene.render();
+            }
+            decoration.tell(&look_with(&values, true), 60, 88);
+            let (mut drawn_layer, mut drawn_item, mut seen) = (0, 0, Vec::new());
+            for _ in 0..16 {
+                run_qml_clock(&mut clock, 16);
+                let [layer, item] = &mut decoration.layers[..] else {
+                    panic!("two layers")
+                };
+                if layer.scene.needs_render() {
+                    drawn_layer += 1;
+                    let _ = layer.scene.render();
+                }
+                if item.scene.needs_render() {
+                    drawn_item += 1;
+                    let _ = item.scene.render();
+                }
+                seen.push(layer.opacity());
+            }
+            assert_eq!(drawn_layer, 0, "a fade by layerOpacity drew a new picture");
+            assert!(
+                drawn_item >= 4,
+                "the control drew {drawn_item}: the count reads nothing"
+            );
+            assert!(
+                seen.iter().any(|alpha| *alpha > 0.05 && *alpha < 0.95)
+                    && seen.windows(2).all(|pair| pair[1] <= pair[0])
+                    && seen.last().is_some_and(|alpha| *alpha == 0.0),
+                "the opacity did not fall from 1 to 0 through the frames: {seen:?}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// The shipped `glass` style around a client `w` by `h`, built in
+    /// software, and its bar's layer, `None` on the GPU path, where a layer
+    /// is built at 1x1 and keeps no image to read back.
+    fn glass(w: i32, h: i32) -> Option<Decoration> {
+        if crate::qml::on_gpu() {
+            return None;
+        }
+        let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/qml/panes/glass"));
+        let style = crate::style::load(dir).expect("the shipped style loads");
+        Some(Decoration::from_style(&style, w, h).expect("the style builds"))
+    }
+
+    /// The alpha at `(x, y)` of the layer called `name`, and the lightest of
+    /// its channels.
+    fn layer_pixel(decoration: &mut Decoration, name: &str, x: usize, y: usize) -> (u8, u8) {
+        let layer = decoration
+            .layers
+            .iter_mut()
+            .find(|layer| layer.name == name)
+            .expect("the layer");
+        let rendered = layer.scene.render().expect("the layer renders");
+        let at = y * rendered.stride + x * 4;
+        let pixel = rendered
+            .pixels
+            .get(at..at + 4)
+            .expect("a pixel of the layer");
+        (pixel[3], pixel[0].max(pixel[1]).max(pixel[2]))
+    }
+
+    /// **The glass style draws no shade of its own and its bar no fill**:
+    /// its layers are the bar and the keyboard pill, the shade being the
+    /// `shade` effect its `effects.lua` puts in front of the pane
+    /// (`state::tests::the_shipped_glass_style_binds_liquid_glass_behind_the_pane`);
+    /// and the bar, focused or not, draws nothing across its band but its
+    /// buttons, title and icon, so the glass behind it shows through.
+    #[test]
+    fn the_glass_style_draws_no_shade_and_its_bar_no_fill() {
+        on_the_qt_thread(|| {
+            let Some(mut decoration) = glass(400, 268) else {
+                return;
+            };
+            let names: Vec<&str> = decoration
+                .layers
+                .iter()
+                .map(|layer| layer.name.as_str())
+                .collect();
+            assert!(!names.contains(&"shade"), "{names:?}");
+            assert_eq!(names.first(), Some(&"bar"), "{names:?}");
+            let values = Values::default();
+            let mut clock = std::time::Duration::from_secs(3_000_000);
+            for focused in [false, true] {
+                decoration.tell(&look_with(&values, focused), 400, 300);
+                run_qml_clock(&mut clock, 100);
+                for y in [270, 284, 299] {
+                    assert_eq!(
+                        layer_pixel(&mut decoration, "bar", 200, y).0,
+                        0,
+                        "focused {focused}: a fill at (200, {y})"
+                    );
+                }
+            }
+        });
+    }
+
+    /// **A focus change draws the glass bar once**: frame by frame for 400 ms
+    /// as the compositor would ask, one new picture of the bar (its title
+    /// and buttons change colour), each way. Nothing in it animates: the
+    /// shade's fade is the compositor's (`effect::fade`), and a bar drawn
+    /// again on every frame of a fade cost a busy screen its frames.
+    #[test]
+    fn a_focus_change_draws_the_glass_bar_once() {
+        on_the_qt_thread(|| {
+            let Some(mut decoration) = glass(400, 268) else {
+                return;
+            };
+            let values = Values::default();
+            let mut clock = std::time::Duration::from_secs(6_000_000);
+            decoration.tell(&look_with(&values, false), 400, 300);
+            run_qml_clock(&mut clock, 400);
+            for layer in &mut decoration.layers {
+                let _ = layer.scene.render();
+            }
+            for focused in [true, false] {
+                decoration.tell(&look_with(&values, focused), 400, 300);
+                let mut bar = 0;
+                for _ in 0..25 {
+                    for layer in &mut decoration.layers {
+                        if layer.scene.needs_render() {
+                            if layer.name == "bar" {
+                                bar += 1;
+                            }
+                            let _ = layer.scene.render();
+                        }
+                    }
+                    run_qml_clock(&mut clock, 16);
+                }
+                assert_eq!(bar, 1, "focused {focused}: the bar was drawn {bar} times");
+            }
+        });
+    }
+
+    /// **The glass bar's numbers are its to change**: its `iconSize` the room
+    /// its title is left, on a pane 120 wide; and its `resizeHz`, read as
+    /// the compositor reads it
+    /// (`tests::a_layer_is_drawn_again_for_a_new_size_at_most_resize_hz_times_a_second`).
+    /// The shade's are the `shade` effect's params, in `effects.lua`.
+    #[test]
+    fn the_glass_bars_numbers_change_what_it_draws() {
+        on_the_qt_thread(|| {
+            let Some(mut narrow) = glass(120, 268) else {
+                return;
+            };
+            let values = Values::default();
+            narrow.tell(&look_with(&values, true), 120, 300);
+            assert!(narrow.layers[0].scene.get_bool("roomForTitle"));
+            narrow.layers[0].scene.set_int("iconSize", 32);
+            assert!(
+                !narrow.layers[0].scene.get_bool("roomForTitle"),
+                "a larger icon leaves the title no room at 120"
+            );
+            assert!((narrow.layers[0].resize_hz() - 30.0).abs() < f64::EPSILON);
+        });
+    }
+
+    /// **A layer is drawn again for a new size at most `resizeHz` times a
+    /// second** while its pane's size keeps changing: the glass bar, at its
+    /// 30, through a second of a drag that widens its pane on every frame of
+    /// a 260 Hz monitor, is drawn about 30 times and not 260, its picture
+    /// stretched between; at its last size within a thirtieth of a second of
+    /// the drag stopping, and not again after; and at once, at the pane's
+    /// size, when it has something new to draw (a focus change). At
+    /// `resizeHz = 0` it is drawn at every size, as every layer was.
+    #[test]
+    fn a_layer_is_drawn_again_for_a_new_size_at_most_resize_hz_times_a_second() {
+        use std::time::Duration;
+        on_the_qt_thread(|| {
+            let Some(mut decoration) = glass(400, 268) else {
+                return;
+            };
+            let values = Values::default();
+            let insets = decoration.insets;
+            decoration.tell(&look_with(&values, true), 400, 300);
+            // One frame of `layer_elements`' for the bar, at `ms` with its pane
+            // `width` wide, as the software path draws it: whether it drew a
+            // new picture, and the size it is at.
+            let frame = |decoration: &mut Decoration, ms: u64, width: i32| {
+                let bar = &mut decoration.layers[0];
+                let wanted = (width, 300);
+                let (size, _) = bar.size_for(Duration::from_millis(ms), wanted, wanted, insets);
+                bar.scene.resize(size.0, size.1, 1.0);
+                let fresh = bar.scene.needs_render();
+                if fresh {
+                    let _ = bar.scene.render();
+                }
+                bar.buffer_size = size;
+                (u32::from(fresh), size)
+            };
+            // A drag: 250 frames 4 ms apart, the pane a pixel wider on each.
+            let drag = |decoration: &mut Decoration, from: u64| {
+                (0..250_u64)
+                    .map(|step| {
+                        let width = 400 + i32::try_from(step).unwrap_or(0);
+                        frame(decoration, from + step * 4, width).0
+                    })
+                    .sum::<u32>()
+            };
+            assert_eq!(
+                frame(&mut decoration, 0, 400),
+                (1, (400, 300)),
+                "first drawn"
+            );
+            let drawn = drag(&mut decoration, 1000);
+            assert!(
+                (25..=31).contains(&drawn),
+                "drawn {drawn} times through the drag"
+            );
+            // Stopped at 649 wide: drawn there within 34 ms, and then no more.
+            let mut settled = Vec::new();
+            for ms in (2000..2100).step_by(4) {
+                settled.push(frame(&mut decoration, ms, 649));
+            }
+            let at: Vec<(u32, (i32, i32))> =
+                settled.iter().copied().filter(|seen| seen.0 == 1).collect();
+            assert_eq!(at, [(1, (649, 300))], "{settled:?}");
+            assert!(
+                settled.iter().take(9).any(|seen| seen.1 == (649, 300)),
+                "not drawn at its last size within 34 ms: {settled:?}"
+            );
+            // A focus change mid-drag is drawn at once, at the pane's size.
+            assert_eq!(frame(&mut decoration, 3000, 700).1, (700, 300));
+            assert_eq!(frame(&mut decoration, 3004, 701), (0, (700, 300)), "held");
+            decoration.tell(&look_with(&values, false), 701, 300);
+            assert_eq!(
+                frame(&mut decoration, 3008, 702),
+                (1, (702, 300)),
+                "something new"
+            );
+            // And at 0, at every size.
+            assert!(
+                decoration.layers[0]
+                    .scene
+                    .set_json("resizeHz", &crate::json::Json::Number(0.0))
+            );
+            let every = drag(&mut decoration, 4000);
+            assert_eq!(every, 250, "at resizeHz 0");
+        });
+    }
+
+    /// **The glass bar shows the icon the theme has for its app id**, and
+    /// none for no id: whatever this machine's icon theme holds, the icon is
+    /// on show exactly when `image://solium/icon/` resolves the window's app
+    /// id (`icon::resolve`, its fallback included), and it follows the id.
+    #[test]
+    fn the_glass_bar_shows_the_icon_the_theme_has_for_its_app_id() {
+        on_the_qt_thread(|| {
+            let Some(mut decoration) = glass(400, 268) else {
+                return;
+            };
+            let values = Values::default();
+            for app_id in ["kitty", "", "org.example.no-such-application", "kitty"] {
+                decoration.tell(
+                    &Look {
+                        title: "a window",
+                        app_id,
+                        focused: true,
+                        pointer_inside: false,
+                        caret: None,
+                        values: &values,
+                    },
+                    400,
+                    300,
+                );
+                let resolves = !app_id.is_empty() && crate::icon::resolve(app_id, 16, 1).is_some();
+                assert_eq!(
+                    decoration.layers[0].scene.get_bool("iconShown"),
+                    resolves,
+                    "{app_id:?}"
                 );
             }
         });

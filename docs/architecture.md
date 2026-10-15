@@ -167,19 +167,23 @@ preview without touching the renderer.
 
 ### So are the shapes
 
-`crates/effects` is the same crate again for the other half of a transform: the
-vertex deformations a rectangle and a matrix cannot express — a genie, and
-whatever fold, curl or page turn comes next. Same empty `[dependencies]`, same
-unit tests, same wasm preview with live sliders, and the same reason.
+The other half of a transform, the vertex deformations a rectangle and a
+matrix cannot express — a genie, and whatever fold, curl or page turn comes
+next — are effect folders: a geometry effect's `mesh`, Lua, called once a
+pass (below). `crates/effects` keeps the first of them, the genie, as Rust
+(`Deform::Genie`), with its unit tests and its wasm preview, as the oracle
+the shipped `effects/genie/` is held to within 10⁻⁹, and the compositor
+reaches it only in tests and, through `SOLIUM_GEOMETRY_ORACLE`, a debug
+build: no release binary draws an effect from Rust.
 
-It has a second reason the animation engine does not, and it is the harder one:
+It has a reason the animation engine does not, and it is the harder one:
 **the damage tracker needs a deformed window's bounding box before anything is
-drawn, and a shader cannot tell it one.** So a vertex function stays CPU-side
-and parametric — a name and some numbers, never user code. A *fragment* effect
-could one day be code a style supplies, because a bad one is a wrong picture
-and a bad damage rect is a corrupt screen; today there is one, rounded
-corners, and its shader is compiled into the crate. See
-`docs/design/2026-09-12-panes-and-effects-design.md`.
+drawn, and a shader cannot tell it one.** So a vertex function stays CPU-side,
+its grid checked (the count, every number finite, every point inside a box
+around the pane's monitor) before a vertex of it is drawn, and the warp's
+bounds are those points'. A *fragment* effect can be a file of its own,
+because a bad one is a wrong picture and a bad damage rect is a corrupt
+screen. See `docs/design/2026-09-12-panes-and-effects-design.md`.
 
 The split with the compositor is the anchor. A deformation morphs between two
 rectangles, and the far one is named rather than given: `deform = { effect =
@@ -187,16 +191,23 @@ rectangles, and the far one is named rather than given: `deform = { effect =
 `Solium::aimed_at_for` resolves on the frame that draws it, and `to = { surface =
 name }` aims at a `sol.surface` scene the same way: at its instance on the
 window's own monitor, not on the one the pointer is on. Both ends are in global
-space and are moved onto each screen together, so a genie on a monitor that is
-not at the origin lands where it was aimed (#143). A rectangle read out of a
-Lua table when the binding was pressed aims at where a dock icon was half a
-second ago, which is the stale-copy failure the anchors planned in
-`docs/shell-boundary.md` are meant to rule out for a hosted dock.
-`crates/effects` never sees the identity — it has no idea what a pane is, which
-is what keeps it testable without a session.
+space, and so is the grid the `mesh` writes, moved onto each screen with the
+frame, so a genie on a monitor that is not at the origin lands where it was
+aimed (#143). A rectangle read out of a Lua table when the binding was pressed
+aims at where a dock icon was half a second ago, which is the stale-copy
+failure the anchors planned in `docs/shell-boundary.md` are meant to rule out
+for a hosted dock. The effect never sees the identity, only the rectangles it
+resolved to, in `t.from` and `t.to`.
 
-`Deform::from_name` is what scripts bind to, exactly as `Curve::from_name` is,
-and `script::shipped` checks the shipped Lua against both.
+`sol.present`'s `deform` names a folder, which the effect host resolves where
+the command is applied (`present::Geometry`: the effect's id, the progress, its
+params packed into numbers so a present can blend them, its axis, picked once
+for `"auto"`, and what it draws when it cannot be drawn); `render::prepare`
+builds each warped pane's grid once a pass, not once per output, at the top
+of `resolve` (`render::plan_warps`), and keeps it
+on the pane while nothing it depends on moves, and `warp::mesh_grid` projects
+it. `script::shipped` checks every effect the shipped Lua names is a shipped
+folder, as it checks every curve against `Curve::from_name`.
 
 ### Fragment programs and captures
 
@@ -255,6 +266,278 @@ The texture is the cost. Every visible warped window keeps one, which is why
 keeps none. What is beneath a node, the input a blur would need, is named in
 `fragment.rs` and nothing constructs it yet; rounded corners are the one effect
 there is.
+
+### Effect folders load in two phases
+
+An effect is a folder of Lua and GLSL a user can copy and change
+(`crates/solium/effects/README.md`), and it loads in two phases, because a
+configuration reload has no renderer and `render::prepare` is the first place
+the compositor holds a GL context between frames. At config load, with no
+GPU, `effect::host::Host` reads every folder the configuration wants, runs its
+`effect.lua` in a Lua of its own (`effect/sandbox.rs`), flattens its stages
+into one plan for its defaults and one for each `fallback` rung
+(`solium_effects::stage`), lints every pass's shader and hashes the folder;
+one whose hash has not changed keeps everything, and is only bound again when
+an effect it uses or falls back to changed, so the programs that effect's old
+version compiled are deleted between frames. At the top of the next
+`prepare` the host compiles what changed, in raw GL from three source strings
+(`effect/gl.rs`: a prelude, the user's file untouched, an epilogue), so the
+driver's log names the user's own line, which smithay's program API would
+drop. Programs are keyed by the hash of what they compile, so two effects
+with the same program share it, and a version swaps in only once all of its
+programs compiled: one that fails leaves the version that ran. Before its
+first compile, `prepare` asks the GPU once, with a 1×1 target, whether it
+renders into `rgba16f` (`pool::formats`); from then a plan drawing into a
+format the GPU lacks is dropped at bind, so the effect starts at its first
+rung that runs, and until then every rung is kept. With no effect wanted,
+`prepare` asks the host one question and touches no GL.
+
+Rules (`sol.effects`) are bound at config load the same way, GPU-free:
+`Solium::apply_effects` wants every effect they name, binds every link with
+its params into one chained plan per rule (`effect::plan::Chains`), and
+refuses a tier this build cannot run; one rule that fails keeps the whole set
+out and the rules that ran stay, with the problem on the overlay. The host
+holds the programs the bound rules run, and gives them back when a set
+replaces them; a set refused leaves nothing to compile. A reload reads the folders before the scripts run, so the
+rules bind against the folders as they now are, and the probe's first answer
+binds them again after the frame (`Solium::settle`), since rules bound before
+it kept every rung.
+
+A pane style's rules come from its `effects.lua`, read by `style::rules_of`
+in an effect's sandbox, once per folder and content, and carried on each
+pane's `Decoration` with their generation, so a bare pane has none.
+`Solium::apply_style_rules` wants their effects and binds them when the style
+is applied (each `sol.pane`, a reload, the probe's rebind), never in
+`prepare`; unlike the user's set they bind one by one, a rule that cannot
+leaving its slot empty, and a file that does not run keeps the rules that
+ran, its problems under `style:<folder>`.
+
+Once a pass, `render::prepare` resolves every rule, after the effects compile
+and before any capture is built (`render::build_slots`): for every part of
+each pane a monitor shows (the cull its captures make), each scripted
+surface's instance on each output and each client layer surface, the last
+matching rule per slot, kept in `Prepared.slots` (`effect::plan::Slots`) so
+every output and every screencopy places from one answer. A window's facts
+(`Solium::window_facts`) are gathered only for the keys some rule reads, and a
+slot is wanted only when its rule's chain is bound, since binding is the
+config load's and never a frame's. With no rules, neither the user's nor any
+pane style's, nothing is resolved and no fact is gathered.
+
+Each output then walks a pane's pieces with its slots (`render::pane_walk`):
+the pane's `front` and `behind` around its layers and client, under its
+popups; the client's around the client, its `replace` in the client's place;
+a layer's, and the titlebar's around the style's `bar` layer, through
+`Decoration::layer_elements`' hook; the popups' around the popups; and a
+layer surface's or a scripted surface's just over and under it
+(`render::stacked_walk`). A slot is drawn only once its result is ready, so a
+wanted slot whose chain failed or has not run draws the part (`replace`) or
+nothing (`behind`, `front`), and with no rules the walk is `PANE_ORDER`'s.
+A result is placed over its part grown by its reach and cut by the part's
+mask, unless its rule asks for the alpha or its chain reads `shape`; the
+off-screen cull grows a pane by the furthest its results reach. A slot is
+ready once its chain has run, below.
+
+A slot whose chain reads its part's own pixels (T1) captures the part each
+pass (`render::self_inputs`, `offscreen::part_job`): the client's own surface
+tree, unrounded, since the mask rounds the result; the popups; one of the
+style's layers at its canvas; the whole pane; a scripted surface's instance;
+or a layer surface. The part's corner sits at the chain's reach, rounded up
+to a whole pixel on the part's monitor, so the capture holds what the chain
+reads around it, and the capture is keyed as a warp's is, so a still part is
+captured once and again only when it commits. Every wanted slot's padded box,
+the part inside it and its radii, is recorded whatever its tier
+(`render::record_boxes`), for the runs. A slot's capture and its chain's
+targets live in `effect::store::Store` on `Solium`: made when a slot is first
+wanted, made afresh when another rule fills it, and given back by the sweep
+at the end of `prepare` once no rule wants it. A titlebar rule whose chain
+reads `self` is refused when it binds: a region's own pixels are a crop of
+the layer that draws it, which waits for P15.
+
+A plan is run by `effect/run.rs`, in raw GL like the programs: each step is
+drawn into a pooled target in a frame opened on the carrier, reading
+`sol_tex` on texture unit 0 and the textures it `uses` on the next, at most
+eight in all, and puts back what smithay expects to find. States run first,
+and nothing waits on the CPU between steps, since one context's reads come
+after its writes; only the last step's fence goes back to the caller. Before
+it draws, a run asks the host for every program: one not compiled yet leaves
+the part as if no effect were configured that pass and latches nothing, and
+one that failed, or a GL error after the run, fails the chain for good. A
+chain's targets are held from one run to the next: a step draws into a target
+an earlier step of its size and format drew into, once no later step reads
+what that one holds (`stage::Plan::slots`), so a jump flood of eight passes
+holds two and a second run of the same size makes nothing; and a state is
+made again only when what it `depends` on moves (`run::Keys`: the params'
+hash, the self capture's commit, the shape), when its size does, or when a
+state it reads was made again. The effects' GPU time is one region a run
+phase, `gpu_effects_us` in the trace; wirecheck runs plans on their own
+(cases 12d to 12g and 12l to 12q).
+
+`prepare` goes in phases (`render::effect_phases`, over a `render::Phases`
+the tests drive with no GPU): compile what is pending; resolve the slots;
+capture and run every part but a whole pane; capture a whole pane, whose
+capture walks the results the first phase made and never its own, and run
+its chains; and only then build and draw the warps, so a warped window's
+capture walks the same slots as the flat path, in the same order, with this
+pass's results in them. A blurred window stays blurred while it tilts or
+genies, and a chain that re-ran makes the warp's capture stale while a result
+placed again does not (`dev/effects-check.sh tilt`). The store and the pool
+are swept once, at the end. Each run phase binds one carrier, and none when
+none of its chains is wanted (`render::run_slots`, through a
+`render::Runner`). A self chain runs, its part's capture as its first input, only when that capture
+was redrawn this pass, its params changed or its padded box's size did
+(`effect::store::SlotState::needs_run`); otherwise its last result is placed
+again with the same id and commit, so nothing under it is damaged. With
+`SOLIUM_RECAPTURE=always` every capture is redrawn, so every chain runs every
+pass. A run's result is the slot's `Ready`, drawn through the masked program.
+A chain that fails is latched and said once, and its part is drawn as if no
+rule named it; one whose program has not compiled yet is drawn the same for
+that pass and latches nothing. `effect_runs` in the trace counts the runs. A chain
+that reads nothing of the frame (T0, `Tier::Generated`: only `shape` and its
+states) captures nothing: its first input is the pool's one 1x1 transparent
+texture (`pool::Pool::blank`), its input never counts as redrawn
+(`render::input_redrawn`), so it runs on its first pass and again only when
+its params or its padded box's size change, and it runs in the first phase
+whatever its part. `dev/effects-check.sh t0` shows one behind a window.
+
+So three tiers run: T0, T1 (`Tier::Own`, a capture of the part) and T2 (the
+backdrop from xray), the tier read from the bound chain's flattened plan when
+the rules are applied (`effect::rules::tier`); the live backdrop (T3) is
+refused at bind by `rules::runnable`, naming X4.1, so a rule that cannot run
+yet is a problem and not a slot drawn empty.
+
+T2 adds two phases to `prepare`, after `resolve` and before any capture or
+chain (Ruling F31): `scenes` renders each hosted scene a wanted xray cut
+holds at the size and scale `elements` will ask for, and `xray` draws each
+wanted cut (`offscreen::xray_job`, a keyed capture of the layers below a
+part's band, kept until what it holds differs) and runs each wanted memo
+over a cut redrawn since it last ran (`render::run_xray`). `resolve` records
+one `T2Place` per monitor a T2 part's padded box overlaps (its box in that
+monitor's xray pixels and its own, a `BoxMap` into the monitor-sized
+textures, the size the suffix runs at), and `want_t2` wants each place's cut
+and asks `effect::memo::Memos::admit_pass` once for every place's memos under
+`effects.memo.budget_mib`; a cut or a memo nobody reads this pass is not
+built. In the inner nest each place then runs its chain's suffix at the
+part's own size (or its whole plan, when its memos were not held), only when
+its `memo::T2Key` moved, or, with an empty suffix, places a crop of the memo
+and runs nothing; the walk places each monitor's result there
+(`Slots::at_on`). The split (`stage::split_memo`) is derived from the bound
+plan by `BoundChain::split`, by `effects.memo.split` or a rule's
+`memo = false`. While the session is locked `build_slots` wants no slot of
+the session at all, so nothing of it is captured, run or read behind the
+lock.
+
+A T2 place is measured where the part is drawn this pass (Ruling F37,
+`render::measured`): at rest from the layout's rectangle, through a glide or
+a drag from the rectangle the walk draws it at, so a plain blur's crop moves
+with the window and a suffix runs again on each pass its box moves. The pass
+reads the clock once, at the top of `resolve`, where it also plans every
+pane's warp (`render::plan_warps`; the `warps` phase takes those plans), and
+the places, the warps and `elements`' walk are all measured at that instant
+(`Prepared::now`). A suffix whose key moved only with its part's place or
+size runs at most `effects.motion_hz` times a second (60 by default; 0
+on every pass), its last result drawn where the part is between, each place
+on a tick of its own phase so windows that glide together do not run
+together (`effect::store::T2State::waits`). A warped pane's capture holds its slots, with one
+exception: under `effects.xray.warped = "drawn"`, the default, a `behind` T2
+slot is drawn beneath the warp instead (`effect::beneath`), through the same
+mesh, each fragment sampling the memo or the suffix's result where it is on
+the monitor and cut by the part's shape at the mesh's texture coordinates,
+and the capture keeps a hole there (`beneath::Hole`, blended `ZERO,
+ONE_MINUS_SRC_ALPHA`) so the pane's lower layers do not cover it. Its place
+is the bounds of the part's cells of the mesh. The capture is one picture
+for every monitor, so it holes the part only while every place has its
+texture that pass, and the slot is skipped otherwise. `"rest"` keeps the
+slot in the capture at the pane's resting rectangle.
+`dev/effects-check.sh motion` holds, glides and genies a window over bars no
+two places of which look alike, and wirecheck case 13i pins the beneath
+draw and the hole on the GPU.
+
+`dev/effects-check.sh blur` blurs a video player's own pixels through a rule
+and shows a still window's chain run only on the passes that captured it.
+
+A rule with a `fade` eases its slot in and out as it comes and goes
+(`effect::fade`): `build_slots` steps each slot through `Solium::slot_fades`
+at the pass's instant, so a slot whose rule has just matched is wanted from
+opacity 0, and one whose rule has stopped is still wanted, its result drawn
+as it is at a falling opacity, until it reaches 0 and is wanted no more. The
+opacity is the walk's (`Slots::opacity`, multiplied in `slot_element` and in
+a beneath draw's alpha), and nothing is run for it; a pass a fade moves asks
+for the next. The glass style's shade is one: a T0 `shade` in front of the
+pane, matching `focused = false`.
+
+The first desktop frame waits for what it shows (spec C14: nothing pops in
+after it). Once a pass, at the end of `prepare`, `render::hold_first_frame`
+asks `warm::Warm` whether to hold, given `Solium::first_frame_ready`: today
+`Solium::effects_ready`, every program asked compiled (`Host::ready`) and
+every xray cut ever wanted built once (`Xrays::ready`); milestone 1's
+warm-up list adds its own terms to the same predicate. While it holds,
+`elements` draws only the clear colour and the next pass is asked for;
+`prepare` runs as always behind it, so programs compile, scenes render and
+cuts build. Once a frame is let through it never holds again, so a hotplug,
+a lock and a reload draw at once. `sol.startup{ first_frame = { hold,
+max_ms, on_reload } }` (`startup.first_frame` in `config.lua`) says whether
+it holds (`true`); the longest it does (2000 ms, 0 to 10000, 0 never
+holding), after which whatever is late is drawn as it is and named in the
+log; and whether each successful reload arms it again (`false`)
+(`warm::tests::the_hold_is_capped_at_max_ms`,
+`warm::tests::hold_and_on_reload_are_obeyed`). With no effects nothing is
+pending, and the first frame is drawn at once.
+
+Every way an effect fails leaves its part drawn: a Lua error or a lint keeps
+the set out at load, and a program that will not compile, a run that fails
+on the GPU and a self input never captured leave the slot wanted and never
+ready, which the walk draws as no slot
+(`state::tests::real_client::every_failure_leaves_the_part_drawn`, and
+`every_failure_leaves_layer_and_scripted_surfaces_drawn` for the surfaces;
+`dev/effects-check.sh fail` on screen). With no rules none of this runs:
+`build_slots` gathers no fact and wants no slot, no self input is captured,
+no chain runs and nothing is compiled, and a window takes the path it took
+before effects existed. A fullscreen window with no rule is not warped
+(`render::warp_of`, `prepare`'s warp condition), wants no capture and walks
+`PANE_ORDER`, so `panes` builds the surface elements smithay's DRM compositor
+assigns planes from, and direct scanout stays
+(`state::tests::real_client::a_fullscreen_window_with_no_rule_takes_todays_path`;
+`dev/effects-check.sh none`, whose trace has no capture and no run).
+
+### Geometry files, and the clock every effect call runs against
+
+A geometry effect's `mesh` is Lua called once a pass (`effect::geometry`),
+on the effect's own sandbox, with one `t` and one `out` kept in its registry
+and reused every call, so a pass allocates nothing in Lua; what it wrote is
+checked (the count, every number finite, every point inside a box four
+monitors wide and high centred on the pane's) before a vertex of it is
+drawn. At load the file is called at
+progress 0 and 1, on every axis and in every direction, and at rest over a
+part of the window too, 36 calls sharing one
+load budget (`effects.sandbox.load_ms`, 100 ms by default; the sandbox's
+memory is `effects.sandbox.memory_mib`, both in `effect::settings` with the
+engine's other keys), and refused unless it draws the window exactly where it is at
+rest and the fastest of those calls fits the 2 ms a frame gives (the
+fastest, since one call is slow when the machine is busy and all of them
+only when the file is), at its `mesh`'s line on the overlay and in
+`--check`. A version with nothing to compile, a geometry file alone, is
+current as soon as it loads.
+
+Every call into an effect's Lua runs against a deadline, and none of them
+under a count hook: Lua 5.4 takes its slow path on every instruction while
+one is set, which doubles a genie's call. So `effect::watch` keeps one
+watchdog thread that waits for each call's deadline and sends a call still
+running a real-time signal, on its own thread; the handler arms a hook with
+`lua_sethook` there, the one Lua call a signal handler may make, as `lua.c`
+stops a script on Ctrl-C. The watchdog never touches a Lua itself: from
+another thread it would walk the running call's frames while an unwinding
+error frees them. Where the signal is taken by something else, a call falls
+back to a count hook set for it alone. A call stopped either way poisons its
+state, since mlua 0.12.1 leaves the error in the stopped frame's locals, and
+`Solium::settle` loads it again from its unchanged folder after the frame
+(`Host::revive`), keeping its programs and its id, so a stop caused by a
+busy machine costs the panes of one pass and not the rest of the session. A
+folder changed since it loaded, or a rebuild that fails (said on the
+overlay), is not tried again until a reload reads it. The watchdog sends a
+call past its due its signal again every budget until it returns, so a stop
+whose hook a stale signal's took off is not lost. The clock stops Lua
+between instructions, never inside one call into Lua's own library, so the
+sandbox has no pattern functions, whose backtracking can outlast any frame.
 
 ### The arrangements are a crate too
 
@@ -335,6 +618,10 @@ renderer to choose instead. Drawing does not stay behind Smithay's generic
 - fragment programs of Solium's own, for rounded corners (`clip.rs`, drawing
   each surface through the programs `pass.rs` compiles from the GLSL ES source
   kept in `crates/effects`);
+- effect programs from user folders, compiled from three source strings and
+  failing with the driver's log (`effect/gl.rs`), and run with several
+  textures a pass (`effect/run.rs`), none of which smithay's program API
+  gives;
 - the EGL context and fence that QML on the GPU shares with Qt (`qml/paint.rs`,
   `surface.rs`).
 

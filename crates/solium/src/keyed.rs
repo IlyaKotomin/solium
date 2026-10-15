@@ -34,6 +34,9 @@ pub(crate) enum Kind {
     /// A warped pane's popups, drawn in front of its warp:
     /// `render::tests::a_warped_panes_popups_are_in_front_of_it`.
     Over,
+    /// A monitor's xray cut, Ruling F29, held in `effect::xray::Xrays` and
+    /// never by a pane: `tests::a_pane_holds_no_xray_capture`.
+    Xray,
 }
 
 /// One element a capture was drawn from: what the damage tracker itself
@@ -163,7 +166,8 @@ impl<T: Clone> Capture<Target<T>> {
         if let Some(old) = self.target.take() {
             pool.give_back(old);
         }
-        pool.target(alloc, size)
+        // A capture is the window's own pixels: always 8 bits a channel.
+        pool.target(alloc, size, crate::pool::Format::Rgba8)
     }
 
     /// Give the target back. `tests::a_pane_that_stops_warping_gives_the_texture_back`.
@@ -223,23 +227,29 @@ impl<T> Captures<T> {
 }
 
 impl<T: Clone> Captures<T> {
-    pub(crate) fn get_mut(&mut self, kind: Kind) -> &mut Capture<Target<T>> {
+    /// The pane's capture of `kind`; none of an xray, which a monitor holds
+    /// (`effect::xray::Xrays`). `tests::a_pane_holds_no_xray_capture`.
+    pub(crate) fn get_mut(&mut self, kind: Kind) -> Option<&mut Capture<Target<T>>> {
         match kind {
-            Kind::Pane => &mut self.pane,
-            Kind::Over => &mut self.over,
+            Kind::Pane => Some(&mut self.pane),
+            Kind::Over => Some(&mut self.over),
+            Kind::Xray => None,
         }
     }
 
     /// Give back every capture but those of `kinds`, the ones it captures this
     /// pass: a pane that captures nothing holds nothing, and a warped pane
     /// keeps its popups' capture only while it has popups open.
+    /// `tests::keep_holds_every_kind_it_is_given_and_gives_back_the_rest`,
     /// `tests::a_pane_that_stops_warping_gives_the_texture_back`,
     /// `tests::a_warped_pane_keeps_its_popups_capture`,
     /// `tests::a_warped_pane_whose_popups_close_gives_their_capture_back`.
-    pub(crate) fn keep_only(&mut self, kinds: &[Kind], pool: &mut Pool<T>) {
+    pub(crate) fn keep(&mut self, kinds: &[Kind], pool: &mut Pool<T>) {
         for each in [Kind::Pane, Kind::Over] {
-            if !kinds.contains(&each) {
-                self.get_mut(each).release(pool);
+            if !kinds.contains(&each)
+                && let Some(capture) = self.get_mut(each)
+            {
+                capture.release(pool);
             }
         }
     }
@@ -284,6 +294,19 @@ mod tests {
     #[test]
     fn a_capture_never_drawn_is_stale() {
         assert!(Capture::<u32>::default().stale(&nothing(Kind::Pane)));
+    }
+
+    /// **A pane holds no xray capture**: a monitor's cuts are held in
+    /// `effect::xray::Xrays`, so a pane asked for one answers none, and an
+    /// xray's key is never a pane's.
+    #[test]
+    fn a_pane_holds_no_xray_capture() {
+        let mut captures = Captures::<u32>::default();
+        assert!(captures.get_mut(Kind::Xray).is_none());
+        assert!(captures.get_mut(Kind::Pane).is_some());
+        let mut capture = Capture::<u32>::default();
+        capture.drawn(1, nothing(Kind::Pane));
+        assert!(capture.stale(&nothing(Kind::Xray)));
     }
 
     fn shape(turn: f32) -> crate::render::Shape {
@@ -364,7 +387,11 @@ mod tests {
     }
     impl Alloc for Counting {
         type Tex = Handle;
-        fn make(&mut self, _size: Size<i32, Physical>) -> Option<Handle> {
+        fn make(
+            &mut self,
+            _size: Size<i32, Physical>,
+            _format: crate::pool::Format,
+        ) -> Option<Handle> {
             self.made += 1;
             Some(Handle(Rc::new(Buffer(Rc::clone(&self.freed)))))
         }
@@ -417,10 +444,12 @@ mod tests {
         for _ in 0..60 {
             let target = captures
                 .get_mut(Kind::Pane)
+                .expect("a pane's capture")
                 .target_for(&mut pool, &mut alloc, size(1150, 850))
                 .expect("a target");
             captures
                 .get_mut(Kind::Pane)
+                .expect("a pane's capture")
                 .drawn(target, nothing(Kind::Pane));
         }
         assert_eq!(
@@ -437,17 +466,21 @@ mod tests {
             (Captures::<Handle>::default(), Pool::new(0), counting());
         let first = captures
             .get_mut(Kind::Pane)
+            .expect("a pane's capture")
             .target_for(&mut pool, &mut alloc, size(1150, 850))
             .expect("a target");
         captures
             .get_mut(Kind::Pane)
+            .expect("a pane's capture")
             .drawn(first, nothing(Kind::Pane));
         let second = captures
             .get_mut(Kind::Pane)
+            .expect("a pane's capture")
             .target_for(&mut pool, &mut alloc, size(1200, 850))
             .expect("a target");
         captures
             .get_mut(Kind::Pane)
+            .expect("a pane's capture")
             .drawn(second, nothing(Kind::Pane));
         assert_eq!(
             alloc.freed.get(),
@@ -463,14 +496,48 @@ mod tests {
             (Captures::<Handle>::default(), Pool::new(0), counting());
         let target = captures
             .get_mut(Kind::Pane)
+            .expect("a pane's capture")
             .target_for(&mut pool, &mut alloc, size(1150, 850))
             .expect("a target");
         captures
             .get_mut(Kind::Pane)
+            .expect("a pane's capture")
             .drawn(target, nothing(Kind::Pane));
-        captures.keep_only(&[], &mut pool);
+        captures.keep(&[], &mut pool);
         assert_eq!(alloc.freed.get(), 1);
-        assert!(captures.get_mut(Kind::Pane).target().is_none());
+        assert!(
+            captures
+                .get_mut(Kind::Pane)
+                .expect("a pane's capture")
+                .target()
+                .is_none()
+        );
+    }
+
+    /// **A window both warped and self-ruled keeps both captures**: `keep`
+    /// with a set, every kind in it held and the rest given back.
+    #[test]
+    fn keep_holds_every_kind_it_is_given_and_gives_back_the_rest() {
+        let (mut captures, mut pool, mut alloc) = (
+            Captures::<Handle>::default(),
+            Pool::new(64 << 20),
+            counting(),
+        );
+        for kind in [Kind::Pane, Kind::Over] {
+            let target = captures
+                .get_mut(kind)
+                .expect("a pane's capture")
+                .target_for(&mut pool, &mut alloc, size(8, 8))
+                .expect("a target");
+            captures
+                .get_mut(kind)
+                .expect("a pane's capture")
+                .drawn(target, nothing(kind));
+        }
+        captures.keep(&[Kind::Pane, Kind::Over], &mut pool);
+        assert!(captures.pane.target().is_some() && captures.over.target().is_some());
+        captures.keep(&[Kind::Pane], &mut pool);
+        assert!(captures.pane.target().is_some() && captures.over.target().is_none());
     }
 
     /// A warped pane with popups open keeps their capture with its own, and
@@ -482,17 +549,31 @@ mod tests {
         for kind in [Kind::Pane, Kind::Over] {
             let target = captures
                 .get_mut(kind)
+                .expect("a pane's capture")
                 .target_for(&mut pool, &mut alloc, size(400, 300))
                 .expect("a target");
-            captures.get_mut(kind).drawn(target, nothing(kind));
+            captures
+                .get_mut(kind)
+                .expect("a pane's capture")
+                .drawn(target, nothing(kind));
         }
-        captures.keep_only(&[Kind::Pane, Kind::Over], &mut pool);
+        captures.keep(&[Kind::Pane, Kind::Over], &mut pool);
         assert!(
-            captures.get_mut(Kind::Over).target().is_some(),
+            captures
+                .get_mut(Kind::Over)
+                .expect("a pane's capture")
+                .target()
+                .is_some(),
             "a warped pane let its popups' capture go"
         );
-        captures.keep_only(&[], &mut pool);
-        assert!(captures.get_mut(Kind::Over).target().is_none());
+        captures.keep(&[], &mut pool);
+        assert!(
+            captures
+                .get_mut(Kind::Over)
+                .expect("a pane's capture")
+                .target()
+                .is_none()
+        );
         assert_eq!(alloc.freed.get(), 2);
     }
 
@@ -506,16 +587,30 @@ mod tests {
         for kind in [Kind::Pane, Kind::Over] {
             let target = captures
                 .get_mut(kind)
+                .expect("a pane's capture")
                 .target_for(&mut pool, &mut alloc, size(400, 300))
                 .expect("a target");
-            captures.get_mut(kind).drawn(target, nothing(kind));
+            captures
+                .get_mut(kind)
+                .expect("a pane's capture")
+                .drawn(target, nothing(kind));
         }
-        captures.keep_only(&[Kind::Pane], &mut pool);
+        captures.keep(&[Kind::Pane], &mut pool);
         assert!(
-            captures.get_mut(Kind::Over).target().is_none(),
+            captures
+                .get_mut(Kind::Over)
+                .expect("a pane's capture")
+                .target()
+                .is_none(),
             "the menu closed and the pane kept its capture"
         );
-        assert!(captures.get_mut(Kind::Pane).target().is_some());
+        assert!(
+            captures
+                .get_mut(Kind::Pane)
+                .expect("a pane's capture")
+                .target()
+                .is_some()
+        );
         assert_eq!(alloc.freed.get(), 1);
     }
 }

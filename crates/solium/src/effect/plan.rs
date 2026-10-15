@@ -1,0 +1,1118 @@
+//! What a frame draws for effects: the rules' chains, bound at config load,
+//! and the slots resolved once a pass ([`Slots`]).
+
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+
+use smithay::utils::{Logical, Physical, Rectangle, Size};
+use solium_effects::stage::{Plan, Split};
+
+use super::element::EffectElement;
+use super::host::{Host, Problem};
+use super::memo::MemoKey;
+use super::rules::{CutChoice, Fill, Origin, Part, Rule, RuleKey, Slot, Tier, runnable, tier};
+use super::run::BoxMap;
+use super::xray::Cut;
+use crate::pane::PaneId;
+
+/// One rule's chain, bound and checked.
+/// `state::tests::a_broken_rule_keeps_the_rules_that_ran`.
+#[derive(Debug)]
+pub(crate) struct BoundChain {
+    pub(crate) plan: Plan,
+    pub(crate) reach: f64,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no frame reads it yet: the cull grows a pane by its results' reach"
+        )
+    )]
+    pub(crate) bleed: f64,
+    pub(crate) tier: Tier,
+    /// A hash of every link's name and bound params: a chain whose params
+    /// changed runs again (`store::SlotState::needs_run`).
+    /// `tests::a_chain_reaches_as_its_first_link_and_bleeds_as_all_of_them`.
+    pub(crate) params_hash: u64,
+    /// How [`BoundChain::split`] splits `plan`: the configured
+    /// `effects.memo.split`, or `Off` for a rule with `memo = false`
+    /// (Ruling F30; amended 2026-10-08, configurable).
+    /// `state::tests::real_client::a_rule_with_memo_false_is_never_split`.
+    pub(crate) split_by: Split,
+    /// The xray cut the rule asks for (Ruling F29).
+    /// `state::tests::real_client::a_rule_may_read_the_wallpaper_alone`.
+    pub(crate) cut: CutChoice,
+    /// A T2 chain's memo split, derived from `plan` by [`BoundChain::split`]
+    /// and by nothing else; `None` for every other tier.
+    memo: Option<solium_effects::stage::Memo>,
+    /// One key per export of `memo`, in its order: the prefix's
+    /// `keys()[export.step]`.
+    memo_keys: Vec<u64>,
+}
+
+impl BoundChain {
+    /// Derive the memo split and one key per export from `plan`, the one
+    /// copy: at bind, and after every write into `plan` (Task 59's
+    /// `write_uniform`), so what a memo or a suffix runs is never a stale
+    /// clone (Ruling F30). By `split_by`, the configured
+    /// `effects.memo.split`, or `Off` for a rule with `memo = false`
+    /// (amended 2026-10-08, configurable).
+    /// `state::tests::real_client::a_backdrop_blur_binds_as_t2_with_its_memo_split`,
+    /// `state::tests::real_client::the_memo_split_key_reaches_the_bound_chain`,
+    /// `state::tests::real_client::a_rule_with_memo_false_is_never_split`.
+    fn split(&mut self) {
+        self.memo = (self.tier == Tier::Xray)
+            .then(|| solium_effects::stage::split_memo(&self.plan, self.split_by));
+        self.memo_keys = self.memo.as_ref().map_or_else(Vec::new, |memo| {
+            let keys = memo.prefix.as_ref().map(Plan::keys).unwrap_or_default();
+            memo.exports
+                .iter()
+                .filter_map(|export| keys.get(export.step).copied())
+                .collect()
+        });
+    }
+
+    /// The split every run reads: `render::run_xray` the plans of its memos
+    /// (the prefix up to each export), `render::run_slots` its suffix.
+    /// Nothing else holds a copy.
+    /// `state::tests::real_client::a_backdrop_blur_binds_as_t2_with_its_memo_split`.
+    pub(crate) fn memo(&self) -> Option<&solium_effects::stage::Memo> {
+        self.memo.as_ref()
+    }
+
+    /// One key per export, in `memo().exports`' order.
+    /// `state::tests::real_client::a_backdrop_blur_binds_as_t2_with_its_memo_split`.
+    pub(crate) fn memo_keys(&self) -> &[u64] {
+        &self.memo_keys
+    }
+
+    /// Move the memo keys as a prefix uniform animated every pass would
+    /// (Task 59's `write_uniform` re-splits), for a test that needs them to
+    /// move with no folder that animates.
+    /// `state::tests::real_client::two_parts_under_a_one_memo_budget_do_not_trade_it_as_their_keys_move`.
+    #[cfg(test)]
+    pub(crate) fn set_memo_keys_for_test(&mut self, keys: Vec<u64>) {
+        self.memo_keys = keys;
+    }
+
+    /// A T2 chain of `plan` with `params_hash`, split as the default
+    /// configuration splits it, for a test that needs no folder.
+    #[cfg(test)]
+    pub(crate) fn t2_for_test(plan: Plan, params_hash: u64) -> Self {
+        let mut chain = Self {
+            plan,
+            reach: 0.0,
+            bleed: 0.0,
+            tier: Tier::Xray,
+            params_hash,
+            split_by: Split::Resize,
+            cut: CutChoice::Below,
+            memo: None,
+            memo_keys: Vec::new(),
+        };
+        chain.split();
+        chain
+    }
+}
+
+/// Every rule's bound chain, by its key.
+/// `state::tests::a_replaced_rule_set_holds_only_its_own_programs`.
+#[derive(Debug, Default)]
+pub(crate) struct Chains {
+    by_key: HashMap<RuleKey, BoundChain>,
+    /// The rules whose chain failed on the GPU, each said once.
+    /// `tests::a_failed_chain_is_said_once_per_rule`.
+    refused: HashSet<RuleKey>,
+}
+
+impl Chains {
+    /// Bind every link, chain them, and check the tier. GPU-free. A link's
+    /// failure is its effect's own problem, file and line kept, so the
+    /// overlay names the `.frag`'s line and not the configuration
+    /// (`state::tests::a_rule_whose_effect_is_broken_is_named_at_the_frags_line_until_mended`);
+    /// a tier this build cannot run is refused by name
+    /// (`state::tests::a_blur_rule_without_source_binds_and_live_is_refused`).
+    /// A T2 chain ends split for its memo ([`BoundChain::split`]).
+    pub(crate) fn bind(host: &mut Host, rule: &Rule) -> Result<BoundChain, Problem> {
+        let plain =
+            |message: String| Problem::error("rules", Path::new("effects.rules"), None, message);
+        let Fill::Chain(links) = &rule.fill else {
+            return Err(plain("an empty slot has no chain".to_owned()));
+        };
+        let mut plans = Vec::with_capacity(links.len());
+        let (mut reach, mut bleed) = (0.0_f64, 0.0_f64);
+        let mut hashed: Vec<u8> = Vec::new();
+        for (index, link) in links.iter().enumerate() {
+            let bound = host.bind(&link.effect, &link.params)?;
+            // A link's own `reach` and `bleed` win over its file's (Ruling 5):
+            // `rules::tests::a_links_reach_and_bleed_override_the_files`,
+            // `tests::a_chain_reaches_as_its_first_link_and_bleeds_as_all_of_them`.
+            if index == 0 {
+                reach = link.extents.reach.unwrap_or(bound.reach);
+            }
+            bleed += link.extents.bleed.unwrap_or(bound.bleed);
+            hashed.extend(format!("{}{:?}", link.effect, bound.params).bytes());
+            // The configured plan: the ladder that steps along the fallback
+            // rungs is X2.7's, so FX2 runs a chain's configured plans only.
+            plans.push(
+                bound.plans.into_iter().next().ok_or_else(|| {
+                    plain(format!("`{}` has no plan this GPU can run", link.effect))
+                })?,
+            );
+        }
+        let plan = solium_effects::stage::chain(plans);
+        let tier = tier(plan.reads, rule.source);
+        // A region's own pixels are a crop of the layer that draws it, which
+        // waits for P15's published regions.
+        // `tests::a_region_self_rule_is_refused_until_p15`.
+        if matches!(rule.part, Part::Region(_)) && tier == Tier::Own {
+            return Err(plain(
+                "a region's own pixels arrive with P15's Solium.region".to_owned(),
+            ));
+        }
+        runnable(tier).map_err(|why| {
+            plain(format!(
+                "`{}` {why}",
+                links.first().map_or("", |link| link.effect.as_str())
+            ))
+        })?;
+        let mut chain = BoundChain {
+            plan,
+            reach,
+            bleed,
+            tier,
+            params_hash: solium_effects::glsl::content_hash(&[&hashed]),
+            split_by: if rule.memo {
+                host.memo_split()
+            } else {
+                Split::Off
+            },
+            cut: rule.cut,
+            memo: None,
+            memo_keys: Vec::new(),
+        };
+        chain.split();
+        Ok(chain)
+    }
+
+    pub(crate) fn insert(&mut self, key: RuleKey, chain: BoundChain) {
+        self.by_key.insert(key, chain);
+    }
+
+    /// Drop one rule's chain: a style's rule that no longer binds leaves its
+    /// slot empty. `state::tests::the_formats_probe_rebinds_the_styles_rules_too`.
+    pub(crate) fn remove(&mut self, key: RuleKey) {
+        self.by_key.remove(&key);
+        self.refused.remove(&key);
+    }
+
+    /// Say `why` a rule's chain is not drawn, once per rule, as
+    /// `pass::Programs::refuse` latches: a chain that failed on the GPU is
+    /// latched failed in its slot's `Held`, and would otherwise be said at
+    /// the refresh rate. Whether it was said now.
+    /// `tests::a_failed_chain_is_said_once_per_rule`.
+    pub(crate) fn refuse_once(&mut self, key: RuleKey, why: &str) -> bool {
+        if !self.refused.insert(key) {
+            return false;
+        }
+        tracing::warn!(?key, "{why}");
+        true
+    }
+
+    /// A slot's chain: a resolved key with none bound wants no slot
+    /// (Ruling 15). `state::tests::real_client::a_rule_whose_chain_is_not_bound_wants_no_slot`.
+    pub(crate) fn get(&self, key: RuleKey) -> Option<&BoundChain> {
+        self.by_key.get(&key)
+    }
+
+    /// One rule's chain, for a test to change.
+    /// `state::tests::real_client::two_parts_under_a_one_memo_budget_do_not_trade_it_as_their_keys_move`.
+    #[cfg(test)]
+    pub(crate) fn get_mut_for_test(&mut self, key: RuleKey) -> Option<&mut BoundChain> {
+        self.by_key.get_mut(&key)
+    }
+
+    /// Drop an origin's chains of an older generation (a set replaced whole).
+    /// `state::tests::a_replaced_rule_set_holds_only_its_own_programs`.
+    pub(crate) fn retain_generation(&mut self, origin: Origin, generation: u32) {
+        self.by_key
+            .retain(|key, _| key.origin != origin || key.generation == generation);
+        self.refused
+            .retain(|key| key.origin != origin || key.generation == generation);
+    }
+
+    /// The program of every step every chain runs, its states' included: what
+    /// the host holds for the rules, so a set replaced gives its programs
+    /// back. `state::tests::a_replaced_rule_set_holds_only_its_own_programs`.
+    pub(crate) fn programs(&self) -> Vec<u64> {
+        let mut keys: Vec<u64> = self
+            .by_key
+            .values()
+            .flat_map(|chain| {
+                chain.plan.steps.iter().chain(
+                    chain
+                        .plan
+                        .states
+                        .iter()
+                        .flat_map(|state| state.steps.iter()),
+                )
+            })
+            .map(|step| step.key)
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys
+    }
+
+    /// The newest bound chain of `origin`'s, for a test to read.
+    #[cfg(test)]
+    pub(crate) fn first_for_test(&self, origin: Origin) -> Option<&BoundChain> {
+        self.by_key
+            .iter()
+            .filter(|(key, _)| key.origin == origin)
+            .max_by_key(|(key, _)| (key.generation, std::cmp::Reverse(key.index)))
+            .map(|(_, chain)| chain)
+    }
+
+    /// Every bound chain of `origin`'s newest generation, by its place in
+    /// its list, for a test to read.
+    #[cfg(test)]
+    pub(crate) fn all_for_test(&self, origin: Origin) -> Vec<(RuleKey, &BoundChain)> {
+        let newest = self
+            .by_key
+            .keys()
+            .filter(|key| key.origin == origin)
+            .map(|key| key.generation)
+            .max();
+        let mut all: Vec<(RuleKey, &BoundChain)> = self
+            .by_key
+            .iter()
+            .filter(|(key, _)| key.origin == origin && Some(key.generation) == newest)
+            .map(|(key, chain)| (*key, chain))
+            .collect();
+        all.sort_by_key(|(key, _)| key.index);
+        all
+    }
+
+    /// The newest bound plan of `origin`'s, for a test to read.
+    #[cfg(test)]
+    pub(crate) fn first_plan_for_test(&self, origin: Origin) -> Option<&Plan> {
+        self.by_key
+            .iter()
+            .filter(|(key, _)| key.origin == origin)
+            .max_by_key(|(key, _)| (key.generation, std::cmp::Reverse(key.index)))
+            .map(|(_, chain)| &chain.plan)
+    }
+}
+
+/// A pane's parts that have slots.
+/// `state::tests::real_client::a_rule_on_focused_follows_the_keyboard`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum PaneSlot {
+    Pane,
+    Client,
+    Titlebar,
+    /// The style's layer at this index (`LayerSpec.index`).
+    /// `decoration::tests::every_layer_is_named_with_its_place_among_the_styles_layers`.
+    Layer(usize),
+    Popups,
+}
+
+/// Who a slot belongs to.
+/// `state::tests::real_client::a_surface_has_a_slot_per_monitor_and_a_layer_surface_one_of_its_own`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Owner {
+    Pane(PaneId, PaneSlot),
+    /// A scripted surface's instance on the output of this name.
+    Surface(crate::scripted::SurfaceId, String),
+    LayerShell(smithay::reexports::wayland_server::backend::ObjectId),
+}
+
+/// A slot's result, ready to place: the element, and the padded box it covers
+/// in the part's own physical pixels. Filled by `render::run_slots`; with no
+/// GPU a test marks a slot ready with none
+/// (`tests::a_slot_is_wanted_by_its_owner_and_slot_and_ready_apart`).
+#[derive(Clone, Debug)]
+pub(crate) struct Ready {
+    pub(crate) element: EffectElement,
+    pub(crate) padded: Rectangle<i32, Physical>,
+    pub(crate) reach: i32,
+}
+
+/// A slot's padded box in its part's own physical pixels: the box at
+/// `(0, 0)`, the part inside it in `uv` (x, y, w, h), the part's mask radii
+/// (top-left, top-right, bottom-left, bottom-right) and the reach that padded
+/// it. What a run reads, whether or not a capture was drawn this pass
+/// (Ruling 16). `tests::a_part_box_is_its_part_padded_by_its_reach_on_every_side`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PartBox {
+    pub(crate) padded: Rectangle<i32, Physical>,
+    pub(crate) content: [f32; 4],
+    pub(crate) radii: [f32; 4],
+    pub(crate) reach: i32,
+}
+
+impl PartBox {
+    /// A part of `own` pixels padded by `pad` on every side.
+    /// `tests::a_part_box_is_its_part_padded_by_its_reach_on_every_side`.
+    pub(crate) fn around(own: Size<i32, Physical>, pad: i32, radii: [f32; 4]) -> Self {
+        let padded: Size<i32, Physical> = (own.w + 2 * pad, own.h + 2 * pad).into();
+        Self {
+            padded: Rectangle::from_size(padded),
+            content: [
+                uv(pad, padded.w),
+                uv(pad, padded.h),
+                uv(own.w, padded.w),
+                uv(own.h, padded.h),
+            ],
+            radii,
+            reach: pad,
+        }
+    }
+
+    /// The padded box's size, as a run takes it.
+    /// `tests::a_part_box_is_its_part_padded_by_its_reach_on_every_side`.
+    pub(crate) fn size(&self) -> (u32, u32) {
+        (
+            u32::try_from(self.padded.size.w).unwrap_or(0),
+            u32::try_from(self.padded.size.h).unwrap_or(0),
+        )
+    }
+}
+
+/// `part` pixels of `whole`, in `uv`.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a fraction of a texture side, given to GL as a float"
+)]
+fn uv(part: i32, whole: i32) -> f32 {
+    (f64::from(part) / f64::from(whole.max(1))) as f32
+}
+
+/// Where a T2 slot's padded box lies on one monitor (Ruling F30): the
+/// monitor and the cut it reads, the box in that monitor's xray pixels
+/// (`padded`, where its crop of a memo lies), in its own physical pixels
+/// (`screen`, what `memo::T2Key` keys on, so a drag finer than an xray
+/// pixel still re-runs the suffix, Ruling F37), as a `BoxMap` into the
+/// monitor-sized textures, and its own size at the monitor's scale, which
+/// the suffix runs at whatever the xray's resolution (`own`); and what the
+/// run reads there (`part`): the slot's own box at rest, else the drawn
+/// part's own pixels on that monitor, padded as the slot is (Ruling F37,
+/// amended 2026-10-14, live under motion and warps).
+/// `tests::a_parts_place_in_a_monitors_xray_is_its_box_in_xray_pixels`,
+/// `tests::a_parts_box_on_a_monitor_is_in_its_physical_pixels`,
+/// `state::tests::real_client::a_gliding_windows_t2_place_follows_its_drawn_rectangle`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct T2Place {
+    pub(crate) monitor: String,
+    pub(crate) cut: Cut,
+    pub(crate) padded: Rectangle<i32, Physical>,
+    pub(crate) screen: Rectangle<i32, Physical>,
+    pub(crate) map: BoxMap,
+    pub(crate) own: Size<i32, Physical>,
+    pub(crate) part: PartBox,
+}
+
+/// Where a T2 slot's padded box lies in one monitor's xray: in its pixels,
+/// as a `BoxMap` into the monitor-sized texture, and its own size at the
+/// monitor's `scale`, which the suffix runs at whatever the xray's size.
+/// `padded` and `monitor` are global logical; `xray` already carries the
+/// monitor's scale and `effects.xray.scale` (and Task 68's half rung), so
+/// the box and the crop follow the xray and `own` does not: a half-size
+/// xray halves the backdrop and never the refraction, the alpha cut or a
+/// shape's edge.
+/// `tests::a_parts_place_in_a_monitors_xray_is_its_box_in_xray_pixels`,
+/// `tests::a_rotated_monitors_place_is_its_whole_xray`.
+pub(crate) fn place_on(
+    padded: Rectangle<f64, Logical>,
+    monitor: Rectangle<i32, Logical>,
+    scale: f64,
+    xray: Size<i32, Physical>,
+) -> (Rectangle<i32, Physical>, BoxMap, Size<i32, Physical>) {
+    let local = Rectangle::<f64, Logical>::new(padded.loc - monitor.loc.to_f64(), padded.size);
+    let mw = f64::from(monitor.size.w.max(1));
+    let mh = f64::from(monitor.size.h.max(1));
+    let px = Rectangle::<f64, Physical>::new(
+        (
+            local.loc.x / mw * f64::from(xray.w),
+            local.loc.y / mh * f64::from(xray.h),
+        )
+            .into(),
+        (
+            local.size.w / mw * f64::from(xray.w),
+            local.size.h / mh * f64::from(xray.h),
+        )
+            .into(),
+    )
+    .to_i32_round();
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a fraction of a monitor, given to GL as a float"
+    )]
+    let map = BoxMap {
+        offset: [(local.loc.x / mw) as f32, (local.loc.y / mh) as f32],
+        scale: [(local.size.w / mw) as f32, (local.size.h / mh) as f32],
+    };
+    let own = padded.size.to_physical_precise_round(scale);
+    (px, map, own)
+}
+
+/// A padded box (global logical) in a monitor's own physical pixels, from
+/// the monitor's corner: what a T2 run's key holds, whatever the xray's
+/// resolution. `tests::a_parts_box_on_a_monitor_is_in_its_physical_pixels`.
+pub(crate) fn screen_box(
+    padded: Rectangle<f64, Logical>,
+    monitor: Rectangle<i32, Logical>,
+    scale: f64,
+) -> Rectangle<i32, Physical> {
+    Rectangle::<f64, Logical>::new(padded.loc - monitor.loc.to_f64(), padded.size)
+        .to_physical(scale)
+        .to_i32_round()
+}
+
+/// What effects this pass draws where: what the rules want, and what is
+/// ready. Built once a pass by `render::build_slots`, so every output and
+/// every screencopy places from the same answer.
+/// `tests::a_slot_is_wanted_by_its_owner_and_slot_and_ready_apart`.
+#[derive(Debug, Default)]
+pub(crate) struct Slots {
+    wants: HashMap<(Owner, Slot), RuleKey>,
+    boxes: HashMap<(Owner, Slot), PartBox>,
+    ready: HashMap<(Owner, Slot), Option<Ready>>,
+    /// A T2 slot's places, one per monitor its padded box overlaps
+    /// (`render::record_boxes`).
+    places: HashMap<(Owner, Slot), Vec<T2Place>>,
+    /// A T2 slot's result on one monitor, by the monitor's name.
+    on: HashMap<(Owner, Slot, String), Option<Ready>>,
+    /// The T2 places whose memos were not held this pass, over
+    /// `effects.memo.budget_mib` (`render::want_t2`).
+    unshared: HashSet<(Owner, Slot, String)>,
+    /// Every memo a place reads this pass, each once, in order: what the
+    /// `xray` phase runs when its xray was redrawn (`render::want_t2`).
+    memos: Vec<MemoKey>,
+    /// The T2 slots drawn beneath their pane's warp this pass, out of its
+    /// capture (`render::record_boxes`, Ruling F37).
+    beneath: HashSet<(Owner, Slot)>,
+    /// A beneath slot's texture on each monitor, as its run left it
+    /// (`render::run_t2`), for the warp's `Under`s.
+    screened: HashMap<(Owner, Slot, String), crate::effect::beneath::Screened>,
+    reach: HashMap<PaneId, i32>,
+    facts: u32,
+    /// A slot fading in or out with its rule, at the opacity its fade has
+    /// reached this pass; every other slot is whole (`effect::fade`).
+    opacity: HashMap<(Owner, Slot), f32>,
+}
+
+impl Slots {
+    /// Nothing wanted.
+    /// `state::tests::real_client::with_no_rules_no_slot_is_wanted_and_no_fact_is_gathered`.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.wants.is_empty()
+    }
+
+    /// `tests::a_slot_is_wanted_by_its_owner_and_slot_and_ready_apart`.
+    pub(crate) fn want(&mut self, owner: Owner, slot: Slot, key: RuleKey) {
+        self.wants.insert((owner, slot), key);
+    }
+
+    /// A wanted slot fading in or out with its rule: its result is drawn at
+    /// `opacity` this pass, over whatever its part is drawn at.
+    /// `state::tests::real_client::a_rule_with_a_fade_eases_its_slot_in_and_out_with_the_focus`.
+    pub(crate) fn set_opacity(&mut self, owner: Owner, slot: Slot, opacity: f32) {
+        self.opacity.insert((owner, slot), opacity);
+    }
+
+    /// How opaque a slot's result is drawn this pass: 1 but while its rule's
+    /// fade moves it (`effect::fade`).
+    /// `state::tests::real_client::a_rule_with_a_fade_eases_its_slot_in_and_out_with_the_focus`.
+    pub(crate) fn opacity(&self, owner: &Owner, slot: Slot) -> f32 {
+        if self.opacity.is_empty() {
+            return 1.0;
+        }
+        self.opacity
+            .get(&(owner.clone(), slot))
+            .copied()
+            .unwrap_or(1.0)
+    }
+
+    /// `tests::a_slot_is_wanted_by_its_owner_and_slot_and_ready_apart`.
+    pub(crate) fn wants(&self) -> impl Iterator<Item = (&Owner, Slot, RuleKey)> {
+        self.wants
+            .iter()
+            .map(|((owner, slot), key)| (owner, *slot, *key))
+    }
+
+    /// A wanted slot's padded box (`render::record_boxes`).
+    /// `state::tests::real_client::every_wanted_slot_has_its_part_box_padded_by_its_reach`.
+    pub(crate) fn set_box(&mut self, owner: Owner, slot: Slot, part: PartBox) {
+        self.boxes.insert((owner, slot), part);
+    }
+
+    /// `state::tests::real_client::every_wanted_slot_has_its_part_box_padded_by_its_reach`.
+    pub(crate) fn boxed(&self, owner: &Owner, slot: Slot) -> Option<PartBox> {
+        self.boxes.get(&(owner.clone(), slot)).copied()
+    }
+
+    /// `tests::a_slot_is_wanted_by_its_owner_and_slot_and_ready_apart`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by tests: the walk asks `is_ready`")
+    )]
+    pub(crate) fn wanted(&self, owner: &Owner, slot: Slot) -> bool {
+        self.wants.contains_key(&(owner.clone(), slot))
+    }
+
+    /// The rule a wanted slot resolved to, whose mask and chain say how its
+    /// result is cut (`render::cut_by_shape`).
+    /// `tests::a_slot_is_wanted_by_its_owner_and_slot_and_ready_apart`.
+    pub(crate) fn key(&self, owner: &Owner, slot: Slot) -> Option<RuleKey> {
+        self.wants.get(&(owner.clone(), slot)).copied()
+    }
+
+    /// A slot's result, its pane reaching as far as it does
+    /// (`tests::a_pane_reaches_as_far_as_its_furthest_ready_slot`).
+    pub(crate) fn set_ready(&mut self, owner: Owner, slot: Slot, ready: Ready) {
+        self.reached(&owner, ready.reach);
+        self.ready.insert((owner, slot), Some(ready));
+    }
+
+    /// A pane reaches as far as the furthest of its slots' results; a
+    /// surface's reach no pane.
+    /// `tests::a_pane_reaches_as_far_as_its_furthest_ready_slot`.
+    fn reached(&mut self, owner: &Owner, reach: i32) {
+        if let Owner::Pane(pane, _) = owner {
+            let furthest = self.reach.entry(*pane).or_insert(0);
+            *furthest = (*furthest).max(reach);
+        }
+    }
+
+    /// `tests::a_slot_is_wanted_by_its_owner_and_slot_and_ready_apart`.
+    pub(crate) fn at(&self, owner: &Owner, slot: Slot) -> Option<&Ready> {
+        self.ready
+            .get(&(owner.clone(), slot))
+            .and_then(Option::as_ref)
+    }
+
+    /// Whether the slot has a result to draw on any monitor: what a walk
+    /// with no monitor asks (a warped pane's capture).
+    /// `tests::a_slot_is_wanted_by_its_owner_and_slot_and_ready_apart`,
+    /// `tests::a_monitors_own_result_wins_over_the_slots_one`,
+    /// `render::tests::a_wanted_slot_with_nothing_ready_draws_what_no_slot_draws`.
+    pub(crate) fn is_ready(&self, owner: &Owner, slot: Slot) -> bool {
+        self.ready.contains_key(&(owner.clone(), slot))
+            || self
+                .on
+                .keys()
+                .any(|(each, at, _)| each == owner && *at == slot)
+    }
+
+    /// A T2 slot's places (`render::record_boxes`).
+    /// `state::tests::real_client::a_window_across_two_monitors_has_a_t2_place_on_each`.
+    pub(crate) fn set_places(&mut self, owner: Owner, slot: Slot, places: Vec<T2Place>) {
+        self.places.insert((owner, slot), places);
+    }
+
+    /// A T2 slot's places, one per monitor its padded box overlaps; none
+    /// for any other slot.
+    /// `state::tests::real_client::a_window_across_two_monitors_has_a_t2_place_on_each`.
+    pub(crate) fn places(&self, owner: &Owner, slot: Slot) -> &[T2Place] {
+        self.places
+            .get(&(owner.clone(), slot))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// A T2 slot's result on one monitor (Ruling F30).
+    /// `tests::a_monitors_own_result_wins_over_the_slots_one`.
+    pub(crate) fn set_ready_on(&mut self, owner: Owner, slot: Slot, monitor: &str, ready: Ready) {
+        self.reached(&owner, ready.reach);
+        self.on
+            .insert((owner, slot, monitor.to_owned()), Some(ready));
+    }
+
+    /// The slot's result on `monitor`: its own there, else the one result
+    /// a slot of another tier has. What the walk places on that monitor.
+    /// `tests::a_monitors_own_result_wins_over_the_slots_one`.
+    pub(crate) fn at_on(&self, owner: &Owner, slot: Slot, monitor: &str) -> Option<&Ready> {
+        match self.on.get(&(owner.clone(), slot, monitor.to_owned())) {
+            Some(ready) => ready.as_ref(),
+            None => self.at(owner, slot),
+        }
+    }
+
+    /// Whether the slot has a result to draw on `monitor`: its own there,
+    /// else the slot's one result. What the walk on that monitor asks, so
+    /// a T2 slot ready on one monitor only brackets nothing on another.
+    /// `tests::a_monitors_own_result_wins_over_the_slots_one`.
+    pub(crate) fn is_ready_on(&self, owner: &Owner, slot: Slot, monitor: &str) -> bool {
+        self.on
+            .contains_key(&(owner.clone(), slot, monitor.to_owned()))
+            || self.ready.contains_key(&(owner.clone(), slot))
+    }
+
+    /// A T2 place whose memos were not held this pass: it runs its whole
+    /// plan per part (`effects.memo.budget_mib`).
+    /// `state::tests::real_client::over_the_memo_budget_a_slot_runs_its_whole_plan`.
+    pub(crate) fn set_unshared(&mut self, owner: Owner, slot: Slot, monitor: &str) {
+        self.unshared.insert((owner, slot, monitor.to_owned()));
+    }
+
+    /// Whether a T2 place reads its memos this pass.
+    /// `state::tests::real_client::over_the_memo_budget_a_slot_runs_its_whole_plan`.
+    pub(crate) fn shared_on(&self, owner: &Owner, slot: Slot, monitor: &str) -> bool {
+        !self
+            .unshared
+            .contains(&(owner.clone(), slot, monitor.to_owned()))
+    }
+
+    /// Every memo the places read this pass (`render::want_t2`).
+    /// `state::tests::real_client::two_windows_with_one_blur_want_one_memo`.
+    pub(crate) fn set_memos(&mut self, memos: Vec<MemoKey>) {
+        self.memos = memos;
+    }
+
+    /// `state::tests::real_client::two_windows_with_one_blur_want_one_memo`.
+    pub(crate) fn memos(&self) -> &[MemoKey] {
+        &self.memos
+    }
+
+    /// A T2 slot drawn beneath its pane's warp this pass
+    /// (`render::record_boxes`).
+    /// `state::tests::real_client::a_warped_panes_behind_slot_is_drawn_beneath_its_warp`.
+    pub(crate) fn set_beneath(&mut self, owner: Owner, slot: Slot) {
+        self.beneath.insert((owner, slot));
+    }
+
+    /// `state::tests::real_client::a_warped_panes_behind_slot_is_drawn_beneath_its_warp`.
+    pub(crate) fn is_beneath(&self, owner: &Owner, slot: Slot) -> bool {
+        self.beneath.contains(&(owner.clone(), slot))
+    }
+
+    /// A beneath slot's texture on `monitor` this pass (`render::run_t2`).
+    /// `render::tests::a_beneath_slot_is_a_hole_only_inside_a_capture`.
+    pub(crate) fn set_screened(
+        &mut self,
+        owner: Owner,
+        slot: Slot,
+        monitor: &str,
+        screened: crate::effect::beneath::Screened,
+    ) {
+        self.screened
+            .insert((owner, slot, monitor.to_owned()), screened);
+    }
+
+    /// A beneath slot's texture on `monitor`, if its run left one.
+    pub(crate) fn screened(
+        &self,
+        owner: &Owner,
+        slot: Slot,
+        monitor: &str,
+    ) -> Option<&crate::effect::beneath::Screened> {
+        self.screened
+            .get(&(owner.clone(), slot, monitor.to_owned()))
+    }
+
+    /// Whether every place of the slot has its texture this pass: what the
+    /// one capture of a warped pane may hole the part for, since a monitor
+    /// with nothing beneath would show the screen below through the hole
+    /// (`render::slot_draw`).
+    /// `render::tests::a_beneath_slot_is_a_hole_only_inside_a_capture`.
+    pub(crate) fn screened_all(&self, owner: &Owner, slot: Slot) -> bool {
+        let places = self.places(owner, slot);
+        !places.is_empty()
+            && places
+                .iter()
+                .all(|place| self.screened(owner, slot, &place.monitor).is_some())
+    }
+
+    /// A slot made ready with no texture, so the walk's order is testable
+    /// with no GPU (Tasks 19 and 25).
+    /// `tests::a_slot_is_wanted_by_its_owner_and_slot_and_ready_apart`.
+    #[cfg(test)]
+    pub(crate) fn mark_ready(&mut self, owner: Owner, slot: Slot) {
+        self.ready.insert((owner, slot), None);
+    }
+
+    /// [`Self::mark_ready`] on one monitor.
+    /// `tests::a_monitors_own_result_wins_over_the_slots_one`.
+    #[cfg(test)]
+    pub(crate) fn mark_ready_on(&mut self, owner: Owner, slot: Slot, monitor: &str) {
+        self.on.insert((owner, slot, monitor.to_owned()), None);
+    }
+
+    /// How many slots have a result to draw, of every owner, a T2 slot's
+    /// once per monitor.
+    /// `state::tests::real_client::every_failure_leaves_the_part_drawn`.
+    #[cfg(test)]
+    pub(crate) fn ready_count(&self) -> usize {
+        self.ready.len() + self.on.len()
+    }
+
+    /// `tests::a_pane_reaches_as_far_as_its_furthest_ready_slot`,
+    /// `render::tests::the_bleed_cull_counts_an_effects_reach`.
+    pub(crate) fn reach(&self, pane: PaneId) -> i32 {
+        self.reach.get(&pane).copied().unwrap_or(0)
+    }
+
+    /// One owner's facts gathered and its rules resolved.
+    /// `state::tests::real_client::with_no_rules_no_slot_is_wanted_and_no_fact_is_gathered`.
+    pub(crate) fn gathered(&mut self) {
+        self.facts += 1;
+    }
+
+    /// How many owners' facts this pass gathered: 0 with no rules (spec §8.4).
+    /// `state::tests::real_client::with_no_rules_no_slot_is_wanted_and_no_fact_is_gathered`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the §8.4 guard's tests only")
+    )]
+    pub(crate) fn facts_gathered(&self) -> u32 {
+        self.facts
+    }
+}
+
+/// A rule's problem as the overlay lists it: under `"rules"`, numbered as
+/// Lua counts, at its effect's own file and line when it has one and at the
+/// configuration otherwise.
+/// `state::tests::a_rule_whose_effect_is_broken_is_named_at_the_frags_line_until_mended`,
+/// `check::tests::a_rule_reading_the_live_backdrop_fails_the_check`.
+pub(crate) fn rule_problem(number: usize, problem: Problem, config: &Path) -> Problem {
+    Problem {
+        effect: "rules".to_owned(),
+        message: format!("effects.rules, rule {number}: {}", problem.message),
+        file: if problem.line.is_some() {
+            problem.file
+        } else {
+            config.to_path_buf()
+        },
+        ..problem
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Chains;
+    use crate::effect::host::tests::{folder, scratch};
+
+    /// Rules from Lua source, read the way `sol.effects` reads them.
+    fn rules(lua: &str) -> Vec<crate::effect::rules::Rule> {
+        let state = mlua::Lua::new();
+        let value: mlua::Value = state.load(lua).eval().expect("the test's Lua");
+        let tree = crate::effect::tree::Tree::from_lua(&value)
+            .expect("readable")
+            .expect("a value");
+        crate::effect::rules::parse(&tree).expect("parses")
+    }
+
+    /// **A chain reaches as far as its first link and bleeds as far as all
+    /// of them**, each link's own `reach` and `bleed` winning over its
+    /// file's (Ruling 5); its tier is what the chained plan reads, and its
+    /// params hash changes with its params.
+    #[test]
+    fn a_chain_reaches_as_its_first_link_and_bleeds_as_all_of_them() {
+        let place = scratch("plan-extents");
+        folder(
+            &place,
+            "wide",
+            "return { api = 1, inputs = { 'self' }, params = { amount = { 1 } }, reach = 6, bleed = 2, frag = 'effect.frag' }",
+            &[(
+                "effect.frag",
+                "vec4 sol_effect(vec2 uv) { return sol_tex(uv) * p_amount; }\n",
+            )],
+        );
+        folder(
+            &place,
+            "ring",
+            "return { api = 1, inputs = { 'shape' }, bleed = 5, frag = 'effect.frag' }",
+            &[(
+                "effect.frag",
+                "vec4 sol_effect(vec2 uv) { return vec4(sol_shape(uv)); }\n",
+            )],
+        );
+        let mut host = crate::effect::host::Host::new(crate::effect::host::Library::with(
+            Some(place.clone()),
+            place.join("none"),
+        ));
+        host.want("rules", ["wide".to_owned(), "ring".to_owned()]);
+        let bound = |host: &mut crate::effect::host::Host, lua: &str| {
+            Chains::bind(host, &rules(lua)[0]).expect("binds")
+        };
+        let chain = bound(
+            &mut host,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = { { "wide" }, { "ring", bleed = 1 } } } }"#,
+        );
+        assert_eq!((chain.reach, chain.bleed), (6.0, 3.0));
+        assert_eq!(chain.tier, crate::effect::rules::Tier::Own);
+        let chain = bound(
+            &mut host,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = { "ring", reach = 4 } } }"#,
+        );
+        assert_eq!((chain.reach, chain.bleed), (4.0, 5.0));
+        assert_eq!(chain.tier, crate::effect::rules::Tier::Generated);
+        // And a chain's params are its key's: a chain whose params changed
+        // runs again (`store::tests::a_param_or_size_change_reruns_the_chain`).
+        let hash = |host: &mut crate::effect::host::Host, amount: &str| {
+            bound(
+                host,
+                &format!(
+                    r#"{{ {{ match = "*", part = "client", slot = "behind", effect = {{ "wide", amount = {amount} }} }} }}"#
+                ),
+            )
+            .params_hash
+        };
+        assert_eq!(hash(&mut host, "2"), hash(&mut host, "2"));
+        assert_ne!(hash(&mut host, "2"), hash(&mut host, "3"));
+        let _ = std::fs::remove_dir_all(place);
+    }
+
+    /// **A failed chain is said once per rule**: again for the same rule is
+    /// silent, another rule is said, and a rule set replaced (a reload) says
+    /// its own failures afresh.
+    #[test]
+    fn a_failed_chain_is_said_once_per_rule() {
+        use crate::effect::rules::{Origin, RuleKey};
+        let mut chains = Chains::default();
+        let key = |index, generation| RuleKey {
+            origin: Origin::User,
+            index,
+            generation,
+        };
+        assert!(chains.refuse_once(key(0, 1), "failed"));
+        assert!(!chains.refuse_once(key(0, 1), "failed"), "said twice");
+        assert!(chains.refuse_once(key(1, 1), "failed"), "another rule");
+        chains.retain_generation(Origin::User, 2);
+        assert!(chains.refuse_once(key(0, 2), "failed"), "a new rule set");
+        assert_eq!(chains.refused.len(), 1, "the old set's latches stayed");
+    }
+
+    /// **A region's own pixels wait for P15**: a titlebar rule whose chain
+    /// reads `self` is refused at bind, naming it; one reading nothing of the
+    /// frame binds.
+    #[test]
+    fn a_region_self_rule_is_refused_until_p15() {
+        let place = scratch("plan-region-self");
+        folder(
+            &place,
+            "tint",
+            "return { api = 1, inputs = { 'self' }, frag = 'effect.frag' }",
+            &[(
+                "effect.frag",
+                "vec4 sol_effect(vec2 uv) { return sol_tex(uv); }\n",
+            )],
+        );
+        folder(
+            &place,
+            "ring",
+            "return { api = 1, inputs = { 'shape' }, frag = 'effect.frag' }",
+            &[(
+                "effect.frag",
+                "vec4 sol_effect(vec2 uv) { return vec4(sol_shape(uv)); }\n",
+            )],
+        );
+        let mut host = crate::effect::host::Host::new(crate::effect::host::Library::with(
+            Some(place.clone()),
+            place.join("none"),
+        ));
+        host.want("rules", ["tint".to_owned(), "ring".to_owned()]);
+        let refused = Chains::bind(
+            &mut host,
+            &rules(r#"{ { match = "*", part = "region:titlebar", slot = "behind", effect = "tint" } }"#)[0],
+        )
+        .expect_err("a region's self rule bound");
+        assert!(refused.message.contains("P15"), "{}", refused.message);
+        assert!(
+            Chains::bind(
+                &mut host,
+                &rules(r#"{ { match = "*", part = "client", slot = "behind", effect = "tint" } }"#)
+                    [0],
+            )
+            .is_ok(),
+            "a client's self rule was refused"
+        );
+        assert!(
+            Chains::bind(
+                &mut host,
+                &rules(r#"{ { match = "*", part = "region:titlebar", slot = "behind", effect = "ring" } }"#)[0],
+            )
+            .is_ok(),
+            "a titlebar rule reading nothing of the frame was refused"
+        );
+        let _ = std::fs::remove_dir_all(place);
+    }
+
+    /// **A part's box is the part padded by its reach on every side**, the
+    /// part inside it in `uv`.
+    #[test]
+    fn a_part_box_is_its_part_padded_by_its_reach_on_every_side() {
+        let part = super::PartBox::around((100, 50).into(), 6, [4.0; 4]);
+        assert_eq!(
+            part.padded,
+            smithay::utils::Rectangle::from_size((112, 62).into())
+        );
+        assert_eq!(part.size(), (112, 62));
+        assert_eq!(
+            part.content,
+            [6.0 / 112.0, 6.0 / 62.0, 100.0 / 112.0, 50.0 / 62.0]
+        );
+        assert_eq!((part.radii, part.reach), ([4.0; 4], 6));
+        let bare = super::PartBox::around((100, 50).into(), 0, [0.0; 4]);
+        assert_eq!(bare.content, [0.0, 0.0, 1.0, 1.0]);
+    }
+
+    /// **A slot is wanted by its owner and slot alone, and ready apart from
+    /// being wanted**: what the walk asks of a pass's plan (Tasks 19, 25).
+    #[test]
+    fn a_slot_is_wanted_by_its_owner_and_slot_and_ready_apart() {
+        use super::{Owner, PaneSlot, Slots};
+        use crate::effect::rules::{Origin, RuleKey, Slot};
+        let client = Owner::Pane(crate::pane::PaneId::from_raw(7), PaneSlot::Client);
+        let key = RuleKey {
+            origin: Origin::User,
+            index: 0,
+            generation: 1,
+        };
+        let mut slots = Slots::default();
+        assert!(slots.is_empty());
+        slots.want(client.clone(), Slot::Behind, key);
+        assert!(!slots.is_empty());
+        assert!(slots.wanted(&client, Slot::Behind));
+        assert!(!slots.wanted(&client, Slot::Front));
+        assert_eq!(slots.key(&client, Slot::Behind), Some(key));
+        assert_eq!(slots.key(&client, Slot::Front), None);
+        assert!(!slots.wanted(
+            &Owner::Pane(crate::pane::PaneId::from_raw(7), PaneSlot::Pane),
+            Slot::Behind
+        ));
+        assert_eq!(
+            slots.wants().collect::<Vec<_>>(),
+            [(&client, Slot::Behind, key)]
+        );
+        assert!(!slots.is_ready(&client, Slot::Behind));
+        slots.mark_ready(client.clone(), Slot::Behind);
+        assert!(slots.is_ready(&client, Slot::Behind));
+        assert!(
+            slots.at(&client, Slot::Behind).is_none(),
+            "a slot marked ready in a test has no result to draw"
+        );
+    }
+
+    /// **A part's place in a monitor's xray**: its padded box in that
+    /// monitor's xray pixels, and where that box lies in the monitor-sized
+    /// texture, at the xray's own scale.
+    #[test]
+    fn a_parts_place_in_a_monitors_xray_is_its_box_in_xray_pixels() {
+        use smithay::utils::Rectangle;
+        let monitor = Rectangle::new((2560, 0).into(), (1920, 1080).into());
+        let padded = Rectangle::new((2660.0, 50.0).into(), (200.0, 100.0).into());
+        let (px, map, own) = super::place_on(padded, monitor, 1.0, (960, 540).into());
+        assert_eq!(px, Rectangle::new((50, 25).into(), (100, 50).into()));
+        assert!(
+            (map.offset[0] - 100.0 / 1920.0).abs() < 1e-6
+                && (map.offset[1] - 50.0 / 1080.0).abs() < 1e-6
+        );
+        assert!(
+            (map.scale[0] - 200.0 / 1920.0).abs() < 1e-6
+                && (map.scale[1] - 100.0 / 1080.0).abs() < 1e-6
+        );
+        assert_eq!(
+            own,
+            (200, 100).into(),
+            "a half-size xray, or the Half rung, keeps the suffix at the part's own size"
+        );
+    }
+
+    /// **A part's box on a monitor is in that monitor's own physical
+    /// pixels**, whatever the xray's size: what a T2 run is keyed on, so a
+    /// drag finer than an xray pixel still moves the key (Ruling F37).
+    #[test]
+    fn a_parts_box_on_a_monitor_is_in_its_physical_pixels() {
+        use smithay::utils::Rectangle;
+        let monitor = Rectangle::new((2560, 0).into(), (1536, 864).into());
+        let padded = Rectangle::new((2660.0, 50.0).into(), (200.0, 100.0).into());
+        assert_eq!(
+            super::screen_box(padded, monitor, 1.25),
+            Rectangle::new((125, 63).into(), (250, 125).into())
+        );
+        let moved = Rectangle::new((2661.0, 50.0).into(), (200.0, 100.0).into());
+        let (half, _, _) = super::place_on(padded, monitor, 1.25, (960, 540).into());
+        let (half_moved, _, _) = super::place_on(moved, monitor, 1.25, (960, 540).into());
+        assert_eq!(
+            half, half_moved,
+            "the premise: one logical pixel is under an xray pixel"
+        );
+        assert_ne!(
+            super::screen_box(padded, monitor, 1.25),
+            super::screen_box(moved, monitor, 1.25)
+        );
+    }
+
+    /// **On a rotated monitor at a fractional scale the whole monitor is the
+    /// whole xray**: `place_on` and `offscreen::xray_size_of` agree with the
+    /// output's geometry, which is already turned.
+    #[test]
+    fn a_rotated_monitors_place_is_its_whole_xray() {
+        use smithay::utils::{Rectangle, Transform};
+        for transform in [Transform::_90, Transform::Flipped270] {
+            let xray = crate::offscreen::xray_size_of((2560, 1440).into(), transform, 1.0);
+            let monitor = Rectangle::new((0, 0).into(), (1152, 2048).into()); // 1440×2560 at 1.25
+            let (px, map, own) = super::place_on(monitor.to_f64(), monitor, 1.25, xray);
+            assert_eq!(
+                px,
+                Rectangle::new((0, 0).into(), (1440, 2560).into()),
+                "{transform:?}"
+            );
+            assert_eq!(map, crate::effect::run::BoxMap::WHOLE);
+            assert_eq!(own, (1440, 2560).into());
+        }
+    }
+
+    /// **A monitor's own result wins, and a slot with none falls back to
+    /// the one result a T1 slot has.**
+    #[test]
+    fn a_monitors_own_result_wins_over_the_slots_one() {
+        use super::{Owner, PaneSlot, Slots};
+        use crate::effect::rules::Slot;
+        let owner = Owner::Pane(crate::pane::PaneId::from_raw(1), PaneSlot::Client);
+        let mut slots = Slots::default();
+        assert!(!slots.is_ready_on(&owner, Slot::Behind, "DP-1"));
+        slots.mark_ready_on(owner.clone(), Slot::Behind, "DP-2");
+        assert!(slots.is_ready_on(&owner, Slot::Behind, "DP-2"));
+        assert!(
+            !slots.is_ready_on(&owner, Slot::Behind, "DP-1"),
+            "a T2 result on one monitor is on another"
+        );
+        assert!(
+            slots.is_ready(&owner, Slot::Behind),
+            "ready on some monitor"
+        );
+        slots.mark_ready(owner.clone(), Slot::Behind);
+        assert!(
+            slots.at_on(&owner, Slot::Behind, "DP-1").is_none(),
+            "a test's ready has no element"
+        );
+        assert!(
+            slots.is_ready_on(&owner, Slot::Behind, "DP-1"),
+            "the slot-wide answer is the fallback"
+        );
+    }
+
+    /// **A pane reaches as far as the furthest of its ready slots**, and a
+    /// surface's slots reach no pane: what the bleed cull grows a pane by
+    /// (Task 19).
+    #[test]
+    fn a_pane_reaches_as_far_as_its_furthest_ready_slot() {
+        use super::{Owner, PaneSlot, Slots};
+        let (pane, other) = (
+            crate::pane::PaneId::from_raw(1),
+            crate::pane::PaneId::from_raw(2),
+        );
+        let mut slots = Slots::default();
+        assert_eq!(slots.reach(pane), 0);
+        slots.reached(&Owner::Pane(pane, PaneSlot::Client), 12);
+        slots.reached(&Owner::Pane(pane, PaneSlot::Titlebar), 4);
+        slots.reached(
+            &Owner::Surface(crate::scripted::SurfaceId::from_raw(1), "DP-1".to_owned()),
+            40,
+        );
+        assert_eq!((slots.reach(pane), slots.reach(other)), (12, 0));
+    }
+}

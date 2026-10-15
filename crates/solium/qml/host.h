@@ -389,6 +389,12 @@ int solium_qml_scene_get_int(const SoliumQmlScene *scene, const char *name);
  * Path-aware, exactly as solium_qml_scene_get_int is and for the same reason. */
 int solium_qml_scene_get_bool(const SoliumQmlScene *scene, const char *name);
 
+/* Read a number property, or `fallback` when the scene declares no property
+ * by that path or it does not read as a number: a layer's `layerOpacity` is 1
+ * where the layer never mentions it. Path-aware, as solium_qml_scene_get_int
+ * is. `decoration::tests::a_layers_opacity_is_its_roots_and_one_when_it_has_none`. */
+double solium_qml_scene_get_real(const SoliumQmlScene *scene, const char *name, double fallback);
+
 /* How many Layer children the style declares.
  *
  * -1 if the root is not a PaneStyle, which is how a bundle with the wrong root

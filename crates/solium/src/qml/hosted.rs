@@ -1098,6 +1098,28 @@ pub(crate) mod tests {
         });
     }
 
+    /// **The overlay lists each row, builds without a warning, and takes no
+    /// press**: it is information, and a click lands on what is under it.
+    #[test]
+    fn the_problems_overlay_lists_each_row_and_takes_no_input() {
+        on_the_qt_thread(|| {
+            crate::qml::start().expect("Qt starts");
+            let path =
+                std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/qml/problems.qml"));
+            let mark = crate::qml::warning_mark();
+            let rows = r#"{"rows":[{"text":"/x/blur/effect.lua:3: unexpected symbol","severity":"error"},{"text":"/x/blur/up.frag:2: sol_soft reads transparent","severity":"warning"}]}"#;
+            let scene = Scene::for_monitor(path, 480, 120, Some(rows), "problems-1")
+                .expect("the overlay builds");
+            assert_eq!(
+                crate::qml::warnings_since(mark),
+                0,
+                "the overlay warned while building"
+            );
+            assert_eq!(scene.hit(20.0, 20.0), Hit::Nothing);
+            drop(scene);
+        });
+    }
+
     /// **The Tweaks panel is opaque and grey** where it has no entry, so what
     /// is behind it -- the wallpaper's colour -- never shows through the
     /// theme's grey. Drawn at 0.94, it did: alpha 239 here, and a violet

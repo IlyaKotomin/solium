@@ -38,6 +38,7 @@ titlebar is.
 | the wallpaper | `qml/wallpaper.qml` | `wallpaper = ...` (see [ricing.md](ricing.md)) |
 | a shell (bar, dock, launcher) | nothing ships | `shell = { scene = ... }` |
 | the keyboard pill, on a surface of its own | `qml/indicator/keyboard.qml` | `keyboard.indicator` in `config.lua` (`lua/keyboard_indicator.lua` declares it through `sol.surface`) |
+| what is broken in an effect or the configuration, on the primary monitor while anything is | `qml/problems.qml` | `require("problems")` in `init.lua` (`lua/problems.lua` declares it through `sol.surface` from `sol.problems()`) |
 | any other scene | `qml/tweaks.qml`, the Developer Tweaks panel (`--debug-mode` only) | `sol.surface(name, { scene = ... })` |
 | the pointer, with no scene and no cursor theme | `qml/cursor.qml` | not replaced; name a scene instead |
 | the pointer's scene | nothing ships | `cursor = { scene = ... }`, or `SOLIUM_QML_CURSOR` for one run |
@@ -120,14 +121,16 @@ and the compositor hands the same four numbers to every layer as `insetTop`,
 `insetRight`, `insetBottom` and `insetLeft`. Reserve nothing and the style
 becomes an overlay: it draws over the client and never moves it.
 
-**`focused`, `pointerInside`, `title` and the sizes are written for you** when
-they change, so reacting to focus or to the cursor is a binding rather than a
-subscription. `pointerInside` is true while the pointer is anywhere over the
-window, *including over the client*, which is how a border can follow a cursor
-that is over a text editor. So are `caret`, where the focused text field's
-caret is when this window has it, and `values`, whatever the configuration
-handed every pane with `sol.pane_values{ ... }`; the `Keyboard` singleton is
-there to read as well. The panes README says what each holds.
+**`focused`, `pointerInside`, `title`, `appId` and the sizes are written for
+you** when they change, so reacting to focus or to the cursor is a binding
+rather than a subscription. `pointerInside` is true while the pointer is
+anywhere over the window, *including over the client*, which is how a border
+can follow a cursor that is over a text editor. `appId` is the window's
+application id, which a bar can show the application's icon by, through
+`image://solium/icon/<appId>?size=16`. So are `caret`, where the focused text
+field's caret is when this window has it, and `values`, whatever the
+configuration handed every pane with `sol.pane_values{ ... }`; the `Keyboard`
+singleton is there to read as well. The panes README says what each holds.
 
 **`action` is how a button asks for something.** Set it to `"close"` or
 `"maximize"`; the compositor takes it and clears it, so a press is acted on
@@ -156,8 +159,8 @@ window instead of pressing, which looks like broken buttons rather than like a
 missing property. `hovered` on its own is not read by anything. Five of the
 shipped styles with buttons, `left`, `bottom`, `pulse`, `reactive` and
 `reveal`, declare `hovered` and not `onButton`, so their buttons may not press
-([#158](https://github.com/Lilium-Linux/solium/issues/158)). `top` is the one
-to copy.
+([#158](https://github.com/Lilium-Linux/solium/issues/158)). `top` and `glass`
+are the ones to copy.
 
 Two more things a style author meets. Presses reach a layer only inside the
 band the insets reserve; hover goes everywhere, presses do not, so a button
@@ -425,7 +428,11 @@ window and a reload button.
 
 The shipped styles, and the demonstrations kept with the tests, are listed
 once, in the [panes README](../crates/solium/qml/panes/README.md#what-is-here).
-`top` is the default.
+`glass` is the default: the window and its bar one rounded piece of dark
+liquid glass, the bar along the bottom
+([glass](../crates/solium/qml/panes/README.md#glass)).
+`pane = "top"` goes back to the opaque titlebar above the window that was the
+default before it.
 
 See also: **[ricing.md](ricing.md)** for the settings,
 **[animation.md](animation.md)** for the engine that moves the windows these

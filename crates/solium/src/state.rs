@@ -762,6 +762,39 @@ pub(crate) struct Solium {
     /// not something a client binds.
     pub(crate) programs: crate::pass::Programs,
 
+    /// The effects the configuration wants: loaded GPU-free at config load,
+    /// compiled at the top of `render::prepare` (Ruling 7).
+    /// `effect::host::tests::an_empty_host_touches_no_gl`.
+    pub(crate) effects: crate::effect::host::Host,
+    /// The engine's own keys, `effects.sandbox`, `limits` and `present`, as
+    /// the last `sol.effects` gave them (Ruling 28): what binding a
+    /// `sol.present` geometry reads; and `xray` and `memo` (Rulings F29,
+    /// F30), what the xray and the memos read.
+    /// `tests::effects_sandbox_reaches_the_host_and_the_styles_reader`,
+    /// `tests::real_client::the_xray_target_is_the_monitor_at_its_scale_times_xray_scale`.
+    pub(crate) effect_settings: crate::effect::settings::Settings,
+    /// The problems' generation the scripts were last told about, so `settle`
+    /// fires `problems` once per change:
+    /// `tests::settle_tells_the_scripts_once_per_change_of_the_problems`.
+    pub(crate) problems_told: u64,
+    /// The rules `sol.effects` gave, taken whole once every one bound
+    /// (`tests::a_broken_rule_keeps_the_rules_that_ran`).
+    pub(crate) rules: crate::effect::rules::Rules,
+    /// Every rule's chain, bound at config load, by its key.
+    pub(crate) chains: crate::effect::plan::Chains,
+    /// The slots on their way in or out, for a rule with a `fade`, kept from
+    /// one pass to the next by `render::build_slots`.
+    /// `effect::fade::tests::a_slot_fades_in_as_its_rule_comes_and_out_as_it_goes`,
+    /// `tests::real_client::a_rule_with_a_fade_eases_its_slot_in_and_out_with_the_focus`.
+    pub(crate) slot_fades: crate::effect::fade::Fades,
+    /// The user's rules' generation: a set taken is a new one, so a key of
+    /// the set it replaced finds nothing.
+    pub(crate) rules_generation: u32,
+    /// The formats probe changed what is known, so the rules are bound again
+    /// after the frame (Ruling 11,
+    /// `tests::the_formats_probe_rebinds_the_rules_after_the_frame`).
+    pub(crate) rebind: bool,
+
     /// GPU time per pass, only while pacing is on: `gputime.rs`. On the state
     /// rather than the backend so a capture can time itself (Ruling 5).
     pub(crate) timer: Option<crate::gputime::Timer>,
@@ -769,6 +802,31 @@ pub(crate) struct Solium {
     /// The renderer's pooled targets: captures now, previews and effect
     /// passes later (spec §6.3 item 4). `pool::tests::a_target_is_made_once_and_its_fbo_with_it`.
     pub(crate) pool: crate::pool::Pool,
+    /// What each effect slot keeps between passes: its part's capture, its
+    /// chain's targets (Ruling 16). Swept once a pass by `render::prepare`.
+    /// `effect::store::tests::a_slot_no_rule_wanted_this_pass_is_dropped`.
+    pub(crate) store: crate::effect::store::Store,
+    /// Every monitor's xray cuts, their captures and generations (Ruling
+    /// F29), held between passes like the store's and kept
+    /// `effects.xray.keep_ms` once nothing reads them.
+    /// `effect::xray::tests::a_cut_nobody_wants_is_kept_for_keep_ms`.
+    pub(crate) xrays: crate::effect::xray::Xrays,
+    /// Every memo: a T2 chain's backdrop-only prefix, run once per monitor,
+    /// cut and prefix result and read by every place whose chain begins the
+    /// same way (Ruling F30). Held outside the pool's free-list budget,
+    /// capped by `effects.memo.budget_mib`, swept with the store.
+    /// `effect::memo::tests::two_slots_with_one_prefix_share_one_memo`.
+    pub(crate) memos: crate::effect::memo::Memos,
+    /// The first desktop frame's gate: held, at most
+    /// `startup.first_frame.max_ms`, until [`Solium::first_frame_ready`]
+    /// (spec C14). `warm::tests::the_first_frame_is_held_until_ready_then_never_again`.
+    pub(crate) warm: crate::warm::Warm,
+    /// The pass's warp plans and its one instant, made at the top of
+    /// `resolve` (`render::plan_warps`, Ruling F31): what a warped pane's
+    /// behind slots are placed on, and what the T2 places and the walk are
+    /// measured at.
+    /// `tests::real_client::a_gliding_windows_t2_place_is_measured_at_the_passs_instant`.
+    pub(crate) presented: crate::render::Presented,
 
     /// Hardware buffer sharing: `zwp_linux_dmabuf_v1`.
     ///
@@ -1011,6 +1069,16 @@ struct Gesture {
     released: Option<Duration>,
 }
 
+/// What `Solium::memory_report` counts that the compositor holds itself.
+/// `tests::real_client::a_held_memo_is_in_the_memory_report`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Memory {
+    pub(crate) windows: usize,
+    pub(crate) lua_kb: usize,
+    /// Every held memo's bytes (`effect::memo::Memos::held_bytes`).
+    pub(crate) memos_kb: u64,
+}
+
 /// An edge drag in progress.
 ///
 /// Carries *positions* rather than deltas, on both of its paths. A layout sets
@@ -1132,6 +1200,34 @@ fn size_window(window: &Window, client: Rectangle<i32, Logical>) {
     }
     if let Err(err) = x11.configure(Some(client)) {
         tracing::warn!(?err, "could not size an X11 window");
+    }
+}
+
+/// What rules match a window against, gathered only for the keys some rule
+/// reads (`effect::rules::Rules::uses`): the costly ones are empty
+/// otherwise. `sol.windows()` carries every one of them.
+/// `tests::real_client::sol_windows_carries_every_window_match_key`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct WindowFacts {
+    pub(crate) app_id: String,
+    pub(crate) title: String,
+    pub(crate) focused: bool,
+    pub(crate) fullscreen: bool,
+    pub(crate) monitor: String,
+    pub(crate) style: String,
+}
+
+/// A pane's `style` as a rule's match reads it: the configured style's name
+/// for a framed pane, the default's when nothing has named one (the style it
+/// is then framed in), and `"none"` for a bare one (fullscreen, drawing its
+/// own decorations, or under `pane = "none"`), so a style's own rules never
+/// reach a fullscreen window and yours can (Ruling 15).
+/// `tests::a_framed_panes_style_is_the_configured_one_or_the_default_and_a_bare_ones_is_none`.
+pub(crate) fn style_fact(framed: bool, configured: Option<&str>) -> &str {
+    if framed {
+        configured.unwrap_or(crate::decoration::DEFAULT_STYLE)
+    } else {
+        "none"
     }
 }
 
@@ -1280,8 +1376,25 @@ impl Solium {
             pressing: false,
             warp_after_press: None,
             programs: crate::pass::Programs::default(),
+            effects: crate::effect::host::Host::new(crate::effect::host::Library::new()),
+            effect_settings: crate::effect::settings::Settings::default(),
+            problems_told: 0,
+            rules: crate::effect::rules::Rules::default(),
+            chains: crate::effect::plan::Chains::default(),
+            slot_fades: crate::effect::fade::Fades::default(),
+            rules_generation: 0,
+            rebind: false,
             timer: None,
             pool: crate::pool::Pool::new(0),
+            store: crate::effect::store::Store::default(),
+            xrays: crate::effect::xray::Xrays::default(),
+            memos: crate::effect::memo::Memos::default(),
+            warm: {
+                let mut warm = crate::warm::Warm::default();
+                warm.inject(crate::dev::warm_inject());
+                warm
+            },
+            presented: crate::render::Presented::default(),
             textures: None,
             focusing: false,
             closing: None,
@@ -1663,7 +1776,24 @@ impl Solium {
         deform: Option<present::Deform>,
     ) -> Option<present::Aimed> {
         let deform = deform.filter(|deform| !deform.effect.is_at_rest())?;
-        let to = match deform.anchor {
+        let to = self.anchor_rect(pane, deform.anchor)?;
+        Some(present::Aimed {
+            effect: deform.effect,
+            to,
+        })
+    }
+
+    /// Where `anchor` is drawn now, for `pane`'s deform: a rect where it is,
+    /// a pane where it is drawn, a surface's instance on the pane's own
+    /// monitor; `None` when it names nothing. What [`Self::aimed_at_for`]
+    /// resolves each frame, and `axis = "auto"` reads once
+    /// (`tests::real_client::auto_is_kept_for_the_whole_flight`).
+    pub(crate) fn anchor_rect(
+        &self,
+        pane: crate::pane::PaneId,
+        anchor: present::Anchor,
+    ) -> Option<Rectangle<f64, Logical>> {
+        Some(match anchor {
             present::Anchor::Rect(rect) => rect,
             present::Anchor::Pane(id) => {
                 let other = self.panes.by_script_id(id)?;
@@ -1684,10 +1814,6 @@ impl Solium {
                 let area = surface.area_on(&output, geometry, primary.as_ref())?;
                 self.carried(id, &output, area).to_f64()
             }
-        };
-        Some(present::Aimed {
-            effect: deform.effect,
-            to,
         })
     }
 
@@ -1745,6 +1871,69 @@ impl Solium {
                 |window| self.window_title(window),
             )
         })
+    }
+
+    /// What a pane's frame is told its application is, as `appId`: its
+    /// client's, as `sol.windows()` gives it (an X11 window's class), the one
+    /// it had for a window that went and is fading, so its bar fades with the
+    /// icon it showed, and none for a window whose application has not
+    /// arrived. `decoration::tests::a_layer_is_told_the_app_id_and_told_again_when_it_changes`,
+    /// `tests::real_client::reflow_on_close::a_window_that_left_keeps_its_app_id_for_its_frame`.
+    pub(crate) fn pane_app_id(&self, id: crate::pane::PaneId) -> String {
+        self.panes.get(id).map_or_else(String::new, |pane| {
+            if let Some(left) = pane.left() {
+                return left.app_id.clone();
+            }
+            pane.client()
+                .map(|window| self.script_app_id(window))
+                .unwrap_or_default()
+        })
+    }
+
+    /// A pane's facts, which rules match a window against: the costly ones
+    /// (`app_id`, `title`, `monitor`) only when some rule reads them
+    /// (`effect::rules::Rules::uses`), left empty otherwise. `focused` is what
+    /// the frame shows ([`Self::looks_focused`]), `fullscreen` the state the
+    /// compositor last told the client, and `style` [`style_fact`]'s, with the
+    /// monitor judged as `sol.windows()` judges it.
+    /// `tests::real_client::a_rule_on_focused_follows_the_keyboard`,
+    /// `tests::real_client::a_rule_on_fullscreen_applies_from_the_configure_that_sets_it`,
+    /// `tests::real_client::a_rule_for_another_app_leaves_a_window_with_an_empty_plan`.
+    pub(crate) fn window_facts(
+        &self,
+        pane: crate::pane::PaneId,
+        keys: crate::effect::rules::Keys,
+    ) -> WindowFacts {
+        let held = self.panes.get(pane);
+        let window = held.and_then(Pane::client);
+        WindowFacts {
+            app_id: if keys.app_id {
+                window
+                    .map(|window| self.script_app_id(window))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            },
+            title: if keys.title {
+                self.pane_title(pane)
+            } else {
+                String::new()
+            },
+            focused: self.looks_focused(pane),
+            fullscreen: window.is_some_and(workspaces::fullscreen),
+            monitor: if keys.monitor {
+                held.and_then(|held| self.output_of(self.pane_outer(held)))
+                    .map(|output| output.name())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            },
+            style: style_fact(
+                held.is_some_and(|held| matches!(held.frame(), crate::pane::Frame::Styled(_))),
+                self.decorations.style(),
+            )
+            .to_owned(),
+        }
     }
 
     /// Whether the compositor draws this window's frame.
@@ -1882,6 +2071,26 @@ impl Solium {
         for pane in self.panes.iter() {
             animating |= present::settle(pane, self.pane_outer(pane), now);
         }
+        // A version `on_reload = "keep"` pinned is held to the end of its
+        // transform, and no longer: a whole Lua state, let go once nothing
+        // the pane draws keeps it
+        // (`tests::real_client::a_pinned_version_is_let_go_when_its_present_lands`).
+        let unpinned: Vec<crate::pane::PaneId> = self
+            .panes
+            .iter()
+            .filter(|pane| pane.meshes().pinned.is_some())
+            .filter(|pane| {
+                !present::geometries(pane, now).iter().any(|geometry| {
+                    geometry.on_reload == crate::effect::settings::PresentReload::Keep
+                })
+            })
+            .map(Pane::id)
+            .collect();
+        for id in unpinned {
+            if let Some(pane) = self.panes.get_mut(id) {
+                pane.meshes_mut().pinned = None;
+            }
+        }
         // A window shrinking back out of fullscreen or maximised that has
         // landed is an ordinary window again, with nothing of its shrink kept.
         // `a_window_glides_into_fullscreen_and_out_again`.
@@ -1933,6 +2142,24 @@ impl Solium {
         // (Ruling 11):
         // `tests::real_client::reflow_on_close::hosted::a_reserve_a_scene_changes_on_its_own_is_read_after_the_frame`.
         self.settle_scenes();
+        // The rules bound before the formats probe kept every rung; its first
+        // answer binds them again, after the frame and never in `prepare`
+        // (Ruling 11): `tests::the_formats_probe_rebinds_the_rules_after_the_frame`.
+        if self.rebind {
+            self.rebind_effects();
+        }
+        // An effect whose Lua its budget stopped this frame is loaded again
+        // from its unchanged folder, after the frame and never in `prepare`
+        // (Ruling 4); nothing is read unless one was stopped:
+        // `tests::settle_rebuilds_an_effect_its_budget_stopped`.
+        self.effects.revive();
+        // The overlay hears about a changed problem once, after the frame
+        // that found it:
+        // `tests::settle_tells_the_scripts_once_per_change_of_the_problems`.
+        if self.effects.problems_generation() != self.problems_told {
+            self.problems_told = self.effects.problems_generation();
+            self.trigger_problems_changed();
+        }
         self.animating = animating;
         animating
     }
@@ -1982,7 +2209,39 @@ impl Solium {
             .map_or(Insets::NONE, |pane| insets_for(pane.frame()))
     }
 
-    /// Raise a window and give it the keyboard.
+    /// The effects are ready for the first frame: the host has nothing
+    /// pending and every xray cut wanted has been built once (spec C14).
+    /// Tasks 59 and 60 add the materials' terms.
+    /// `tests::real_client::the_first_frame_waits_for_its_xray`.
+    pub(crate) fn effects_ready(&self) -> bool {
+        self.effects.ready() && self.xrays.ready()
+    }
+
+    /// What the first desktop frame waits for (`warm::Warm`): today the
+    /// effects; U17 adds the shell's scenes and the services' first data
+    /// here, so there is one gate. Not ready either for the passes the dev
+    /// control `SOLIUM_WARM_INJECT` names.
+    /// `tests::real_client::the_first_frame_waits_for_its_xray`,
+    /// `tests::an_injected_wait_holds_the_first_frame_for_its_passes`.
+    pub(crate) fn first_frame_ready(&self) -> bool {
+        self.effects_ready() && self.warm.injected_passes_over()
+    }
+
+    /// What `memory_report` counts that the compositor holds itself: the
+    /// windows, the Lua heap and the held memos (Ruling F30: outside the
+    /// pool's free-list budget, so counted here, as `memos_kb`).
+    /// `tests::real_client::a_held_memo_is_in_the_memory_report`.
+    pub(crate) fn memory(&self) -> Memory {
+        Memory {
+            windows: self.panes.len(),
+            lua_kb: self
+                .scripts
+                .as_ref()
+                .map_or(0, |scripts| scripts.used_memory() / 1024),
+            memos_kb: self.memos.held_bytes() / 1024,
+        }
+    }
+
     /// Report what the compositor is holding, once a second, when asked.
     ///
     /// Enabled with `SOLIUM_MEMDIAG=1`. A leak hunt needs to know *which*
@@ -2026,14 +2285,13 @@ impl Solium {
         let focused_inside = self
             .focused_window()
             .map(|window| self.pointer_inside(&window));
+        let memory = self.memory();
         tracing::info!(
             pointer = format!("{pointer_at:?}"),
             focused_inside = format!("{focused_inside:?}"),
-            windows = self.panes.len(),
-            lua_kb = self
-                .scripts
-                .as_ref()
-                .map_or(0, |scripts| scripts.used_memory() / 1024),
+            windows = memory.windows,
+            lua_kb = memory.lua_kb,
+            memos_kb = memory.memos_kb,
             rss_kb,
             "MEMDIAG"
         );

@@ -352,6 +352,10 @@ impl Solium {
                         return None;
                     }
                     let outer = self.pane_outer(pane);
+                    // The two match keys a rule reads that nothing else here
+                    // says, from where the rules read them, so a rule can be
+                    // tried in Lua first: `real_client::sol_windows_carries_every_window_match_key`.
+                    let facts = self.window_facts(pane.id(), crate::effect::rules::Keys::default());
                     Some(WindowInfo {
                         id: pane.id().get(),
                         rect: to_rect(outer),
@@ -405,6 +409,8 @@ impl Solium {
                         }),
                         cramped: pane.cramped(),
                         shown: crate::present::was_shown(pane),
+                        fullscreen: facts.fullscreen,
+                        style: facts.style,
                         // `None` for a Wayland window -- there is no
                         // `_NET_WM_WINDOW_TYPE` to have read -- never `"normal"`
                         // standing in for "not X11", which is what would let a
@@ -482,6 +488,22 @@ impl Solium {
             cursor: (cursor.x, cursor.y),
             screens: self.screens(),
             text_input: self.text_field(),
+            problems: self
+                .effects
+                .problems()
+                .iter()
+                .map(|problem| crate::script::ProblemRow {
+                    effect: problem.effect.clone(),
+                    file: problem.file.display().to_string(),
+                    line: problem.line,
+                    column: problem.column,
+                    message: problem.message.clone(),
+                    severity: match problem.severity {
+                        solium_effects::spec::Severity::Error => "error",
+                        solium_effects::spec::Severity::Warning => "warning",
+                    },
+                })
+                .collect(),
         }
     }
 

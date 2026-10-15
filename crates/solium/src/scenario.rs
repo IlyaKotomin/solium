@@ -46,7 +46,7 @@
 //! | step | |
 //! |---|---|
 //! | `pane = "name", client = { w, h }` | a frame built from the shipped style of that name, around a client that size |
-//! | `tell = { caret = { x, y, w, h } or false, values = { ... } }` | what a frame tells it: the caret, and values merged as `sol.pane_values` merges them; and, kept until told again, `focused` (true until then), `inside` (whether the pointer is over the window, false until then) and `title` (empty until then) |
+//! | `tell = { caret = { x, y, w, h } or false, values = { ... } }` | what a frame tells it: the caret, and values merged as `sol.pane_values` merges them; and, kept until told again, `focused` (true until then), `inside` (whether the pointer is over the window, false until then), `title` and `app_id` (each empty until then) |
 //! | `point = { x, y }` | the pointer moved there, in the pane's own space, as the compositor hands it to every layer; `point = false`, gone from the pane, which is also no longer `inside` it |
 //! | `wait = ms` | that much time, on the clock QML's animations and timers run on |
 //! | `scene = "path", size = { w, h }` | a shipped scene, `qml/` and that path, built that size, as a `sol.surface` builds one |
@@ -64,7 +64,9 @@
 //! suggests); or, on the Qt thread,
 //! `pixel(layer, x, y)`, the frame's layer of that name rendered, answering
 //! `r, g, b, a` -- the scene is the layer `"scene"` -- and `dormant`, `true`
-//! by the name of each of the frame's layers that says it is dormant now.
+//! by the name of each of the frame's layers that says it is dormant now, and
+//! `opacity`, each layer's `layerOpacity` by its name: how opaque the next
+//! frame composites the picture `pixel` reads.
 //! `tests::every_scenario_with_a_client_passes`,
 //! `tests::every_scenario_on_the_qt_thread_passes`.
 
@@ -460,6 +462,7 @@ fn on_the_qt_thread(path: &Path) {
     let mut focused = true;
     let mut inside = false;
     let mut title = String::new();
+    let mut app_id = String::new();
     let steps: Vec<Table> = scenario.get("steps").expect("`steps` is a list");
     for (index, step) in steps.iter().enumerate() {
         let index = index + 1;
@@ -492,10 +495,14 @@ fn on_the_qt_thread(path: &Path) {
             if let Ok(Some(told)) = tell.get::<Option<String>>("title") {
                 title = told;
             }
+            if let Ok(Some(told)) = tell.get::<Option<String>>("app_id") {
+                app_id = told;
+            }
             let (built, size) = decoration.as_mut().expect("a `pane` step first");
             built.tell_as_a_frame_would(
                 &Look {
                     title: &title,
+                    app_id: &app_id,
                     focused,
                     pointer_inside: inside,
                     caret,
@@ -574,9 +581,18 @@ fn on_the_qt_thread(path: &Path) {
                     Ok((read[2], read[1], read[0], read[3]))
                 })
                 .expect("pixel");
+            let opacity = lua.create_table().expect("a table");
+            for (name, alpha) in decoration
+                .as_ref()
+                .map(|(built, _)| built.layer_opacities())
+                .unwrap_or_default()
+            {
+                opacity.set(name, alpha).expect("a layer's opacity");
+            }
             let world = lua.create_table().expect("a table");
             world.set("pixel", pixel).expect("pixel");
             world.set("dormant", dormant).expect("dormant");
+            world.set("opacity", opacity).expect("opacity");
             expect(path, index, &check, world);
         } else {
             panic!(

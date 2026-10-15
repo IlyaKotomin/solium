@@ -116,10 +116,14 @@ job without being overwritten.
 return { pane = "left" }
 ```
 
-Eleven styles ship, and
+Twelve styles ship, and
 [the pane styles' README](../crates/solium/qml/panes/README.md#what-is-here)
-lists them with what each one is for. Reload and every open window is
-re-framed.
+lists them with what each one is for. The default is `glass`: each window and
+its bar one rounded piece of dark liquid glass, the bar along the bottom, and
+a thin dark shade just inside the rounded edge of a window that does not have
+the keyboard ([its numbers](../crates/solium/qml/panes/README.md#glass)).
+`pane = "top"` is the opaque titlebar above the window that was the default
+before it. Reload and every open window is re-framed.
 
 ### No frame at all
 
@@ -170,7 +174,7 @@ where it already is, so rounding buys no pass at all and no copy of the window,
 and a window that is tilted or pulled by a genie keeps its corners.
 `client.radius: 0` is no effect at all rather than a radius of nothing, so a
 style that does not want it draws its client exactly as before, and nine of the
-eleven shipped bundles do not want it.
+twelve shipped bundles do not want it.
 
 A rounded window that fades in or out is faded surface by surface, with no
 picture of it taken: where a subsurface overlaps its parent (a player's video
@@ -258,6 +262,83 @@ wallpaper — so its bar is `clientRadius` taller than its band and sits at
 `depth: "behind"`. Under the client it fills the notches and covers nothing;
 over the client the same rectangle would eat the client's top `clientRadius`
 rows, which in a terminal is the top half of the first line.
+
+### Effects
+
+An effect is a folder of Lua and GLSL, yours in `~/.config/solium/effects/`
+or one Solium ships, and a rule puts it in a slot of a part of a window. To
+blur what mpv itself draws, in its own place:
+
+```lua
+return {
+    effects = {
+        rules = {
+            { match = { app_id = "mpv" }, part = "client", slot = "replace",
+              effect = { "blur", source = "self" } },
+        },
+    },
+}
+```
+
+`part` is the window's `client`, its whole `pane`, its `popup`s, a layer of
+its pane style, its `region:titlebar`, or a scripted or layer surface; `slot`
+is `behind` it, in `front` of it, or `replace` it; `effect` is a name, a name
+with params (`{ "blur", passes = 3 }`), a chain of them, or `false` to empty
+the slot. A later rule for the same part and slot wins, and yours win over a
+pane style's: a style may give its own windows rules in an `effects.lua`
+beside its `Pane.qml` ([pane styles](../crates/solium/qml/panes/README.md#effectslua)). `source = "self"` is what makes this blur read mpv's own
+pixels. Without it, a blur reads what is behind the window: put it `behind`
+a translucent terminal and the wallpaper shows through blurred, the blur run
+once per monitor and shared by every window it is behind
+([effect folders](../crates/solium/effects/README.md#the-memo)):
+
+```lua
+{ match = { app_id = "kitty" }, part = "client", slot = "behind", effect = "blur" }
+```
+
+The rules are applied whole: one that cannot be, a typo in a key or an
+effect with a broken shader, keeps the whole set out, leaves the rules that
+were running, and is named in the top-right corner of your primary monitor,
+at its rule number or at the effect's own file and line. `solium --check`
+fails on it too. With no rules nothing changes, and nothing costs anything.
+
+`blur` ships with Solium, a dual Kawase blur with `passes` and `offset`
+([its folder](../crates/solium/effects/blur/README.md)); copy the folder to
+`~/.config/solium/effects/blur/` to change it, and your copy is used instead.
+So does `glass`, liquid glass, dark unless its `tint` says otherwise
+([its folder](../crates/solium/effects/glass/README.md)), which the `glass`
+pane style puts behind every window it frames; a rule of yours for
+`{ style = "glass" }`, the `pane` part and its `behind` slot wins over the
+style's, with other params (`tint = { 1, 1, 1, 0.11 }` is light glass) or with
+`effect = false`. And `shade`, a thin dark edge just inside a part's rounded
+outline ([its folder](../crates/solium/effects/shade/README.md)), which the
+`glass` style puts in front of a window without the keyboard with a rule's
+`fade`: the slot eases in as the rule starts to match and out as it stops,
+
+```lua
+{ match = { focused = false }, part = "pane", slot = "front", effect = "shade",
+  fade = { duration = 240, easing = "outCubic" } }
+```
+
+the compositor blending the result it has at another opacity on each frame
+and running nothing for it.
+An effect that reads the part's own pixels (`self`, or `source = "self"`, as
+the rule above gives the blur) is drawn in its slot, and runs again only when
+the window draws something new, changes size, or the rule's params change:
+a still window's effect runs once and is then placed as it was. So the rule
+above costs a capture of mpv's window and the blur's six small passes (three
+halvings and three doublings back, at its default `passes = 3`) each time mpv
+draws a frame, and nothing while it is paused. A window the rule does not
+match is untouched, drawn exactly as with no rule; `match = { title = … }`
+works too, for a player whose `app_id` you do not know. If the blur fails,
+on a GPU that refuses its shaders or anywhere else, mpv is drawn as if no
+rule named it. An effect that reads nothing of the window, only its shape (a
+border, a glow behind it), is drawn too, with no capture of the window at
+all: it runs once, and again only when the window changes size or the rule's
+params change, however much the window draws.
+[The effects reference](../crates/solium/effects/README.md#tiers) says what
+each kind of effect costs, and [its rules](../crates/solium/effects/README.md#rules)
+every key a rule takes and how to write an effect of your own.
 
 ### What a window shows before its application exists
 

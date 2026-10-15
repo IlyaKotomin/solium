@@ -166,6 +166,13 @@ Item {
     property int contentWidth: 0
     property int contentHeight: 0
 
+    // The window's application id, as `sol.windows()` and a rule's `app_id`
+    // read it (an X11 window's class), and empty while its application has
+    // not arrived: data only, written when it changes. A bar shows the
+    // application's icon by it, `image://solium/icon/<appId>?size=16`.
+    // `decoration::tests::a_layer_is_told_the_app_id_and_told_again_when_it_changes`.
+    property string appId: ""
+
     // The focused text field's caret, when this pane's window has it, in the
     // pane's own space: `{ valid, x, y, width, height }`, written in place as
     // the caret moves and with `valid: false` when the field goes. A layer
@@ -219,6 +226,26 @@ Item {
     readonly property bool dormant: style.layerIndex >= 0
         && style.layerIndex < style.layers.length
         && style.layers[style.layerIndex].dormant === true
+
+    // The `layerOpacity` of the inline layer this scene draws, at the root
+    // where the compositor reads it: how opaque it draws the layer's
+    // picture, applied as it composites it, so a fade by it draws no new
+    // picture (`Layer.qml`). 1 in a manifest.
+    // `decoration::tests::a_layers_opacity_is_its_roots_and_one_when_it_has_none`.
+    readonly property real layerOpacity: style.layerIndex >= 0
+        && style.layerIndex < style.layers.length
+        && typeof style.layers[style.layerIndex].layerOpacity === "number"
+        ? style.layers[style.layerIndex].layerOpacity : 1
+
+    // The `resizeHz` of the inline layer this scene draws, at the root where
+    // the compositor reads it: how often, at most, it draws the layer again
+    // for a new size while the window's size keeps changing (`Layer.qml`).
+    // 0, every size, in a manifest.
+    // `decoration::tests::a_layer_is_drawn_again_for_a_new_size_at_most_resize_hz_times_a_second`.
+    readonly property real resizeHz: style.layerIndex >= 0
+        && style.layerIndex < style.layers.length
+        && typeof style.layers[style.layerIndex].resizeHz === "number"
+        ? style.layers[style.layerIndex].resizeHz : 0
 
     Component.onCompleted: style.showOneLayer()
     onLayerIndexChanged: style.showOneLayer()

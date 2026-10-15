@@ -1,0 +1,520 @@
+# Effect folders
+
+An effect is a folder of Lua and GLSL: `effects/<name>/effect.lua`, which says
+what the effect takes and how it runs, and the shader files beside it that draw
+it. No effect is written into the compositor. Solium gives every effect the
+same generic pieces to build from, and the effects that ship with it are
+folders like any other, here, to read, copy and change. Yours go in
+`~/.config/solium/effects/<name>/` (`$XDG_CONFIG_HOME/solium/effects/` when
+that is set), and a folder of yours shadows the shipped one of the same name,
+name by name, as a pane style's does: copy a shipped folder there, change it,
+and everything that names it uses your copy. A folder with no `effect.lua` in
+it is skipped, so an empty one made and not filled yet does not cost you the
+shipped effect of that name.
+
+A name is lower-case letters, digits, `-` and `_`: `blur`, `soft-glow`,
+`fade_2`. It is a name and never a path, because an effect is named in rules
+and by other effects, where a path would mean nothing: `Blur`, `my/blur` and
+`../blur` name no effect.
+
+An install puts the shipped folders in `share/solium/effects/`, beside the
+shipped QML and Lua: `/usr/share/solium/effects/` for the Fedora package,
+`~/.local/share/solium/effects/` for `dev/install.sh`.
+
+## Nothing changes until you name one
+
+A folder on disk changes nothing by being there. Solium loads only the effects
+your configuration names, in a rule, in `effects.on` or in a binding, and the
+effects those name in turn. Every other folder is left alone, yours and the
+shipped ones alike.
+
+## Rules
+
+A rule puts an effect in a slot of a part of a window, or of a surface. Rules
+go in your configuration, in `effects.rules` (in `user.lua`, a list that
+replaces the shipped empty one whole), and `init.lua` hands them over with
+`sol.effects`:
+
+```lua
+return {
+    effects = {
+        rules = {
+            { match = { app_id = "mpv" }, part = "client", slot = "replace",
+              effect = { "blur", source = "self", passes = 2 } },
+        },
+    },
+}
+```
+
+| Key | What it takes |
+|---|---|
+| `match` | `"*"`, or a table of what to match: `app_id`, `title`, `monitor`, `style` (a bare window's is `"none"`), and `focused` and `fullscreen` as `true` or `false`, for a window's parts; `surface` for a scripted surface's; `layer_shell` for a layer surface's. A word is exact, `"*"`, or a prefix ending in `*` (`"org.gnome.*"`); there are no Lua patterns. A key of another kind of part's is refused. `focused` is whether the window is drawn focused, `fullscreen` whether Solium last told it to be, and `sol.windows()` gives every one of a window's keys, so you can see what a rule will match |
+| `part` | `pane` (the window's frame and client, not its popups), `client`, `popup` (all of a window's popups at once), `layer:<name>` (a pane style's layer), `region:titlebar` (the band along the one side a pane style reserves most for: the window's full width above or below the client, its two outer corners rounded as the client's largest, or square down a side between those; a style that reserves its most on two sides or more, such as `border`, or nothing, and a bare window have none), `surface:<name>` (one scripted surface on one monitor) or `layer_shell:<namespace>` |
+| `slot` | `behind` the part, in `front` of it, or `replace` it. A `pane`'s go around its frame and client and under its popups, so a menu stays on top; a `client`'s between the pane style's layers and the client; a `popup`'s around the popups; `region:titlebar`'s around the pane style's layer named `bar` (else its first `frame` layer) and a `layer:<name>`'s around that layer; a scripted or layer surface's just under and over it |
+| `effect` | an effect's name; a link, `{ "blur", passes = 3 }`, with the effect's params beside its name; a chain of links, run in order, each reading the last one's result, `{ { "blur", source = "self" }, { "tint", amount = 0.1 } }`; or `false`, which empties the slot |
+| `source` | what the chain's first input reads in place of its own: `"self"`, the part's own pixels. On the rule or in its first link, never a later one |
+| `mask` | how the result is cut: `"shape"`, the part's own shape (the default: the client's own rectangle and rounded corners for `client`; the whole window rounded at its largest corner for `pane`; the band, as above, for `region:titlebar`; the rectangle for the rest), or `"alpha"`, the alpha of the part's own pixels, which needs `source = "self"` |
+| `memo` | `false` shares nothing of this rule's chain per monitor: each part runs its whole chain over xray, whatever `effects.memo.split` says (see *The memo*). `true` unless you say so |
+| `cut` | which xray a chain reading the `backdrop` reads: `"below"` (the default), every layer `effects.xray.layers` names below the part's own; or `"background"`, the wallpaper alone, even where `layers` has `"bottom"` |
+| `fade` | how the slot comes and goes as the rule starts and stops matching (a window gaining or losing the keyboard, say): `{ duration = 240, easing = "outCubic" }`, a duration in milliseconds from 0 to 60000 and a curve by name, `outCubic` when not given. The slot's result is drawn at an opacity that eases from 0 to 1 when the rule starts to fill the slot, and from 1 to 0 when it stops, the result drawn as it is and nothing run again for it; turned round part of the way, it goes back from where it got to. Left out, or `false`, the slot is filled and emptied at once |
+
+A link may also give `reach` and `bleed`, in pixels, in place of the
+effect's own. A chain reads as far around its part as its first link
+reaches, and draws as far beyond it as all its links bleed together.
+
+A pane style may give rules of its own, for the windows it frames, in an
+`effects.lua` beside its `Pane.qml`
+([pane styles](../qml/panes/README.md#effectslua)). For one part and one slot
+the later rule wins: a pane style's rules first, then yours, so yours win
+over a style's, and a later one of yours over an earlier one. `effect = false` in a later rule empties the slot an earlier one
+filled. The part itself is always drawn: `behind` and `front` only add, and a
+`replace` whose effect fails draws the part as if no rule named it.
+
+Rules are applied whole. When your configuration loads, every effect a rule
+names is loaded and every link bound with its params, and one rule that
+cannot be (a key misspelled, a part or a slot that does not exist, an effect
+nobody ships, a param it does not have, a shader that fails its checks) keeps
+the whole set out: the rules that ran before stay, and what is wrong is on
+the overlay, by the rule's number and key, or at the effect's own file and
+line when the effect is what failed. `solium --check` fails on it too.
+
+Some of what a rule can say waits for a later part of Solium, and is refused
+until then, by name: the live backdrop (`source = "live"` or `"auto"`)
+arrives with X4.1; regions other than the
+titlebar, a `region:titlebar` rule whose chain reads the band's own pixels
+(`self`), `part = "output"`, `keep`, a `surface` match naming a plane, and an
+alpha mask without `source = "self"` likewise. This build reads, checks and
+binds rules, names a broken one on the overlay, and draws an effect in its
+slot, as far as its tier allows, below.
+
+## Tiers
+
+What a rule's chain reads decides what it costs, and which tier it is in. The
+tier is fixed when the rules are applied: a reload is what changes it.
+
+| Tier | What the chain reads | What it costs | In this build |
+|---|---|---|---|
+| T0 | nothing of the frame: only `shape` and its own states (a border, a glow, a gradient) | no capture. It runs once, and again only when its params or the part's size change, whatever the window draws under it; while the part keeps changing size (a drag on its edge), at most `effects.motion_hz` times a second, its last result stretched over the part between. Its `sol_tex` reads a transparent texel | runs |
+| T1 | the part's own pixels: `self`, or its first input given `source = "self"` | a capture of the part, padded by the chain's `reach`, drawn again only when the part commits. The chain runs again only then, or when its params or the part's size change; otherwise its last result is placed as it was | runs |
+| T2 | the `backdrop`, what is behind the part, from xray: a sharp picture of the layers below the part's own, per monitor (`effects.xray`) | xray is drawn only on a monitor a T2 part is on, and again only when what is in it changes. The chain's start that reads only the backdrop (a blur) runs once per monitor and is shared (*The memo*); the rest runs per part, at the part's own size, again only when the part moves, its params change or xray is redrawn. A plain blur runs nothing per part: each part is a crop of the shared result | runs |
+| T3 | the live backdrop, with `source = "live"` or `"auto"` | | refused, naming X4.1 |
+
+A rule in a tier this build cannot run is an error, not an effect that draws
+nothing: the rules that ran stay, the overlay names it, and `solium --check`
+fails on it, so a rule that cannot work yet says so. The shipped `blur` reads
+the backdrop, so `{ "blur" }` behind a translucent window blurs what is behind
+it (T2), and `{ "blur", source = "self" }` blurs the part's own pixels (T1).
+An effect that reads its part's own pixels always captures the part for now,
+a tint or a dim included; drawing one inline, with no capture, comes later.
+
+A part on `background` has nothing below it to read, so a T2 rule there
+wants no slot and is no problem either. A window across two monitors has a
+T2 result on each, each from that monitor's xray, with a seam at the edge
+(`effects.xray.straddle = "own"` keeps only its own monitor's). While the
+session is locked no rule's slot is wanted at all: nothing of the session is
+captured, run or read behind the lock.
+
+### Moving and warped parts
+
+A T2 part reads the backdrop where it is drawn, on every pass. Through a
+glide or a drag (a relayout, `sol.place`, `sol.present` with a rectangle) a
+plain blur only moves its crop of the shared result and runs nothing, and a
+chain with steps of its own per part runs them again as its box moves, and
+not at rest: at most `effects.motion_hz` times a second (60 unless you
+change it; 0 on every pass), its last result drawn where the part is between,
+so what shows through it lags where the part is by at most that long's worth
+of its motion, and is where it is again within one tick of its stopping. A
+backdrop redrawn under it, or its params changed, runs it at once. Under a warp (a tilt, a genie, an open or close that
+warps) the part's `behind` slot is drawn beneath the warp, through the same
+mesh, each pixel reading the backdrop under it on the screen, and the
+window's own picture keeps a hole in the part's shape there, so what is
+behind the window shows through it as it does at rest. A chain whose steps
+per part read the part's shape (a refraction) runs them over the warp's
+bounding box, not the bent outline. A `front` or `replace` T2 slot, and every
+T0 and T1 slot, stays in the window's picture at rest and bends with it; a T1
+slot is live already, since its capture is drawn again on every commit.
+`effects.xray.warped = "rest"` keeps every warped slot in the window's
+picture, reading the backdrop where the window rests: cheaper, and bent with
+it.
+
+### The memo
+
+A T2 chain is split when the rules are applied: its start, as far as it reads
+only the `backdrop` and earlier such steps, is run once per monitor and xray
+cut and shared by every part whose chain starts the same way (five frosted
+titlebars are one blur); the rest runs per part and reads each shared result
+as the input `memo:<step>`. A step that reads anything only a part has
+(`sol_content`, `sol_shape`, `self` and the rest), or a stage marked
+`per_part = true`, ends the shared start. In a shared step `uv` spans the
+monitor and `sol_size` is the monitor's, so positional work belongs in a
+part's step. With nothing left per part (a plain blur) a part runs no pass at
+all: it is drawn as a crop of the shared result.
+
+`effects.memo` says how: `split = "resize"` (the default) shares up to the
+last step that changes size, so a trailing tint stays per part;
+`"longest"` shares the tint too, and `"off"` shares nothing. A rule's
+`memo = false` is `"off"` for that rule alone. A shared result nobody reads
+is given back after `keep_passes` passes (0 by default), and `budget_mib`
+caps what they hold together (0, no cap, by default): past it a part that
+cannot be given its shared results runs its whole chain itself, a part that
+read them the pass before keeps them, and the first refusal at a cap is said
+in Solium's log. `SOLIUM_XRAY_REBUILD=always` draws xray and runs every shared
+result on every pass, for measuring; the PACING line and the trace count both
+(`xray_builds`, `memo_runs`).
+
+Whatever the tier, an effect that fails, in its Lua, its checks, its compile
+or on the GPU, leaves its part drawn as if no rule named it: a `replace` draws
+the part and a `behind` or `front` draws nothing. With no rules, nothing is
+resolved, captured or run, and a window is drawn exactly as it would be
+without effects at all, a fullscreen one straight from its own buffers.
+
+## When it is read, and when it compiles
+
+An effect's folder is read when your configuration loads, and again at every
+reload, with no GPU: its `effect.lua`, its params and the checks of its
+shaders below. Its shaders are compiled on the GPU just before the next frame.
+An effect whose files have not changed is kept as it is, compiled and all, so
+a reload that changes something else rebuilds nothing. A new version that
+fails, in its Lua, its checks or its compile, leaves the version that ran
+before it running; an effect that has never compiled is left out, as if it
+were not named. A shader that failed to compile is not compiled again until
+its file changes, or until a reload, which tries every failure once more.
+
+## When something is wrong
+
+What is broken is named with its file and line in the top-right corner of
+your primary monitor, for as long as it is broken: a Lua error in an
+`effect.lua`, a check of a shader that fails, a compile the GPU refused, a
+rule that cannot be applied (above), a pane style's `effects.lua` that does
+not run or a rule of it that cannot be bound, a key of `effects` outside its
+bounds (which keeps the rules and keys that ran). A
+configuration that fails to reload is listed there too, at its own line, and
+the configuration that was running before it keeps running. The list goes
+when a reload leaves nothing broken. A version of an effect that fails keeps
+the one that ran, as above, and a reload tries every recorded failure once
+more.
+
+The list is configuration like the rest. The compositor hands the rows to Lua
+as `sol.problems()` and tells a `problems` listener when they change;
+`lua/problems.lua` and `qml/problems.qml` draw them, and a configuration that
+leaves out `require("problems")` has no overlay.
+
+## Checking a folder
+
+```sh
+solium --check ~/.config/solium/effects/<name>
+```
+
+checks one effect folder and starts nothing: its `effect.lua` in a Lua of its
+own, every key in it, the checks of its shaders below, and the effects it
+names in turn (`pixels`, a `fallback` naming an effect, a `use` stage),
+looked for beside it
+first and then among the shipped folders, as when it runs, so a copy of a
+shipped effect that names another shipped one passes. Its Lua runs under
+your configuration's `effects.sandbox` ([below](#what-an-effects-lua-can-reach)), as the
+session loads it, or the defaults if your configuration does not load.
+Errors are printed at their file and line and exit 1; warnings are printed
+and pass. `solium --check .` inside the folder does the same.
+
+Its shaders are compiled on this machine's GPU, on the first render node, and
+only there: a compile says what this machine's driver accepts and nothing
+more. NVIDIA's accepts GLSL that Mesa's refuses, such as a loop bound that is
+not a constant, or an `int` where a `float` is wanted, so an effect meant for
+other machines is worth checking on one with Mesa as well. The same GPU is
+asked whether it can draw into `rgba16f`, so an effect whose every version
+needs it fails there. With no render node it says `shaders not compiled: no
+render node` and `formats not checked: no render node`, keeps every version,
+and that is not a failure.
+
+Plain `solium --check` checks every folder in your `effects/` this way,
+named or not, and every effect your configuration's rules name, and then
+binds each rule as the compositor would, so a rule it would refuse fails
+there too. Rules that do not parse fail by their number and key, and are not
+bound; nor are the rules of a `sol.effects` whose own keys (`sandbox`,
+`limits`, `present`, `xray`, `memo`) are refused, which fails naming the
+key, since the session refuses that whole call: it says `rules not checked:
+they did not parse, or their sol.effects was refused`. A folder with no `effect.lua`
+fails, and so does one whose name cannot name an effect, such as `Blur`,
+since nothing could use it. The `effects.lua` of each pane style of your
+own is read too, and fails on what the overlay would name. Every effect and
+style is read under your `effects.sandbox`.
+
+## What `effect.lua` returns
+
+`effect.lua` returns one table. Every key in it is checked, and a key Solium
+does not know is refused by name, with the key you probably meant, so a typo
+never quietly means a default.
+
+| Key | What it is |
+|---|---|
+| `api` | `1`, the version of this format |
+| `inputs` | what the effect reads: `self`, `backdrop`, `shape`, `old`, or `state:<name>` of its own |
+| `params` | its knobs, below |
+| `frag` | a one-pass effect's shader, a file in the folder |
+| `stages` | a many-pass effect's passes: a list, or a function of the params, below |
+| `pixels` | another effect's name, whose `frag` draws this one's pixels |
+| `mesh` | a geometry effect's `function(t, cols, rows, out)`, [below](#writing-a-mesh) |
+| `grid` | a geometry effect's grid: `{ along = 48, across = 8 }`, which turns with the direction the window moves in, or a fixed `{ cols, rows }` |
+| `reach` | how far beyond its part the effect reads, in pixels: a number, or a function of the params |
+| `bleed` | how far beyond its part the effect draws, likewise |
+| `fallback` | cheaper versions to fall back to, in order: each a table of params, or another effect's name |
+| `duration` | how long it plays, in milliseconds |
+| `easing` | its curve, by name: `outBack`, `inOutQuad` and the rest of Solium's curves |
+
+An effect draws something, and says how once: `frag` or `stages`, not both,
+or a `mesh`, or `pixels`. `motion` is refused until motion tokens exist; give
+`duration` and `easing`. `image:` inputs are not read yet, and are refused.
+
+### Fallbacks
+
+```lua
+fallback = { { passes = 2 }, { passes = 1 }, "frost" },
+```
+
+Wherever the effect is used, its stages are put in place for the params it
+was given, and again for each `fallback` in order: a table of params given
+over those, or another effect at its defaults. That happens when the
+configuration loads, never once a frame. A GPU that cannot draw into
+`rgba16f` drops every version with a pass or a state in that format, so the
+effect starts at the first version that does not; if none is left, the
+effect is not drawn and is named on the overlay. Until Solium's first frame
+has asked the GPU, every version is kept. An effect a `fallback` names is
+loaded with it, and an effect draws only once the shaders of every version
+compiled.
+
+### Params
+
+```lua
+params = { passes = { 3, min = 1, max = 6, int = true }, offset = { 3 } },
+```
+
+A param is `{ default, min =, max =, int = }`, and its default's kind is the
+param's: a number (a whole one with `int = true`), four numbers, a boolean,
+or a word. Its name is lower-case letters, digits and `_`, and it may not be
+one of the words said beside params where an effect is used: `source`,
+`mask`, `keep`, `effect`, `geometry`, `pixels`, `decoration`, `duration`,
+`easing`, `motion`, `from`, `to`, `axis`, `reach` and `bleed`. An effect
+with a `mesh` finds its params in `t`, beside the fields Solium writes
+there, so neither may it take one of theirs: `progress`, `clamped`,
+`direction`, `axis`, `seed`, `scale`, `cols`, `rows`, `from`, `to`,
+`monitor` and `part`.
+
+Where the effect is used its params can be given, as in
+`{ "blur", passes = 2 }`. A param the effect does not have is refused, with
+the one you probably meant; a value of another kind is refused; a whole
+number is a fine value for a fractional param; and a value outside `min` and
+`max` is clamped, with a warning. A function of the params, such as `reach`,
+is called with the params as they were bound.
+
+A geometry effect played by `sol.present` packs its params into numbers (a
+number, a whole one, a boolean as 0 or 1, four numbers as four), so a
+present can blend them between two presents: at most
+`effects.limits.params` of them (8 unless you change it, up to 64), and no
+word param. One with more, or a word, is named on the overlay and the
+window drawn undeformed; nothing is cut.
+
+### Stages
+
+A many-pass effect lists its passes in `stages`, each a table that begins
+with its kind:
+
+```lua
+stages = function(p)
+  local s = {}
+  for i = 1, p.passes do s[#s + 1] = { "pass", "down.frag", scale = 0.5 } end
+  for i = 1, p.passes do s[#s + 1] = { "pass", "up.frag", scale = 2 } end
+  return s
+end,
+```
+
+`stages` is a list, or a function of the params that returns one. The
+function is called when the effect is loaded and where it is used with other
+params, never once a frame, so a loop over `p.passes` costs nothing while the
+effect draws.
+
+| Stage | What it does |
+|---|---|
+| `{ "pass", "<file>.frag" }` | draws one shader into a texture of its own. `sol_tex` reads the last result, or the effect's first input in the first pass. `scale =` sizes it against what it reads, rounded up to whole pixels, 1 when not given; `format =` is `"rgba8"`, the default, or `"rgba16f"`; `uses = { … }` lists the other textures it reads, by name, at most seven, since a pass reads eight textures with its `sol_tex`; `input =` names what `sol_tex` reads in place of the last result; `per_part = true` says it must run for each part alone: a pass that reads only the backdrop may otherwise run once for a whole monitor and be shared by every part on it, and one whose `.frag` reads a part's own names (`sol_content`, `sol_shape`, `sol_progress`, `sol_self` and the like) never is |
+| `{ "repeat", over = { 64, 32, … }, as = "<name>", <stages> }` | runs the stages after its kind once for each number in `over`, with `p_<name>` set to that number. The name is a new one, not one of the effect's params |
+| `{ "save", "<name>" }`, `{ "get", "<name>" }` | names the last result; makes a named result the last one again |
+| `{ "use", "<effect>", <param> = <value>, … }` | runs another effect's stages here, on the last result, with those params. The names it saves are its own, and where it reads its first input by name it reads what it was given. It is put in place when the effect is loaded, so it costs nothing while the effect draws |
+| `{ "state", "<name>", depends = "…", stages = { … } }` | a texture kept from one run to the next, made by its own `stages` from the effect's inputs and the states before it, and made again only when what it `depends` on changes: `"shape"`, `"params"`, or `"self"`, a commit of the part's own surface; and when its size changes with the part's, or a state it reads is made again. Later stages read it by its name. `format =` and `scale =` as for a pass |
+
+A pass with a `scale` above 1 after passes below 1 is the size of what the
+matching smaller pass read, so a blur that halves a window three times and
+doubles it three times comes back to its exact size, odd or not. Every stage
+is checked as `effect.lua`'s own keys are, and a key a stage does not take is
+refused with the one you probably meant. A name an effect saves or makes a
+state is a new GLSL name, because every pass reads it as `sol_<name>`:
+lower-case letters, digits and `_`, not one of the `sol_` names below, and
+not another of its names followed by `_box` or `_sampler`. An effect may not
+use itself, directly or through others, and one effect runs at most 256
+passes, its states' included. `depends = "region"`, an outline a region publishes, waits
+for regions, and is refused.
+
+## What an effect's Lua can reach
+
+Each effect runs in a Lua of its own, apart from your configuration and from
+every other effect, with `math`, `table` and `string` and the base functions
+that reach nothing outside it. There is no `sol`, `io`, `os`, `require`,
+`load`, `loadfile` or `dofile`, no `pcall` or `xpcall`, no `collectgarbage`
+and no `string.dump`, and no patterns: `string.find`, `string.match`,
+`string.gmatch` and `string.gsub` are not there, because matching one runs
+inside a single call that nothing can stop, and some patterns take longer
+than any frame. `print` writes a debug line to Solium's log, naming the
+effect. A metatable may not have a `__gc` finaliser, because a finaliser runs
+where nothing can stop it. Two functions of Solium's are there before your
+file runs: `sol_phase(u, v, axis)`, how far through a sweep along `axis`
+(`"down"`, `"up"`, `"left"` or `"right"`) the point at `(u, v)` of the
+window is, 0 leading and 1 following; and `sol_grid(t, c, r)`, the window's
+`(u, v)` at point `(c, r)` of a `mesh`'s grid ([below](#writing-a-mesh)).
+
+Every call into an effect, running `effect.lua` or a function of its params,
+has `effects.sandbox.load_ms` (100 ms unless you change it), a `mesh` call
+in a frame 2 ms, and the checks a `mesh` is put through when it loads
+([below](#writing-a-mesh)) `load_ms` between them; its Lua has
+`effects.sandbox.memory_mib` (16 MiB unless you change it). Both are keys
+of `effects` in your configuration, `sandbox = { load_ms = 100, memory_mib =
+16 }`, from 10 to 5000 ms and from 1 to 512 MiB; changing either loads every
+effect again, and a pane style's `effects.lua` runs under them too. A
+problem the budget or the memory caused names the key. A call runs at full
+speed, with nothing counting its
+instructions. One that runs longer is stopped at its next Lua instruction,
+so a call into the `string` or `table` library runs to its end first; one
+that asks for more memory is stopped there. An effect stopped by the clock
+runs nothing more in that Lua: after the frame Solium loads it again from
+its folder, if the folder has not changed since it was loaded, and
+otherwise at the next reload. A Lua error is reported at its file and line.
+
+## Writing a `.frag`
+
+A shader file is GLSL ES 1.00 (`#version 100`), the language every program in
+Solium is written in, the warp's included. It defines one function, which is
+called for every pixel the pass draws:
+
+```glsl
+vec4 sol_effect(vec2 uv) {
+    vec4 c = sol_tex(uv);
+    return vec4(mix(c.rgb, vec3(c.a), p_amount), c.a);
+}
+```
+
+`uv` runs from 0 to 1 across the box the pass draws, (0, 0) at its top-left.
+Every texture a pass reads is sampled linearly, so a read between two texels
+blends them, as a blur's taps want, and `sol_tex` past its edge reads the
+edge texel itself.
+Your file is compiled as it is, between a prelude Solium writes for the pass
+and a few lines that call `sol_effect`, and it stays a source string of its
+own, so the line numbers Solium reports from the compiler are your file's own
+lines, however the driver counts them. Do not
+write `#version`, a `precision` or a `uniform` named `p_…` or `sol_…`: the
+prelude has them, and a `uniform` of yours with one of those names is an
+error at its line.
+
+| Name | What it is |
+|---|---|
+| `sol_tex(uv)` | the pass's input: the previous pass's result, or the effect's first input in the first pass, clamped at its edge |
+| `sol_texel`, `sol_size` | one texel of that input, in `uv`; the size of what the pass draws, in pixels |
+| `p_<param>` | each of the effect's params, declared from `params`: a number is a `float` (an `int` with `int = true`), a boolean an `int` 0 or 1, four numbers a `vec4`; a word has none |
+| `sol_<name>(uv)`, `SOL_HAS_<name>` | another texture the effect reads, by name: `sol_self`, `sol_backdrop`, a name it saved, or a state's. One the pass does not list in its `uses` reads transparent and its `SOL_HAS_<name>` is 0, so one file can be written for both cases |
+| `sol_shape(uv)`, `sol_sdf(px)` | the part's shape: its coverage, and its signed distance in pixels, negative inside, exact for a rounded box |
+| `sol_content`, `sol_to_content(uv)`, `sol_to_uv(px)`, `sol_sdf_rrect(px, size, radii)` | the part's rectangle inside the box the pass draws, the maps between `uv` and the part's pixels, and the rounded-box distance itself |
+| `sol_box_px`, `sol_radii` | the box the pass draws, in pixels, and the part's four corner radii in pixels, top-left, top-right, bottom-left and bottom-right, which `sol_sdf` rounds it by |
+| `sol_progress`, `sol_clamped`, `sol_direction`, `sol_seed`, `sol_time` | in a transition: its progress, which a spring may carry past 1; the same clamped to 0..1; +1 arriving, −1 leaving, 0 resizing; a random number fixed for the transition; seconds |
+| `sol_noise(p)`, `sol_hash(p)` | value noise, and the hash in [0, 1) it is made from |
+
+A `p_` name the effect has no param for, and a `sol_` name that is none of
+these, are errors at their line, with the param you probably meant; reading a
+texture the pass does not list in its `uses` is a warning, since it reads
+transparent. Comments are skipped.
+
+## Writing a `mesh`
+
+A geometry effect moves the window's picture rather than its pixels: its
+`mesh` places a grid of points, and the window is drawn stretched across
+them. This one leaves the window where it is:
+
+```lua
+return {
+  api = 1,
+  grid = { along = 48, across = 8 },
+  mesh = function(t, cols, rows, out)
+    local n = 0
+    for r = 0, rows do
+      for c = 0, cols do
+        local u, v = sol_grid(t, c, r)
+        out[n + 1] = t.from.x + u * t.from.w
+        out[n + 2] = t.from.y + v * t.from.h
+        n = n + 2
+      end
+    end
+  end,
+}
+```
+
+`mesh(t, cols, rows, out)` writes the whole grid into `out`: x and y for
+each of its `(cols + 1) × (rows + 1)` points, row by row from the top-left,
+in global logical pixels. `cols` and `rows` are the grid's, from `grid`: one
+given as `along` and `across` runs `along` the way the window is pulled.
+`t` says the rest:
+
+| Field | What it is |
+|---|---|
+| `t.progress`, `t.clamped` | how far the effect has gone: 0 where the window rests, 1 at the far end, which a spring may carry past; the same clamped to 0..1 |
+| `t.direction` | +1 arriving, −1 leaving, 0 resizing |
+| `t.axis` | which way the window is pulled: `"down"`, `"up"`, `"left"` or `"right"` |
+| `t.from`, `t.to` | the window's rectangle, and the one it is pulled toward (its own when there is none), each `{ x, y, w, h }` |
+| `t.monitor` | the window's monitor's rectangle |
+| `t.part` | the part of the window's unit square the grid covers, `{ u0, v0, u1, v1 }`, which can reach past it for a shadow or a popup; `sol_grid` reads it |
+| `t.seed`, `t.scale` | a number in [0, 1) fixed for one transition; the monitor's scale |
+| `t.cols`, `t.rows` | the grid's size, as the call is given it |
+| `t.<param>` | each param: a number, a boolean, a table of four numbers, or a word as a string |
+
+`t` and `out` are the same two tables at every call, so a frame makes no
+garbage, and `out` is emptied before each. What `mesh` wrote is checked
+before a point of it is drawn: the right count of numbers, every one
+finite, and every point inside a box four monitors wide and four high,
+centred on the window's monitor (one and a half monitors beyond each of its
+edges). A grid that fails, a Lua error, or a call its 2 ms stopped is
+refused, and the window is not drawn through it.
+
+When the effect loads, `mesh` is called at progress 0 and 1, on all four
+axes, arriving, leaving and resizing, and at progress 0 it must put every
+point exactly where the window is, within 10⁻⁹ of a pixel, over the window
+and over a `t.part` inside it: an effect starts and ends with the window at
+rest, and a grid that ignores `t.part` (placing point `(c, r)` at `c / cols`
+rather than `sol_grid`'s) would squeeze a popup past the window's edge onto
+it. These 36 calls have `load_ms` between them,
+and the fastest must take no more than the 2 ms a frame gives, or every
+frame would stop it. One that fails any of this is refused, and named on
+the overlay and by `solium --check` at the line its `mesh` is on.
+
+`sol.present` plays one: `deform = { effect = "genie", to = …, progress =
+0.5 }` names the folder, its params beside it, and how far the window is
+pulled into `to` (`t.direction` is −1). Its grid is built once a frame
+whatever the number of monitors, and again only when something it depends
+on moves: the effect, its params, the part, the grid, the axis, the
+progress, the seed, the window's and the target's rectangles, the monitor.
+A grid that is refused draws the window by the present's `failed`
+(`effects.present.failed`, `"flat"` unless you change it: the window
+undeformed; or `"hide"`), and so does a refused grid of its open menus,
+which reach past the window: each is said once a present in Solium's log.
+A folder a reload finds changed while a present plays draws it flat for
+the rest of the move, or on the version it began with under `on_reload =
+"keep"`; a reload that leaves the folder as it was changes nothing, even
+one that changes `effects.sandbox`.
+
+The shipped [`genie`](genie/README.md) is a whole one in a page of Lua: it
+works out how far each row has gone, once (each column, when the window is
+pulled sideways), then places every point from the window's own `(u, v)`,
+so a `t.part` reaching past the window bends whatever lies beyond it with
+the window.
+
+## The shipped folders
+
+| Folder | What it is |
+|---|---|
+| [`blur`](blur/README.md) | a dual Kawase blur, `passes` halvings and as many doublings back at `offset` texels; its input is the backdrop, what is behind the part from xray, or the part's own pixels with `source = "self"` |
+| [`genie`](genie/README.md) | the window pulled into its target like a sheet through a letterbox, the edge nearest the target first, `spread` drawing the tail out behind it; a geometry effect, held to Solium's Rust genie within 10⁻⁹ |
+| [`glass`](glass/README.md) | liquid glass, dark by default: the backdrop blurred and veiled, bent round the part's rounded edge across a rim, with a highlight along the edges facing the light; the `glass` pane style puts it behind every window it frames |
+| [`shade`](shade/README.md) | a thin edge just inside the part's rounded outline, darkest at the very edge; T0, from the part's shape alone. The `glass` pane style puts it in front of a window without the keyboard, faded in and out with the focus by its rule's `fade` |

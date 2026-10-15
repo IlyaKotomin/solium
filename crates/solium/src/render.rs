@@ -22,7 +22,7 @@ use smithay::{
             surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
             utils::{CropRenderElement, RescaleRenderElement},
         },
-        gles::{GlesRenderer, GlesTexture},
+        gles::{GlesRenderer, GlesTexProgram, GlesTexture},
         utils::CommitCounter,
     },
     desktop::{LayerSurface, PopupManager, Window, layer_map_for_output},
@@ -33,13 +33,20 @@ use smithay::{
 };
 
 use crate::{
+    effect::{
+        mask::{Mask, RegionSource as _},
+        plan::{PaneSlot, Slots},
+        rules::{MaskKind, Slot},
+    },
     layer,
+    offscreen::PartSource,
     pane::Pane,
     present,
     stack::{Band, Owner},
     state::Solium,
     style::Depth,
 };
+use solium_effects::fragment::Corners;
 
 render_elements! {
     /// Everything Solium can draw.
@@ -94,6 +101,16 @@ render_elements! {
     /// rectangle, so it stops where the client's corners do (#233). See
     /// [`background_strips`] and `crate::clip::ClippedSolid`.
     ClippedSolid = crate::clip::ClippedSolid,
+    /// An effect's result in its slot, cut by its part's mask. See
+    /// `crate::effect::element`.
+    Effect = crate::effect::element::EffectElement,
+    /// A slot's backdrop drawn beneath a warped pane through its mesh, each
+    /// fragment reading it where it is on the monitor (Ruling F37). See
+    /// `crate::effect::beneath`.
+    Beneath = crate::effect::beneath::Beneath,
+    /// The hole a warped pane's capture keeps where a slot is drawn beneath
+    /// the warp. See `crate::effect::beneath`.
+    Hole = crate::effect::beneath::Hole,
 }
 
 /// The two questions that together mean "will a later frame differ from this
@@ -249,20 +266,53 @@ impl Drawn {
 /// also keeps the part of the pane's unit square they cover
 /// (`offscreen::over_job`).
 ///
-/// Built in two phases: every capture's element list first, which can run Qt,
-/// then every capture drawn on one bound carrier, which must not
-/// (`offscreen::draw`).
+/// Built in phases ([`effect_phases`]): in each, every capture's element list
+/// first, which can run Qt, then every capture drawn on one bound carrier,
+/// which must not (`offscreen::draw`); the warps last, once the chains whose
+/// results their captures hold have run
+/// (`tests::prepare_compiles_first_and_builds_the_warps_after_the_chains`).
 #[derive(Default)]
 pub(crate) struct Prepared {
-    warps: Vec<(Window, GlesTexture, crate::warp::Program, Id, CommitCounter)>,
-    overs: Vec<(
-        Window,
-        GlesTexture,
-        crate::warp::Program,
-        Id,
-        CommitCounter,
-        crate::warp::UnitRect,
-    )>,
+    warps: Vec<Warped>,
+    overs: Vec<Warped>,
+    /// Windows a refused `sol.present` geometry hides this pass
+    /// (`effects.present.failed = "hide"`): nothing of them is drawn.
+    /// `tests::a_refused_present_follows_its_failed_policy`.
+    hidden: Vec<Window>,
+    /// Every rule resolved once this pass ([`build_slots`]), so every output
+    /// and every screencopy places from the same answer.
+    pub(crate) slots: crate::effect::plan::Slots,
+    /// The first frame's gate holds this pass ([`hold_first_frame`]):
+    /// [`elements`] draws only the clear colour, on every monitor and in
+    /// every screencopy. No unit test reaches `prepare` or `elements`:
+    /// `dev/effects-check.sh xray`'s `xray-first-on`, under
+    /// `SOLIUM_WARM_INJECT=3`, finds its first three frames only the clear
+    /// colour and the fourth drawn, the plate's backdrop already blurred.
+    pub(crate) held: bool,
+    /// The pass's one instant ([`Presented::at`]), which [`elements`] walks
+    /// at, so every output and screencopy draws where the T2 places were
+    /// measured (amended 2026-10-14, live under motion and warps).
+    /// `tests::the_walk_draws_at_the_passs_instant`.
+    pub(crate) now: Option<std::time::Duration>,
+}
+
+/// One warp `prepare` made: the capture drawn through it, the program, the id
+/// and commit its element carries, the part of the pane's unit square the
+/// capture covers, and the grid a geometry effect placed over that part this
+/// pass (`None`: the part where it is, as a tilt draws it).
+/// `warp::tests::a_lua_grid_lands_where_the_rust_genie_put_it`.
+#[derive(Clone, Debug)]
+pub(crate) struct Warped {
+    window: Window,
+    texture: GlesTexture,
+    program: crate::warp::Program,
+    id: Id,
+    commit: CommitCounter,
+    part: crate::warp::UnitRect,
+    grid: Option<crate::warp::Grid>,
+    /// The slots drawn beneath it, on every monitor, in its capture's
+    /// order ([`unders`]); none for its popups' warp.
+    under: Vec<crate::effect::beneath::Under>,
 }
 
 /// What a warp's mesh is a function of, in global space, so one comparison
@@ -300,6 +350,17 @@ pub(crate) enum WarpPiece {
 
 pub(crate) const WARP_ORDER: [WarpPiece; 2] = [WarpPiece::Over, WarpPiece::Pane];
 
+impl WarpPiece {
+    /// Its place in [`WARP_ORDER`]: what a pane's per-piece state is kept
+    /// by (`effect::geometry::Meshes`).
+    fn index(self) -> usize {
+        WARP_ORDER
+            .iter()
+            .position(|piece| *piece == self)
+            .unwrap_or_default()
+    }
+}
+
 /// The part of a pane's unit square its popups cover: their rectangle,
 /// relative to the client's corner at `client_corner` in the pane, over the
 /// pane's `outer` size. `tests::the_popups_part_is_their_rectangle_over_the_pane`.
@@ -329,6 +390,279 @@ pub(crate) enum Route {
     /// The flat path, its client rounded where it is if its style says so
     /// (`tests::a_style_with_a_radius_is_drawn_inline`).
     Flat,
+    /// Nothing of it: a refused `sol.present` geometry under
+    /// `failed = "hide"`, no capture job, no warp, no element
+    /// (`tests::a_refused_present_follows_its_failed_policy`).
+    Hidden,
+}
+
+/// Where a pane presented through a geometry goes: the warp, unless its mesh
+/// was refused (or its folder is missing), when it follows its `failed`,
+/// `effects.present.failed` or the deform's own: `Flat`, the window
+/// undeformed, or `Hidden`. `tests::a_refused_present_follows_its_failed_policy`.
+pub(crate) fn present_route(geometry: present::Geometry, refused: bool) -> Route {
+    use crate::effect::settings::PresentFailed;
+    match (refused, geometry.failed) {
+        (false, _) => Route::Warp,
+        (true, PresentFailed::Flat) => Route::Flat,
+        (true, PresentFailed::Hide) => Route::Hidden,
+    }
+}
+
+/// The version a pane's present geometry draws from: the one its id names
+/// while it runs, else, under `on_reload = "keep"`, the one the present
+/// pinned; `None` once its folder was reloaded under `"flat"`, which draws
+/// the window flat for the rest of the transform, as an anchor that
+/// resolves to nothing does.
+/// `state::tests::real_client::a_reload_mid_present_follows_on_reload`.
+#[cfg(test)]
+pub(crate) fn present_source(
+    state: &Solium,
+    pane: crate::pane::PaneId,
+) -> Option<std::rc::Rc<crate::effect::host::Loaded>> {
+    let outer = state.pane_outer_of(pane)?;
+    let geometry = state.drawn(pane, outer).deform?.effect;
+    source_of(state, pane, geometry)
+}
+
+/// [`present_source`], for a geometry already in hand.
+fn source_of(
+    state: &Solium,
+    pane: crate::pane::PaneId,
+    geometry: present::Geometry,
+) -> Option<std::rc::Rc<crate::effect::host::Loaded>> {
+    use crate::effect::settings::PresentReload;
+    state.effects.by_id(geometry.effect).or_else(|| {
+        (geometry.on_reload == PresentReload::Keep)
+            .then(|| state.panes.get(pane)?.meshes().pinned.clone())
+            .flatten()
+    })
+}
+
+/// What `prepare` does with a pane this pass, before anything is captured.
+/// `state::tests::real_client::a_present_deform_is_a_file`.
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one a pane a pass, matched at once and never stored"
+)]
+pub(crate) enum Planned {
+    /// Nothing of it: a refused present geometry under `failed = "hide"`.
+    Hidden,
+    /// The flat path: not warped, or a present geometry that is refused, or
+    /// whose folder was reloaded, on a frame with no matrix.
+    Flat,
+    /// Warped: its frame, what its deform is aimed at, and the grid a
+    /// present geometry placed (`None` for a tilt alone, or a refused
+    /// geometry on a tilted frame, drawn undeformed).
+    Warp {
+        frame: present::Frame,
+        aimed: Option<present::Aimed>,
+        grid: Option<crate::warp::Grid>,
+    },
+}
+
+/// [`warp_of`], and a present geometry's grid built once a pass: refused,
+/// the window follows its `failed` (undeformed, as an unresolved anchor is,
+/// still tilted if it is; or nothing of it), and with its folder reloaded
+/// under `on_reload = "flat"` it is undeformed. Asked with no renderer.
+/// `tests::a_refused_present_follows_its_failed_policy`,
+/// `state::tests::real_client::a_present_deform_is_a_file`,
+/// `state::tests::real_client::effects_present_is_the_default_a_deform_overrides`.
+pub(crate) fn plan_warp(
+    state: &mut Solium,
+    pane: crate::pane::PaneId,
+    outer: Rectangle<i32, Logical>,
+    scale: f64,
+    now: std::time::Duration,
+) -> Planned {
+    let Some((frame, aimed)) = warp_of(state, pane, outer, now) else {
+        return Planned::Flat;
+    };
+    let Some(aimed) = aimed else {
+        return Planned::Warp {
+            frame,
+            aimed: None,
+            grid: None,
+        };
+    };
+    let gridded = present_grid(
+        state,
+        pane,
+        &frame,
+        aimed,
+        (WarpPiece::Pane, crate::warp::UnitRect::WHOLE),
+        scale,
+    );
+    let route = match gridded {
+        Gridded::Grid(grid) => {
+            return Planned::Warp {
+                frame,
+                aimed: Some(aimed),
+                grid: Some(grid),
+            };
+        }
+        Gridded::Refused => present_route(aimed.effect, true),
+        Gridded::Undeformed => Route::Flat,
+    };
+    match route {
+        Route::Hidden => Planned::Hidden,
+        _ if frame.matrix.is_identity() => Planned::Flat,
+        _ => Planned::Warp {
+            frame,
+            aimed: None,
+            grid: None,
+        },
+    }
+}
+
+/// What a present geometry's grid came to this pass.
+#[derive(Debug)]
+enum Gridded {
+    /// Its grid, over the part asked for.
+    Grid(crate::warp::Grid),
+    /// No source: its folder was reloaded mid-flight under `on_reload =
+    /// "flat"`. The window undeformed.
+    Undeformed,
+    /// Refused, or its folder missing: what its `failed` says.
+    Refused,
+}
+
+/// A present geometry's grid for a piece of the pane over its `part`, built
+/// once a pass (not once per output) in global logical pixels through the
+/// effect's `mesh`, and kept on the pane while nothing it depends on moves
+/// (`effect::geometry::tests::a_mesh_is_not_rebuilt_when_neither_progress_nor_an_anchor_changed`).
+/// A refusal is logged once a piece and counted in the trace each pass
+/// (`state::tests::real_client::a_present_refused_for_its_popups_alone_is_said_once`). In a debug build,
+/// when `SOLIUM_GEOMETRY_ORACLE` names the effect, the grid is the Rust
+/// genie's instead, the oracle `dev/effects-check.sh genie` compares the
+/// folder with; a release build has neither the branch nor the oracle.
+fn present_grid(
+    state: &mut Solium,
+    pane: crate::pane::PaneId,
+    frame: &present::Frame,
+    aimed: present::Aimed,
+    (piece, part): (WarpPiece, crate::warp::UnitRect),
+    scale: f64,
+) -> Gridded {
+    use crate::effect::geometry::{Ask, MeshKey, mesh, turned, unpacked};
+    let geometry = aimed.effect;
+    if geometry.effect == crate::effect::host::EffectId::NONE {
+        return Gridded::Refused;
+    }
+    let Some(loaded) = source_of(state, pane, geometry) else {
+        return Gridded::Undeformed;
+    };
+    let (from, to) = (
+        present::for_effects(frame.rect),
+        present::for_effects(aimed.to),
+    );
+    #[cfg(debug_assertions)]
+    if crate::dev::geometry_oracle().as_deref() == Some(loaded.name()) {
+        let spread = unpacked(loaded.defaults(), &geometry.params)
+            .into_iter()
+            .find_map(|(name, value)| match (name.as_str(), value) {
+                ("spread", solium_effects::spec::Value::Number(spread)) => Some(spread),
+                _ => None,
+            })
+            .unwrap_or(1.0);
+        #[expect(clippy::cast_possible_truncation, reason = "the Rust genie's own f32s")]
+        let deform = solium_effects::Deform::Genie {
+            progress: geometry.progress as f32,
+            spread: spread as f32,
+            axis: geometry.axis,
+        };
+        return Gridded::Grid(crate::warp::oracle_grid(frame.rect, aimed.to, deform, part));
+    }
+    let monitor = state
+        .pane_outer_of(pane)
+        .and_then(|slot| state.output_of(slot))
+        .and_then(|output| state.space.output_geometry(&output))
+        .map_or(from, |area| present::for_effects(area.to_f64()));
+    let (cols, rows) = turned(
+        loaded
+            .spec()
+            .grid
+            .unwrap_or(solium_effects::spec::GridSpec::Fixed { cols: 1, rows: 1 }),
+        geometry.axis,
+    );
+    // A `sol.present` geometry measures how far the window is pulled into
+    // its target: a leaving's progress, so `t.direction` is -1.
+    let ask = Ask {
+        progress: geometry.progress,
+        clamped: geometry.progress.clamp(0.0, 1.0),
+        direction: -1.0,
+        axis: geometry.axis,
+        from,
+        to: Some(to),
+        part,
+        seed: geometry.seed,
+        monitor,
+        scale,
+        params: &[],
+    };
+    let key = MeshKey::new(geometry.effect, geometry.params, &ask, cols, rows);
+    let Some(held) = state.panes.get_mut(pane) else {
+        return Gridded::Undeformed;
+    };
+    let meshes = held.meshes_mut();
+    let built = meshes
+        .get_or_build(key, || {
+            let params = unpacked(loaded.defaults(), &geometry.params);
+            let ask = Ask {
+                params: &params,
+                ..ask
+            };
+            mesh(loaded.sandbox(), &ask, cols, rows).map(|points| crate::warp::Grid {
+                cols,
+                rows,
+                part,
+                points,
+            })
+        })
+        .cloned();
+    match built {
+        Ok(grid) => {
+            meshes.built(piece.index());
+            Gridded::Grid(grid)
+        }
+        Err(refusal) => {
+            crate::pacing::mesh_refused();
+            if meshes.say_refused(piece.index()) {
+                tracing::warn!(
+                    effect = loaded.name(),
+                    ?refusal,
+                    "a present's mesh was refused; the window is drawn by its `failed`"
+                );
+            }
+            Gridded::Refused
+        }
+    }
+}
+
+/// What a warped pane's popups are drawn through under a present geometry:
+/// their own grid, over their `part`; refused, what the geometry's `failed`
+/// says, the identity grid of their part (`Some(None)`, drawn undeformed)
+/// under `"flat"` and nothing of them (`None`) under `"hide"`; and drawn
+/// undeformed once the folder was reloaded under `on_reload = "flat"`, as
+/// the pane is.
+/// `state::tests::real_client::a_present_refused_for_its_popups_alone_is_said_once`.
+pub(crate) fn over_grid(
+    state: &mut Solium,
+    pane: crate::pane::PaneId,
+    frame: &present::Frame,
+    aimed: present::Aimed,
+    part: crate::warp::UnitRect,
+    scale: f64,
+) -> Option<Option<crate::warp::Grid>> {
+    match present_grid(state, pane, frame, aimed, (WarpPiece::Over, part), scale) {
+        Gridded::Grid(grid) => Some(Some(grid)),
+        Gridded::Undeformed => Some(None),
+        Gridded::Refused => match present_route(aimed.effect, true) {
+            Route::Hidden => None,
+            _ => Some(None),
+        },
+    }
 }
 
 /// Warp a pane only when it is deformed **and** there is a program to warp it
@@ -342,42 +676,154 @@ pub(crate) fn route(warped: bool, program: bool) -> Route {
     }
 }
 
+/// `prepare`'s warp condition for a pane drawn over `outer`: the frame it is
+/// drawn with this pass and what its deform is aimed at, when its matrix is
+/// not the identity or its deform is aimed at something; `None` when it is
+/// drawn flat, which with no effects is every window at rest, a fullscreen
+/// one included (Ruling 24).
+///
+/// The anchor is resolved here, and not merely tested for presence: a deform
+/// aimed at a pane that has closed draws flat, and capturing a texture for it
+/// would be a megabyte a frame spent on a warp that `elements` has already
+/// decided not to do. At `now`, the pass's one instant ([`plan_warps`]).
+/// `state::tests::real_client::a_fullscreen_window_with_no_rule_takes_todays_path`.
+pub(crate) fn warp_of(
+    state: &Solium,
+    pane: crate::pane::PaneId,
+    outer: Rectangle<i32, Logical>,
+    now: std::time::Duration,
+) -> Option<(present::Frame, Option<present::Aimed>)> {
+    let frame = state.drawn_id_at(pane, outer, now);
+    let aimed = state.aimed_at_for(pane, frame.deform);
+    (!frame.matrix.is_identity() || aimed.is_some()).then_some((frame, aimed))
+}
+
+/// Whether `prepare` warps a pane this pass, asked with no renderer: its
+/// client's outer rectangle, as `prepare` finds it, through [`warp_of`].
+/// `state::tests::real_client::a_fullscreen_window_with_no_rule_takes_todays_path`.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "prepare asks warp_of with the rectangle it has")
+)]
+pub(crate) fn wants_warp(state: &Solium, pane: crate::pane::PaneId) -> bool {
+    state
+        .panes
+        .get(pane)
+        .and_then(crate::pane::Pane::client)
+        .and_then(|window| state.outer_geometry(window))
+        .is_some_and(|outer| warp_of(state, pane, outer, state.clock.now()).is_some())
+}
+
+/// The pass's warp plans, one per pane on screen and shown, made once in
+/// `resolve` before `record_boxes` ([`plan_warps`]), so a warped pane's
+/// behind slots are placed on the mesh it is drawn through this pass; the
+/// `warps` phase takes each one instead of planning again (Ruling F31,
+/// amended 2026-10-14, live under motion and warps).
+/// `state::tests::real_client::a_warped_panes_behind_slot_is_drawn_beneath_its_warp`.
+#[derive(Debug, Default)]
+pub(crate) struct Presented {
+    planned: std::collections::HashMap<crate::pane::PaneId, Planned>,
+    /// The pass's one instant, read once at the top of [`plan_warps`]: what
+    /// the warps, the T2 places and the walk are all measured at (amended
+    /// 2026-10-14, live under motion and warps).
+    /// `state::tests::real_client::a_gliding_windows_t2_place_is_measured_at_the_passs_instant`.
+    at: Option<std::time::Duration>,
+}
+
+impl Presented {
+    /// `state::tests::real_client::a_warped_panes_behind_slot_is_drawn_beneath_its_warp`.
+    pub(crate) fn get(&self, pane: crate::pane::PaneId) -> Option<&Planned> {
+        self.planned.get(&pane)
+    }
+
+    /// The plan the `warps` phase draws: taken, made once a pass.
+    pub(crate) fn take(&mut self, pane: crate::pane::PaneId) -> Option<Planned> {
+        self.planned.remove(&pane)
+    }
+
+    /// `state::tests::real_client::a_gliding_windows_t2_place_is_measured_at_the_passs_instant`.
+    pub(crate) fn at(&self) -> Option<std::time::Duration> {
+        self.at
+    }
+}
+
+/// The instant this pass is measured at: the one [`plan_warps`] read, or
+/// the clock for a caller before any pass (a test calling a phase alone).
+pub(crate) fn pass_now(state: &Solium) -> std::time::Duration {
+    state.presented.at().unwrap_or_else(|| state.clock.now())
+}
+
+/// The instant the walk draws at: the pass's, when `prepare` made the
+/// `Prepared` it is handed, else the clock.
+/// `tests::the_walk_draws_at_the_passs_instant`.
+pub(crate) fn walk_instant(
+    pass: Option<std::time::Duration>,
+    clock: std::time::Duration,
+) -> std::time::Duration {
+    pass.unwrap_or(clock)
+}
+
+/// Plan every warp of the pass, as `warps` planned them: the same panes
+/// (on screen, with a client and an outer rectangle, `shown`), the same
+/// rectangle and scale, the same `plan_warp`, once each, all at the one
+/// instant read here. A refusal is still said once and counted once a pass
+/// (`state::tests::real_client::a_present_refused_for_its_popups_alone_is_said_once`).
+/// `state::tests::real_client::a_warped_panes_behind_slot_is_drawn_beneath_its_warp`,
+/// `state::tests::real_client::a_gliding_windows_t2_place_is_measured_at_the_passs_instant`.
+pub(crate) fn plan_warps(state: &mut Solium) {
+    let now = state.clock.now();
+    let mut planned = std::collections::HashMap::new();
+    for (pane, window) in state.on_screen() {
+        let Some(window) = window else { continue };
+        let Some(outer) = state.outer_geometry(&window) else {
+            continue;
+        };
+        if !shown(state, pane) {
+            continue;
+        }
+        let scale = state.scale_of(outer);
+        planned.insert(pane, plan_warp(state, pane, outer, scale, now));
+    }
+    state.presented = Presented {
+        planned,
+        at: Some(now),
+    };
+}
+
 impl Prepared {
-    /// Lend the texture captured for `window`, the program to draw it
-    /// through, and the id and commit its warp carries, if there is one.
+    /// Lend the warp captured for `window`: the texture to draw through it,
+    /// the program, the id and commit it carries, and its grid.
     ///
     /// Lent rather than taken: with more than one monitor `elements` runs once
     /// per output, and a texture removed by the first one would leave a
     /// deformed window undrawn on every other screen. `GlesTexture` is a
     /// handle, so the clone is a refcount, and the program is GL names.
-    fn warp(
-        &self,
-        window: &Window,
-    ) -> Option<(GlesTexture, crate::warp::Program, Id, CommitCounter)> {
-        self.warps.iter().find(|(each, ..)| each == window).map(
-            |(_, texture, program, id, commit)| (texture.clone(), *program, id.clone(), *commit),
-        )
+    fn warp(&self, window: &Window) -> Option<&Warped> {
+        self.warps.iter().find(|each| each.window == *window)
     }
 
     /// Lend the capture of `window`'s popups, for the warp drawn in front of
     /// its own, with the part of the pane's unit square it covers. Lent for
     /// `warp`'s reason. `None` when it has no popups open.
     /// `dev/present-check.sh`'s `menu` case draws it.
-    fn over(
-        &self,
-        window: &Window,
-    ) -> Option<(
-        GlesTexture,
-        crate::warp::Program,
-        Id,
-        CommitCounter,
-        crate::warp::UnitRect,
-    )> {
-        self.overs.iter().find(|(each, ..)| each == window).map(
-            |(_, texture, program, id, commit, part)| {
-                (texture.clone(), *program, id.clone(), *commit, *part)
-            },
-        )
+    fn over(&self, window: &Window) -> Option<&Warped> {
+        self.overs.iter().find(|each| each.window == *window)
+    }
+
+    /// Whether nothing of `window` is drawn this pass: a refused present
+    /// geometry under `failed = "hide"`.
+    /// `tests::a_refused_present_follows_its_failed_policy`.
+    fn hidden(&self, window: &Window) -> bool {
+        self.hidden.contains(window)
+    }
+}
+
+/// The probe's answer: set on the host, and a rebind after the frame when it
+/// changed what was known, since rules bound before it kept every rung
+/// (Ruling 11). `state::tests::the_formats_probe_rebinds_the_rules_after_the_frame`.
+pub(crate) fn note_formats(state: &mut Solium, found: crate::pool::Formats) {
+    if state.effects.set_formats(found) {
+        state.rebind = true;
     }
 }
 
@@ -387,13 +833,15 @@ impl Prepared {
 /// (`tests::a_style_with_a_radius_is_drawn_inline`).
 ///
 /// Must run before the backend binds its own buffer; see [`Prepared`].
-/// Note on the clock: this walk calls [`Solium::drawn`], which samples the
-/// clock per pane — the very thing that function's own doc now tells a
-/// multi-pane caller not to do. It is left as it was, deliberately: `prepare`
-/// decides what to **capture**, and a capture is keyed on a window and a size,
-/// neither of which a few microseconds of skew can change. `elements` was the
-/// caller where the skew was visible, and that is the one that was fixed. A
-/// drive-by change here would be churn.
+/// Note on the clock: the pass reads it **once**, at the top of `resolve`
+/// ([`plan_warps`]), and everything of the pass is measured at that instant:
+/// the warps' plans, the T2 places ([`measured`]) and the walk, which
+/// `elements` makes at [`Prepared::now`] however much later it runs
+/// (amended 2026-10-14, live under motion and warps). A T2 place measured
+/// at one instant and walked at another would leave a gliding window's
+/// backdrop behind it by its speed times `prepare`'s own time.
+/// `state::tests::real_client::a_gliding_windows_t2_place_is_measured_at_the_passs_instant`,
+/// `tests::the_walk_draws_at_the_passs_instant`.
 pub(crate) fn prepare(state: &mut Solium, renderer: &mut GlesRenderer) -> Prepared {
     // Everything here is the compositor's own work, ahead of any output, apart
     // from the tick below — which is entirely Qt's and is measured separately
@@ -437,183 +885,689 @@ pub(crate) fn prepare(state: &mut Solium, renderer: &mut GlesRenderer) -> Prepar
         .unwrap_or(0);
     state.pool.set_budget(2 * largest);
 
-    let mut warps = Vec::new();
-    let mut overs = Vec::new();
-    let mut jobs = Vec::new();
+    // The effects and the captures, in the one order that lets a warped
+    // pane's capture hold its slots' results (Ruling 17):
+    // `tests::prepare_compiles_first_and_builds_the_warps_after_the_chains`.
+    let mut gpu = Gpu {
+        state,
+        renderer,
+        drawn: crate::effect::store::Drawn::default(),
+        warps: Vec::new(),
+        overs: Vec::new(),
+        hidden: Vec::new(),
+        pass: 0,
+    };
+    let slots = effect_phases(&mut gpu);
+    let Gpu {
+        state,
+        warps,
+        overs,
+        hidden,
+        ..
+    } = gpu;
+    // Once a pass, after the sweep, whatever the number of monitors: the
+    // effects compiled, the scenes rendered and the cuts built above, so
+    // what the gate waits for is this pass's answer.
+    let held = hold_first_frame(state);
+    Prepared {
+        warps,
+        overs,
+        hidden,
+        slots,
+        held,
+        now: state.presented.at(),
+    }
+}
 
-    for (pane, window) in state.on_screen() {
-        // Nothing captured means nothing to keep. A pane holds the targets it
-        // was last captured into between frames -- megabytes of them -- and
-        // there is no later frame on which handing them back gets cheaper, so
-        // an overview that warps twenty windows and is then closed would
-        // otherwise leave twenty behind for the session. See
-        // `keyed::Captures`, and
-        // `keyed::tests::a_pane_that_stops_warping_gives_the_texture_back`.
-        let release = |state: &mut Solium| crate::offscreen::release(state, pane);
-        let Some(window) = window else {
-            release(state);
-            continue;
-        };
-        let Some(outer) = state.outer_geometry(&window) else {
-            release(state);
-            continue;
-        };
-        // A rounded client's programs, compiled here, between frames, so the
-        // first frame that draws it has them: `elements` never compiles
-        // (`clipped`). Before the cull and the guard below, where a rounded
-        // pane now stops, wanting no capture
-        // (`tests::a_pane_neither_warped_nor_styled_wants_no_capture`); the
-        // rounded shot of `dev/pacing-nested.sh` draws through them.
-        if declared_rounding(state, pane).is_some() {
-            let _ = state.programs.clip(renderer);
+/// The first desktop frame's gate (`warm::Warm`, spec C14), asked once a
+/// pass at the end of `prepare`: `true` while [`elements`] draws only the
+/// clear colour. A held pass asks for the next one, since a frame of the
+/// clear colour damaged nothing and nothing else may come along to draw
+/// the frame that releases it; what is still not ready when `max_ms` lets
+/// the frame through is named in the log (`warm::Warm::capped`).
+/// `state::tests::real_client::a_held_first_frame_asks_for_the_next_pass`,
+/// `warm::tests::the_hold_is_capped_at_max_ms`.
+pub(crate) fn hold_first_frame(state: &mut Solium) -> bool {
+    let ready = state.first_frame_ready();
+    let released = state.warm.released();
+    let held = state.warm.holding(state.clock.now(), ready);
+    if held {
+        state.redraw = true;
+    } else if !released && state.warm.capped() {
+        tracing::warn!(
+            compiling = !state.effects.ready(),
+            xray = !state.xrays.ready(),
+            "warm-up: the first frame drawn at startup.first_frame.max_ms, the effects still not ready"
+        );
+    }
+    held
+}
+
+/// `prepare`'s effect phases, so their order is one function a test drives
+/// (`tests::prepare_compiles_first_and_builds_the_warps_after_the_chains`).
+pub(crate) trait Phases {
+    /// Compile what the host was asked for, probe the formats, compile
+    /// `Programs::masked` when an effect is wanted (Ruling 7, spec C14).
+    fn compile(&mut self);
+    /// Plan the pass's warps at its one instant ([`plan_warps`]), resolve
+    /// the slots once this pass ([`build_slots`] over the panes a monitor
+    /// shows), record their boxes and T2 places ([`record_boxes`], on the
+    /// warps' meshes), and want each T2 place's cut and memos ([`want_t2`]).
+    fn resolve(&mut self) -> Slots;
+    /// Render every hosted scene instance this pass needs as pixels before
+    /// `elements`, at the size and scale `elements` will ask for, so
+    /// `elements` draws the cached picture ([`scenes_needed`], Ruling F31).
+    fn scenes(&mut self, slots: &Slots);
+    /// Build each wanted xray cut, a capture kept unless what it is drawn
+    /// from differs, then run each wanted memo prefix over a cut redrawn
+    /// since it last ran ([`memos_to_run`], [`run_xray`]; Ruling F31).
+    fn xray(&mut self, slots: &Slots);
+    /// Build and draw one nest's self captures; a capture that is not stale
+    /// is kept. Both go into the pass's `Drawn`.
+    fn captures(&mut self, slots: &Slots, nest: Nest);
+    /// Run one nest's chains on one bound carrier ([`run_slots`]).
+    fn chains(&mut self, slots: &mut Slots, nest: Nest);
+    /// Build the warp and `over` jobs from `slots` as they are now, draw
+    /// them, and place what they made in `Prepared`.
+    fn warps(&mut self, slots: &Slots);
+    /// The store's sweep and the pool's, once a pass.
+    fn sweep(&mut self);
+}
+
+/// `prepare`'s order (Ruling 17): the warp and `over` jobs are built only
+/// once every chain that can put a result in them has run this pass, and a
+/// whole pane's self capture only once the chains inside it have. The
+/// scenes a cut holds and the cuts and memos themselves come after
+/// `resolve` and before any capture or chain (Ruling F31), since a T2
+/// suffix in the inner nest reads them.
+/// `tests::prepare_compiles_first_and_builds_the_warps_after_the_chains`,
+/// `tests::prepare_renders_scenes_then_xray_before_the_chains`.
+pub(crate) fn effect_phases(phases: &mut impl Phases) -> Slots {
+    phases.compile();
+    let mut slots = phases.resolve();
+    phases.scenes(&slots);
+    phases.xray(&slots);
+    for nest in [Nest::Inner, Nest::Whole] {
+        phases.captures(&slots, nest);
+        phases.chains(&mut slots, nest);
+    }
+    phases.warps(&slots);
+    phases.sweep();
+    slots
+}
+
+/// [`Phases`] on the GPU: `prepare`'s own work, after the memory report,
+/// the QML tick and the pool's budget, driven in the order
+/// `tests::prepare_compiles_first_and_builds_the_warps_after_the_chains`
+/// pins. What the passes make is gathered here for `Prepared`.
+struct Gpu<'a> {
+    state: &'a mut Solium,
+    renderer: &'a mut GlesRenderer,
+    /// Each self input this pass, kept or drawn: what the chains read
+    /// (`effect::store::tests::drawn_tells_an_input_redrawn_this_pass_from_one_kept`).
+    drawn: crate::effect::store::Drawn,
+    warps: Vec<Warped>,
+    overs: Vec<Warped>,
+    hidden: Vec<Window>,
+    /// The store's pass, set by `resolve`.
+    pass: u64,
+}
+
+impl std::fmt::Debug for Gpu<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Gpu")
+            .field("warps", &self.warps.len())
+            .field("overs", &self.overs.len())
+            .field("hidden", &self.hidden.len())
+            .field("pass", &self.pass)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Phases for Gpu<'_> {
+    fn compile(&mut self) {
+        let (state, renderer) = (&mut *self.state, &mut *self.renderer);
+        // Effects compile here, between frames, where the context is current:
+        // nothing at all when no effect is wanted (spec §8.4,
+        // `effect::host::tests::an_empty_host_touches_no_gl`). The formats a
+        // plan may draw into are probed first, once, and only once something is
+        // wanted (`effect::host::tests::the_formats_are_probed_once_and_only_while_something_is_wanted`;
+        // the probe itself is wirecheck case 12c's). A changed answer rebinds
+        // the rules after the frame (`note_formats`).
+        if state.effects.is_idle() {
+            return;
         }
-        // **A pane no monitor shows is not captured**, and this is the same
-        // question `elements` asks one screen at a time before it draws
-        // anything: `!global.overlaps(screen)`, the containment rule that
-        // makes a workspace switch work. A hidden workspace is not unmapped,
-        // it is *parked a screen away*, so without this every window on every
-        // workspace is captured on every frame for as long as the session
-        // lasts -- and `release` below never fires either, because the capture
-        // keeps succeeding.
-        //
-        // It was survivable while a capture meant a warp: a window is deformed
-        // for the length of an animation and then stops. A `client.radius` is
-        // permanent, so twelve windows across three workspaces became twelve
-        // full-window offscreen renders a frame and ~47 MB of captures held
-        // for the session, a third of it for windows nothing ever draws.
-        //
-        // **The slot, through the same `pane_outer_of` call `elements` makes,
-        // and not the `outer` above.** They differ in exactly two places and
-        // the slot is the safer of the two in both: `pane_geometry` falls back
-        // to the layout's rectangle for a window that has mapped without a
-        // size yet -- where `outer_geometry` is a zero-size rect that overlaps
-        // nothing and would be culled while `elements` went on to draw it --
-        // and `insets_of` grows by the decoration's insets where
-        // `frame_insets` gives an undecorated window none. So the question is
-        // asked of the rectangle `elements` will ask it of.
-        //
-        // Being wrong in that direction is *not* a blank window: a pane with
-        // no capture is drawn from its surfaces by the flat path, rounded or
-        // not, so a wrongly culled warp is a FLAT window for one frame. Worth
-        // knowing, because it sets how hard to lean -- the failure is cosmetic
-        // and self-correcting, while being wrong the other way is a capture
-        // per window per frame for the life of the session.
-        //
-        // Costed honestly: `pane_outer_of` is two linear `Panes::get` scans
-        // (one through `insets_of`) plus an `element_location`, so this is
-        // O(panes) per pane per frame, not the single `overlaps` it reads as.
-        // About three hundred comparisons at twelve panes -- nothing beside an
-        // offscreen render, and the reason the cheap case stays cheap is that
-        // `on_screen` is short, not that this line is.
-        if !state
-            .pane_outer_of(pane)
-            .is_some_and(|slot| state.on_any_output(slot))
-        {
-            release(state);
-            continue;
+        if state.effects.wants_formats() {
+            let found = crate::pool::probe_formats(renderer);
+            note_formats(state, found);
         }
-        // The anchor is resolved here, and not merely tested for presence: a
-        // deform aimed at a pane that has closed draws flat, and capturing a
-        // texture for it would be a megabyte a frame spent on a warp that
-        // `elements` has already decided not to do.
-        let frame = state.drawn(pane, outer);
-        // At *its own monitor's* scale. One frame can span monitors at
-        // different scales, and a texture taken at 1x and drawn on a 2x screen
-        // is the blur this whole change exists to remove.
-        //
-        // A deformed window with no warp program takes the flat path below
-        // instead of being captured for a warp that cannot be drawn:
-        // `tests::a_window_whose_warp_has_no_program_is_drawn_flat`.
-        let aimed = state.aimed_at_for(pane, frame.deform);
-        let warped = !frame.matrix.is_identity() || aimed.is_some();
-        let program = if warped {
-            state.programs.warp(renderer)
-        } else {
-            None
-        };
-        let routed = route(warped, program.is_some());
-        // A pane that is not warped builds no job, rounded or not (spec §8.4).
-        // `tests::a_pane_neither_warped_nor_styled_wants_no_capture`.
-        if wanted_capture(routed).is_none() {
-            // Said out loud rather than skipped. Not drawing `Inputs::Backdrop`
-            // is right -- there is nothing composited beneath a node for this
-            // renderer to sample -- but a blur that silently renders as no
-            // blur looks like a style that failed to load and is never
-            // reported as a compositor bug. See `fragment::Inputs::Backdrop`,
-            // and
-            // `pass::tests::an_effect_that_cannot_be_run_is_named_once_and_not_every_frame`.
-            if let Some(refused) = crate::pass::refused(&declared_effects(state, pane)) {
-                state.programs.refuse(refused);
+        state
+            .effects
+            .compile_pending(&mut crate::effect::GlCompiler(renderer));
+        // What a slot's result is drawn through, compiled here, between
+        // frames, while an effect is wanted, since `elements` never compiles;
+        // nothing with none (spec §8.4,
+        // `effect::host::tests::an_empty_host_touches_no_gl`).
+        let _ = state.programs.masked(renderer);
+        // And what a warped pane and a slot beneath its warp are drawn with,
+        // so a slot is never placed beneath a warp that cannot be drawn
+        // (`measured` reads their refusals; Ruling F37).
+        let _ = state.programs.warp(renderer);
+        let _ = state.programs.beneath(renderer);
+    }
+
+    fn resolve(&mut self) -> Slots {
+        let state = &mut *self.state;
+        // The pass's warps, planned once at its one instant, first: a warped
+        // pane's behind slot is placed on the mesh it is drawn through this
+        // pass (Ruling F31, amended 2026-10-14). With no effects it is the
+        // plan `warps` made before, made earlier.
+        // `state::tests::real_client::a_warped_panes_behind_slot_is_drawn_beneath_its_warp`.
+        plan_warps(state);
+        // Every rule resolved once, after the effects compiled and before any
+        // job is built; nothing, and no fact gathered, with no rules (spec §8.4,
+        // `state::tests::real_client::with_no_rules_no_slot_is_wanted_and_no_fact_is_gathered`).
+        let mut slots = build_slots(state);
+        // Every wanted slot's box, and its state in the store, kept while it is
+        // wanted and given back by the sweep once it is not
+        // (`effect::store::tests::a_slot_no_rule_wanted_this_pass_is_dropped`).
+        record_boxes(state, &mut slots);
+        self.pass = state.store.next_pass();
+        for (owner, slot, key) in slots.wants() {
+            state.store.slot_mut(owner, slot, key).seen = self.pass;
+        }
+        // Each T2 place's cut and memos wanted, the rest not, so a cut or a
+        // memo nobody reads this pass is neither built nor run
+        // (`state::tests::real_client::xray_is_wanted_only_on_a_monitor_a_t2_slot_reads`).
+        want_t2(state, &mut slots, self.pass);
+        slots
+    }
+
+    fn scenes(&mut self, _slots: &Slots) {
+        let (state, renderer) = (&mut *self.state, &mut *self.renderer);
+        // Nothing with no cut wanted, which is every pass with no T2 slot
+        // (spec §8.4): `tests::the_scenes_phase_renders_only_what_a_wanted_cut_holds`.
+        let needed = scenes_needed(state);
+        if needed.is_empty() {
+            return;
+        }
+        let now = state.clock.now();
+        for scene in needed {
+            let SceneRef::Surface(id, monitor) = scene;
+            let Some(output) = output_named(state, &monitor) else {
+                continue;
+            };
+            let (Some(screen), Some((area, alpha))) = (
+                state.space.output_geometry(&output),
+                surface_drawn_at(state, id, &output),
+            ) else {
+                continue;
+            };
+            // As `elements` will draw it: through the same call, at the
+            // output's own scale, so its `Gpu::sample` is a hit there, and
+            // the xray's, which asks for the same picture (`surface::Raster`).
+            let scale = output.current_scale().fractional_scale();
+            let _ = scripted(
+                state,
+                renderer,
+                &output,
+                id,
+                area,
+                alpha,
+                screen,
+                now,
+                crate::surface::Raster::at(scale),
+            );
+        }
+    }
+
+    fn xray(&mut self, slots: &Slots) {
+        let (state, renderer) = (&mut *self.state, &mut *self.renderer);
+        let wanted = state.xrays.wanted();
+        // No cut wanted, no capture, no carrier (spec §8.4).
+        if wanted.is_empty() {
+            return;
+        }
+        let mut jobs = Vec::new();
+        for (monitor, cut) in wanted {
+            let Some(output) = output_named(state, &monitor) else {
+                continue;
+            };
+            let Some(job) = crate::offscreen::xray_job(
+                state,
+                renderer,
+                &output,
+                cut,
+                &crate::effect::xray::SessionLayers,
+            ) else {
+                continue;
+            };
+            // Kept while what it is drawn from is the same ([fx0] Ruling 9),
+            // never with `SOLIUM_XRAY_REBUILD=always`, the control of every
+            // count here (`dev::tests::xray_rebuild_always_is_asked_for_by_name`).
+            if !crate::dev::xray_rebuild_always() && crate::offscreen::kept(state, &job).is_some() {
+                state.xrays.drawn(&monitor, cut, false);
+            } else {
+                jobs.push((job, (monitor, cut)));
             }
-            release(state);
-            continue;
         }
-        if let (Route::Warp, Some(program)) = (routed, program) {
+        for ((monitor, cut), _texture, _id, _commit) in
+            crate::offscreen::draw(state, renderer, jobs)
+        {
+            state.xrays.drawn(&monitor, cut, true);
+            crate::pacing::xray_built();
+        }
+        // Each memo a place reads, run once over its cut when that was
+        // redrawn since it last ran
+        // (`tests::a_memo_runs_when_its_xray_was_redrawn_and_once_for_every_slot`).
+        let run = memos_to_run(&state.memos, &state.xrays, slots.memos());
+        if run.is_empty() {
+            return;
+        }
+        let pass = self.pass;
+        let Solium {
+            store,
+            pool,
+            effects,
+            chains,
+            programs,
+            timer,
+            clock,
+            memos,
+            xrays,
+            ..
+        } = &mut *state;
+        let mut cx = RunCx {
+            store,
+            effects: &*effects,
+            chains,
+            masked: programs.masked_compiled().cloned(),
+            now: clock.now().as_secs_f32(),
+            pass,
+            memos,
+            xrays: &*xrays,
+            motion: (std::time::Duration::ZERO, 0.0),
+            waited: false,
+        };
+        let _ = with_carrier(pool, renderer, |renderer, carrier, pool| {
+            let mut runner = GlRunner::new(renderer, carrier, timer.as_mut());
+            run_xray(&mut cx, pool, &mut runner, &run);
+        });
+    }
+
+    fn captures(&mut self, slots: &Slots, nest: Nest) {
+        let (state, renderer) = (&mut *self.state, &mut *self.renderer);
+        let mut jobs = Vec::new();
+        // A part's self input, padded by its chain's reach and drawn only when
+        // what it is drawn from differs (`offscreen::kept`,
+        // `state::tests::real_client::a_self_rule_captures_the_client_once_until_it_commits`).
+        // A whole pane's is built in the later nest, so it walks what the
+        // inner chains made this pass
+        // (`tests::a_whole_panes_capture_walks_its_inner_slots_and_not_its_own`).
+        // None with no slot wanted, and then no carrier is bound (spec §8.4).
+        for input in self_inputs(state, slots) {
+            if Nest::of(&input.owner, crate::effect::rules::Tier::Own) != nest {
+                continue;
+            }
+            let Some(source) = input.found.source() else {
+                continue;
+            };
+            let Some(job) = crate::offscreen::part_job(
+                state,
+                renderer,
+                input.owner.clone(),
+                input.slot,
+                source,
+                input.scale,
+                input.pad,
+                slots,
+            ) else {
+                continue;
+            };
+            match crate::offscreen::kept(state, &job) {
+                Some((texture, _id, commit)) => {
+                    self.drawn
+                        .insert(input.owner, input.slot, texture, false, commit);
+                }
+                None => jobs.push((job, (input.owner, input.slot))),
+            }
+        }
+        for ((owner, slot), texture, _id, commit) in crate::offscreen::draw(state, renderer, jobs) {
+            self.drawn.insert(owner, slot, texture, true, commit);
+        }
+    }
+
+    fn chains(&mut self, slots: &mut Slots, nest: Nest) {
+        // The chains, once their inputs are drawn or kept, on one bound
+        // carrier (Ruling 10): a self chain runs only when its part committed
+        // or its params or size changed, and is otherwise placed again as it
+        // was (`effect::store::tests::a_self_chain_runs_once_until_its_part_commits`).
+        // Nothing runs and no carrier is bound with no chain of this nest
+        // wanted (spec §8.4,
+        // `tests::a_run_phase_with_no_chain_of_its_own_binds_nothing`).
+        if !runs_in(slots, &self.state.chains, nest) {
+            return;
+        }
+        let Self {
+            state,
+            renderer,
+            drawn,
+            pass,
+            ..
+        } = self;
+        let instant = pass_now(state);
+        let motion_hz = state.effect_settings.motion_hz;
+        let Solium {
+            store,
+            pool,
+            effects,
+            chains,
+            programs,
+            timer,
+            clock,
+            memos,
+            xrays,
+            ..
+        } = &mut **state;
+        let mut cx = RunCx {
+            store,
+            effects: &*effects,
+            chains,
+            masked: programs.masked_compiled().cloned(),
+            now: clock.now().as_secs_f32(),
+            pass: *pass,
+            memos,
+            xrays: &*xrays,
+            motion: (instant, motion_hz),
+            waited: false,
+        };
+        let drawn = &*drawn;
+        let _ = with_carrier(pool, renderer, |renderer, carrier, pool| {
+            let mut runner = GlRunner::new(renderer, carrier, timer.as_mut());
+            run_slots(&mut cx, pool, &mut runner, slots, drawn, nest);
+        });
+        // A suffix that waited for its next tick is run on a later pass even
+        // if nothing else on screen asks for one:
+        // `effect::store::tests::a_moving_parts_suffix_runs_at_most_motion_hz_times_a_second`.
+        if cx.waited {
+            state.redraw = true;
+        }
+    }
+
+    fn warps(&mut self, slots: &Slots) {
+        let (state, renderer) = (&mut *self.state, &mut *self.renderer);
+        let mut jobs = Vec::new();
+        for (pane, window) in state.on_screen() {
+            // Nothing captured means nothing to keep. A pane holds the targets it
+            // was last captured into between frames -- megabytes of them -- and
+            // there is no later frame on which handing them back gets cheaper, so
+            // an overview that warps twenty windows and is then closed would
+            // otherwise leave twenty behind for the session. See
+            // `keyed::Captures`, and
+            // `keyed::tests::a_pane_that_stops_warping_gives_the_texture_back`.
+            let release = |state: &mut Solium| crate::offscreen::release(state, pane);
+            let Some(window) = window else {
+                release(state);
+                continue;
+            };
+            let Some(outer) = state.outer_geometry(&window) else {
+                release(state);
+                continue;
+            };
+            // A rounded client's programs, compiled here, between frames, so the
+            // first frame that draws it has them: `elements` never compiles
+            // (`clipped`). Before the cull and the guard below, where a rounded
+            // pane now stops, wanting no capture
+            // (`tests::a_pane_neither_warped_nor_styled_wants_no_capture`); the
+            // rounded shot of `dev/pacing-nested.sh` draws through them.
+            if declared_rounding(state, pane).is_some() {
+                let _ = state.programs.clip(renderer);
+            }
+            // **A pane no monitor shows is not captured**, and this is the same
+            // question `elements` asks one screen at a time before it draws
+            // anything: `!global.overlaps(screen)`, the containment rule that
+            // makes a workspace switch work. A hidden workspace is not unmapped,
+            // it is *parked a screen away*, so without this every window on every
+            // workspace is captured on every frame for as long as the session
+            // lasts -- and `release` below never fires either, because the capture
+            // keeps succeeding.
+            //
+            // It was survivable while a capture meant a warp: a window is deformed
+            // for the length of an animation and then stops. A `client.radius` is
+            // permanent, so twelve windows across three workspaces became twelve
+            // full-window offscreen renders a frame and ~47 MB of captures held
+            // for the session, a third of it for windows nothing ever draws.
+            //
+            // **The slot, through the same `pane_outer_of` call `elements` makes,
+            // and not the `outer` above.** They differ in exactly two places and
+            // the slot is the safer of the two in both: `pane_geometry` falls back
+            // to the layout's rectangle for a window that has mapped without a
+            // size yet -- where `outer_geometry` is a zero-size rect that overlaps
+            // nothing and would be culled while `elements` went on to draw it --
+            // and `insets_of` grows by the decoration's insets where
+            // `frame_insets` gives an undecorated window none. So the question is
+            // asked of the rectangle `elements` will ask it of.
+            //
+            // Being wrong in that direction is *not* a blank window: a pane with
+            // no capture is drawn from its surfaces by the flat path, rounded or
+            // not, so a wrongly culled warp is a FLAT window for one frame. Worth
+            // knowing, because it sets how hard to lean -- the failure is cosmetic
+            // and self-correcting, while being wrong the other way is a capture
+            // per window per frame for the life of the session.
+            //
+            // Costed honestly: `pane_outer_of` is two linear `Panes::get` scans
+            // (one through `insets_of`) plus an `element_location`, so this is
+            // O(panes) per pane per frame, not the single `overlaps` it reads as.
+            // About three hundred comparisons at twelve panes -- nothing beside an
+            // offscreen render, and the reason the cheap case stays cheap is that
+            // `on_screen` is short, not that this line is.
+            if !shown(state, pane) {
+                release(state);
+                continue;
+            }
+            // At *its own monitor's* scale. One frame can span monitors at
+            // different scales, and a texture taken at 1x and drawn on a 2x screen
+            // is the blur this whole change exists to remove.
+            //
+            // A deformed window with no warp program takes the flat path below
+            // instead of being captured for a warp that cannot be drawn:
+            // `tests::a_window_whose_warp_has_no_program_is_drawn_flat`.
             let scale = state.scale_of(outer);
-            // What its mesh is drawn from, in global space: the warp's commit
-            // moves when this does, as well as when its capture is redrawn.
-            // `keyed::tests::a_warp_whose_mesh_moves_inside_the_same_bounds_is_given_a_new_commit`.
-            let shape = Shape::of(&frame, aimed, scale);
-            let job = crate::offscreen::pane_job(state, renderer, pane, &window, scale);
-            // Its popups the same way, in a capture of their own that `panes`
-            // draws in front of the pane's warp
-            // (`tests::a_warped_panes_popups_are_in_front_of_it`), kept until
-            // they commit:
-            // `state::tests::real_client::a_commit_on_a_popup_makes_the_popups_capture_stale`.
-            let over = if job.is_some() {
-                crate::offscreen::over_job(state, renderer, pane, &window, scale)
+            // `resolve`'s plan, made at the pass's instant; planned here only
+            // for a caller with no `resolve` before it.
+            let now = pass_now(state);
+            let planned = match state.presented.take(pane) {
+                Some(planned) => planned,
+                None => plan_warp(state, pane, outer, scale, now),
+            };
+            let (warp, grid) = match planned {
+                Planned::Hidden => {
+                    self.hidden.push(window);
+                    release(state);
+                    continue;
+                }
+                Planned::Flat => (None, None),
+                Planned::Warp { frame, aimed, grid } => (Some((frame, aimed)), grid),
+            };
+            let program = if warp.is_some() {
+                state.programs.warp(renderer)
             } else {
                 None
             };
-            // Holding only what it captures this pass: popups that closed give
-            // their capture back while the pane goes on warping.
-            // `keyed::tests::a_warped_pane_whose_popups_close_gives_their_capture_back`.
-            let kinds: &[crate::keyed::Kind] = if over.is_some() {
-                &[crate::keyed::Kind::Pane, crate::keyed::Kind::Over]
-            } else {
-                &[crate::keyed::Kind::Pane]
-            };
-            let (panes, pool) = (&mut state.panes, &mut state.pool);
-            if let Some(held) = panes.get_mut(pane) {
-                held.captures_mut().keep_only(kinds, pool);
-            }
-            if let Some(job) = job {
-                // Already drawn from exactly this: no frame (`offscreen::kept`,
-                // `state::tests::real_client::a_capture_whose_surface_tree_has_not_committed_is_not_drawn_again`).
-                if let Some((texture, id, _commit)) = crate::offscreen::kept(state, &job) {
-                    let commit = warp_commit(state, pane, crate::keyed::Kind::Pane, shape, false);
-                    warps.push((window.clone(), texture, program, id, commit));
-                } else {
-                    jobs.push((job, Then::Warp(window.clone(), program, pane, shape)));
+            let routed = route(warp.is_some(), program.is_some());
+            // A pane that is not warped builds no job, rounded or not (spec §8.4).
+            // `tests::a_pane_neither_warped_nor_styled_wants_no_capture`.
+            if wanted_capture(routed).is_none() {
+                // Said out loud rather than skipped. Not drawing `Inputs::Backdrop`
+                // is right -- there is nothing composited beneath a node for this
+                // renderer to sample -- but a blur that silently renders as no
+                // blur looks like a style that failed to load and is never
+                // reported as a compositor bug. See `fragment::Inputs::Backdrop`,
+                // and
+                // `pass::tests::an_effect_that_cannot_be_run_is_named_once_and_not_every_frame`.
+                if let Some(refused) = crate::pass::refused(&declared_effects(state, pane)) {
+                    state.programs.refuse(refused);
                 }
+                release(state);
+                continue;
             }
-            if let Some((job, part)) = over {
-                if let Some((texture, id, _commit)) = crate::offscreen::kept(state, &job) {
-                    let commit = warp_commit(state, pane, crate::keyed::Kind::Over, shape, false);
-                    overs.push((window, texture, program, id, commit, part));
+            if let (Route::Warp, Some(program), Some((frame, aimed))) = (routed, program, warp) {
+                // What its mesh is drawn from, in global space: the warp's commit
+                // moves when this does, as well as when its capture is redrawn.
+                // `keyed::tests::a_warp_whose_mesh_moves_inside_the_same_bounds_is_given_a_new_commit`.
+                let shape = Shape::of(&frame, aimed, scale);
+                let job = crate::offscreen::pane_job(state, renderer, pane, &window, scale, slots);
+                // Its popups the same way, in a capture of their own that `panes`
+                // draws in front of the pane's warp
+                // (`tests::a_warped_panes_popups_are_in_front_of_it`), kept until
+                // they commit:
+                // `state::tests::real_client::a_commit_on_a_popup_makes_the_popups_capture_stale`.
+                // Under a present geometry their part has a grid of its own,
+                // and a grid refused follows the geometry's `failed`: the
+                // popups undeformed, or none of them, the pane's warp kept.
+                let over = if job.is_some() {
+                    crate::offscreen::over_job(state, renderer, pane, &window, scale)
                 } else {
-                    jobs.push((job, Then::Over(window, program, pane, shape, part)));
+                    None
+                };
+                let over = match (over, aimed) {
+                    (Some((job, part)), Some(aimed)) => {
+                        over_grid(state, pane, &frame, aimed, part, scale)
+                            .map(|grid| (job, part, grid))
+                    }
+                    (over, _) => over.map(|(job, part)| (job, part, None)),
+                };
+                // Holding only what it captures this pass: popups that closed give
+                // their capture back while the pane goes on warping.
+                // `keyed::tests::a_warped_pane_whose_popups_close_gives_their_capture_back`.
+                let kinds: &[crate::keyed::Kind] = if over.is_some() {
+                    &[crate::keyed::Kind::Pane, crate::keyed::Kind::Over]
+                } else {
+                    &[crate::keyed::Kind::Pane]
+                };
+                let (panes, pool) = (&mut state.panes, &mut state.pool);
+                if let Some(held) = panes.get_mut(pane) {
+                    held.captures_mut().keep(kinds, pool);
                 }
+                if let Some(job) = job {
+                    // The slots its capture holes, drawn beneath its warp
+                    // (Ruling F37), read before the job is drawn or kept.
+                    let holes = holes_in(&job.elements);
+                    // Already drawn from exactly this: no frame (`offscreen::kept`,
+                    // `state::tests::real_client::a_capture_whose_surface_tree_has_not_committed_is_not_drawn_again`).
+                    if let Some((texture, id, _commit)) = crate::offscreen::kept(state, &job) {
+                        let commit =
+                            warp_commit(state, pane, crate::keyed::Kind::Pane, shape, false);
+                        let under = unders(state, slots, &holes, scale, commit);
+                        self.warps.push(Warped {
+                            window: window.clone(),
+                            texture,
+                            program,
+                            id,
+                            commit,
+                            part: crate::warp::UnitRect::WHOLE,
+                            grid,
+                            under,
+                        });
+                    } else {
+                        jobs.push((
+                            job,
+                            Then::Warp(window.clone(), program, pane, shape, grid, (holes, scale)),
+                        ));
+                    }
+                }
+                if let Some((job, part, grid)) = over {
+                    if let Some((texture, id, _commit)) = crate::offscreen::kept(state, &job) {
+                        let commit =
+                            warp_commit(state, pane, crate::keyed::Kind::Over, shape, false);
+                        self.overs.push(Warped {
+                            window,
+                            texture,
+                            program,
+                            id,
+                            commit,
+                            part,
+                            grid,
+                            under: Vec::new(),
+                        });
+                    } else {
+                        jobs.push((job, Then::Over(window, program, pane, shape, part, grid)));
+                    }
+                }
+                continue;
             }
-            continue;
+            release(state);
         }
-        release(state);
+
+        // Every list is built, from the slots as the chains left them: draw
+        // them all, on one carrier, and place what they made
+        // (`tests::prepare_compiles_first_and_builds_the_warps_after_the_chains`).
+        for (then, texture, id, _commit) in crate::offscreen::draw(state, renderer, jobs) {
+            match then {
+                Then::Warp(window, program, pane, shape, grid, (holes, scale)) => {
+                    let commit = warp_commit(state, pane, crate::keyed::Kind::Pane, shape, true);
+                    let under = unders(state, slots, &holes, scale, commit);
+                    self.warps.push(Warped {
+                        window,
+                        texture,
+                        program,
+                        id,
+                        commit,
+                        part: crate::warp::UnitRect::WHOLE,
+                        grid,
+                        under,
+                    });
+                }
+                Then::Over(window, program, pane, shape, part, grid) => {
+                    let commit = warp_commit(state, pane, crate::keyed::Kind::Over, shape, true);
+                    self.overs.push(Warped {
+                        window,
+                        texture,
+                        program,
+                        id,
+                        commit,
+                        part,
+                        grid,
+                        under: Vec::new(),
+                    });
+                }
+            }
+        }
     }
 
-    // Every list is built: draw them all, on one carrier.
-    for (then, texture, id, _commit) in crate::offscreen::draw(state, renderer, jobs) {
-        match then {
-            Then::Warp(window, program, pane, shape) => {
-                let commit = warp_commit(state, pane, crate::keyed::Kind::Pane, shape, true);
-                warps.push((window, texture, program, id, commit));
-            }
-            Then::Over(window, program, pane, shape, part) => {
-                let commit = warp_commit(state, pane, crate::keyed::Kind::Over, shape, true);
-                overs.push((window, texture, program, id, commit, part));
-            }
-        }
+    fn sweep(&mut self) {
+        // A slot no rule wanted this pass gives its targets back, and the
+        // pool deletes what was given back, once a pass and not in each
+        // draw (Ruling 17).
+        // `effect::store::tests::a_slot_no_rule_wanted_this_pass_is_dropped`.
+        let state = &mut *self.state;
+        state.store.sweep(self.pass, &mut state.pool);
+        // A memo no place read for `effects.memo.keep_passes` passes, and a
+        // cut nobody wanted for `effects.xray.keep_ms`, give their targets
+        // back (Rulings F29, F30): `effect::memo::tests::a_memo_is_kept_for_keep_passes`,
+        // `effect::xray::tests::a_cut_nobody_wants_is_kept_for_keep_ms`.
+        state.memos.sweep(
+            self.pass,
+            state.effect_settings.memo.keep_passes,
+            &mut state.pool,
+        );
+        state.xrays.sweep(
+            state.clock.now(),
+            std::time::Duration::from_millis(state.effect_settings.xray.keep_ms),
+            &mut state.pool,
+        );
+        state.pool.sweep(self.renderer);
     }
-    Prepared { warps, overs }
+}
+
+/// Whether any monitor shows a pane, asked of the rectangle `elements` asks
+/// it of: `prepare`'s cull, which [`build_slots`] makes too. `prepare`'s walk
+/// says at length why the slot and not the client's rectangle.
+/// `state::tests::real_client::a_pane_no_monitor_shows_gathers_no_fact_and_wants_no_slot`.
+fn shown(state: &Solium, pane: crate::pane::PaneId) -> bool {
+    state
+        .pane_outer_of(pane)
+        .is_some_and(|slot| state.on_any_output(slot))
 }
 
 /// What a capture becomes once drawn: `dev/fence-check.sh` has two warps,
@@ -622,13 +1576,24 @@ pub(crate) fn prepare(state: &mut Solium, renderer: &mut GlesRenderer) -> Prepar
 /// the part of the pane they cover as well.
 #[derive(Debug)]
 enum Then {
-    Warp(Window, crate::warp::Program, crate::pane::PaneId, Shape),
+    /// The pane's own warp, its grid, and the slots its capture holes with
+    /// the capture's scale (Ruling F37).
+    Warp(
+        Window,
+        crate::warp::Program,
+        crate::pane::PaneId,
+        Shape,
+        Option<crate::warp::Grid>,
+        (Vec<(crate::effect::plan::Owner, Slot)>, f64),
+    ),
+    /// Its popups', over their part, and its grid.
     Over(
         Window,
         crate::warp::Program,
         crate::pane::PaneId,
         Shape,
         crate::warp::UnitRect,
+        Option<crate::warp::Grid>,
     ),
 }
 
@@ -650,6 +1615,75 @@ fn warp_commit(
         .unwrap_or_default()
 }
 
+/// The slots a pane's capture holes, topmost first: each `Hole` among the
+/// elements its job is drawn from (Ruling F37).
+fn holes_in(elements: &[Element]) -> Vec<(crate::effect::plan::Owner, Slot)> {
+    elements
+        .iter()
+        .filter_map(|element| match element {
+            Element::Hole(hole) => {
+                let (owner, slot) = hole.owner();
+                Some((owner.clone(), slot))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A warped pane's beneath slots on every monitor, in its capture's order:
+/// each hole's slot with its T2 texture there (`Slots::screened`), its
+/// shape in the capture's pixels at `scale`, the T2 result's per-monitor
+/// id, and a commit that moves with the warp's or a re-run
+/// (`effect::store::tests::an_unders_commit_moves_with_its_warp_or_its_rerun`).
+/// What `dev/effects-check.sh motion`'s `genie` draws beneath its funnel.
+fn unders(
+    state: &mut Solium,
+    slots: &Slots,
+    holes: &[(crate::effect::plan::Owner, Slot)],
+    scale: f64,
+    warp: CommitCounter,
+) -> Vec<crate::effect::beneath::Under> {
+    let mut unders = Vec::new();
+    for (owner, slot) in holes {
+        let crate::effect::plan::Owner::Pane(pane, _) = owner else {
+            continue;
+        };
+        let (Some(outer), Some((found, _)), Some(key), Some(boxed)) = (
+            state.pane_outer_of(*pane),
+            part_of(state, owner),
+            slots.key(owner, *slot),
+            slots.boxed(owner, *slot),
+        ) else {
+            continue;
+        };
+        let Some(rest) = part_rect(state, &found) else {
+            continue;
+        };
+        let mask = crate::effect::beneath::BeneathMask::Shape(
+            crate::effect::beneath::beneath_mask(rest, outer, boxed.radii, scale),
+        );
+        for place in slots.places(owner, *slot) {
+            let Some(screened) = slots.screened(owner, *slot, &place.monitor) else {
+                continue;
+            };
+            let t2 = state
+                .store
+                .slot_mut(owner, *slot, key)
+                .t2_mut(&place.monitor);
+            unders.push(crate::effect::beneath::Under {
+                monitor: place.monitor.clone(),
+                texture: screened.texture.clone(),
+                over: screened.over,
+                mask: mask.clone(),
+                id: t2.id.clone(),
+                commit: t2.under_commit(warp, screened.rerun),
+                opacity: slots.opacity(owner, *slot),
+            });
+        }
+    }
+    unders
+}
+
 /// The effects a pane's style declares, copied out so nothing borrows the
 /// state: nought or one, and `Vec::new()` (no allocation) for every
 /// unstyled window. Lifted from what was `client_pass`.
@@ -665,6 +1699,1968 @@ fn declared_effects(
         .map(crate::decoration::Decoration::effects)
         .unwrap_or_default()
         .to_vec()
+}
+
+/// A pane's style rules and the generation they were read at: its
+/// decoration's for a framed pane, and none for a bare one (fullscreen, CSD,
+/// `pane = "none"`), so a style's rules never reach a pane it does not frame
+/// (Ruling 15). The one place `prepare` reads them from.
+/// `tests::a_bare_pane_gets_no_style_rules`,
+/// `decoration::tests::a_decoration_carries_the_styles_rules`.
+pub(crate) fn style_rules(frame: &crate::pane::Frame) -> (&[crate::effect::rules::Rule], u32) {
+    match frame {
+        crate::pane::Frame::Styled(decoration) => {
+            (decoration.rules(), decoration.rules_generation())
+        }
+        crate::pane::Frame::Pending | crate::pane::Frame::None => (&[], 0),
+    }
+}
+
+/// Resolve every rule once this pass: for every part of every pane a monitor
+/// shows (the cull `prepare` makes), every scripted surface's instance on
+/// each output, and every client layer surface, what each slot wants. A
+/// resolved key wants a slot only when its chain is bound: every chain was
+/// bound at config load or when its style was applied (Ruling 15), so this
+/// binds nothing, and a style's rule that could not bind, already on the
+/// overlay, wants none. With no rules, the user's or any pane's style's,
+/// nothing is resolved and no fact gathered (spec §8.4).
+/// `state::tests::real_client::with_no_rules_no_slot_is_wanted_and_no_fact_is_gathered`,
+/// `state::tests::real_client::a_rule_on_focused_follows_the_keyboard`,
+/// `state::tests::real_client::a_surface_has_a_slot_per_monitor_and_a_layer_surface_one_of_its_own`.
+pub(crate) fn build_slots(state: &mut Solium) -> crate::effect::plan::Slots {
+    use crate::effect::plan::{Owner, Slots};
+    if state.rules.is_empty()
+        && state
+            .panes
+            .iter()
+            .all(|pane| style_rules(pane.frame()).0.is_empty())
+    {
+        // No rule is left to fade a slot either.
+        state.slot_fades.clear();
+        return Slots::default();
+    }
+    // While the session is locked no slot of the session is wanted, T1 or
+    // T2: nothing of it is captured (a self or a mask capture), run or read
+    // behind the lock, and no xray is built ([16] §5, Ruling F29). The
+    // pointer's own scene keeps its slots from Task 61 on.
+    // `state::tests::real_client::nothing_of_the_session_is_captured_while_locked`.
+    if state.lock.is_some() {
+        return Slots::default();
+    }
+    // At the pass's instant, as the walk draws: a slot fading in or out with
+    // its rule (`effect::fade`) is shown at its opacity then.
+    let now = pass_now(state);
+    let mut fades = std::mem::take(&mut state.slot_fades);
+    let slots = resolve_slots(state, &mut fades, now);
+    // A slot whose pane is out of sight this pass keeps its fade; one whose
+    // owner has gone does not.
+    fades.sweep(|owner| match owner {
+        Owner::Pane(pane, _) => state.panes.get(*pane).is_some(),
+        Owner::Surface(..) | Owner::LayerShell(_) => false,
+    });
+    // A fade draws no new picture and damages nothing, so its frames are
+    // asked for here or it stops where it stands.
+    // `state::tests::real_client::a_rule_with_a_fade_eases_its_slot_in_and_out_with_the_focus`.
+    if fades.moving(now) {
+        state.redraw = true;
+    }
+    state.slot_fades = fades;
+    slots
+}
+
+/// [`build_slots`]' walk, its slots stepped through `fades` at `now`.
+fn resolve_slots(
+    state: &Solium,
+    fades: &mut crate::effect::fade::Fades,
+    now: std::time::Duration,
+) -> crate::effect::plan::Slots {
+    use crate::effect::plan::{self, PaneSlot, Slots};
+    use crate::effect::rules::{Facts, PartRef};
+    use smithay::reexports::wayland_server::Resource as _;
+    let mut slots = Slots::default();
+    for held in state.panes.iter() {
+        let pane = held.id();
+        if !shown(state, pane) {
+            continue;
+        }
+        let (style, generation) = style_rules(held.frame());
+        let facts = state.window_facts(pane, state.rules.uses(style));
+        slots.gathered();
+        let view = Facts {
+            app_id: &facts.app_id,
+            title: &facts.title,
+            focused: facts.focused,
+            fullscreen: facts.fullscreen,
+            monitor: &facts.monitor,
+            style: &facts.style,
+            ..Facts::default()
+        };
+        let mut want = |slot_of: PaneSlot, part: PartRef<'_>| {
+            want_resolved(
+                &mut slots,
+                state,
+                (&mut *fades, now),
+                &plan::Owner::Pane(pane, slot_of),
+                (style, state.rules.resolve(style, generation, part, &view)),
+            );
+        };
+        want(PaneSlot::Pane, PartRef::Pane);
+        want(PaneSlot::Client, PartRef::Client);
+        want(PaneSlot::Popups, PartRef::Popup);
+        want(PaneSlot::Titlebar, PartRef::Region("titlebar"));
+        for (index, name) in held
+            .decoration()
+            .into_iter()
+            .flat_map(|decoration| decoration.layer_names())
+        {
+            want(PaneSlot::Layer(index), PartRef::Layer(name));
+        }
+    }
+    // A style's rules are for its panes only (Ruling 15): surfaces and layer
+    // surfaces resolve the user's, so with none there is nothing to resolve.
+    if state.rules.is_empty() {
+        return slots;
+    }
+    let primary = state.primary_output();
+    for output in state.space.outputs() {
+        // One owner per scripted surface's instance on each output it is on,
+        // where `elements` puts it (`wanted`), matched by its name.
+        if let Some(geometry) = state.space.output_geometry(output) {
+            for surface in state.surfaces.iter() {
+                if surface
+                    .area_on(output, geometry, primary.as_ref())
+                    .is_none()
+                {
+                    continue;
+                }
+                slots.gathered();
+                let name = surface.name();
+                let facts = Facts {
+                    surface: name,
+                    ..Facts::default()
+                };
+                let resolved = state.rules.resolve(&[], 0, PartRef::Surface(name), &facts);
+                want_resolved(
+                    &mut slots,
+                    state,
+                    (&mut *fades, now),
+                    &plan::Owner::Surface(surface.id(), output.name()),
+                    (&[], resolved),
+                );
+            }
+        }
+        // And one per client layer surface, matched by its namespace.
+        let map = layer_map_for_output(output);
+        for layer in map.layers() {
+            slots.gathered();
+            let namespace = layer.namespace();
+            let facts = Facts {
+                layer_shell: namespace,
+                ..Facts::default()
+            };
+            let resolved = state
+                .rules
+                .resolve(&[], 0, PartRef::LayerShell(namespace), &facts);
+            want_resolved(
+                &mut slots,
+                state,
+                (&mut *fades, now),
+                &plan::Owner::LayerShell(layer.wl_surface().id()),
+                (&[], resolved),
+            );
+        }
+    }
+    slots
+}
+
+/// Want each slot a part resolved to whose chain is bound, stepped through
+/// `fades` at `now`: a rule with a `fade` is wanted at the opacity its fade
+/// has reached, and still wanted, fading out, once it stops matching, until
+/// it is gone (`effect::fade`); one without is wanted whole while it matches.
+/// `style` is the pane's style's rules, which a key of the style's names.
+/// `state::tests::real_client::a_rule_whose_chain_is_not_bound_wants_no_slot`,
+/// `state::tests::real_client::a_rule_with_a_fade_eases_its_slot_in_and_out_with_the_focus`.
+fn want_resolved(
+    slots: &mut crate::effect::plan::Slots,
+    state: &Solium,
+    (fades, now): (&mut crate::effect::fade::Fades, std::time::Duration),
+    owner: &crate::effect::plan::Owner,
+    (style, resolved): (
+        &[crate::effect::rules::Rule],
+        crate::effect::rules::Resolved,
+    ),
+) {
+    use crate::effect::rules::Slot;
+    for slot in [Slot::Behind, Slot::Front, Slot::Replace] {
+        let bound = resolved
+            .get(slot)
+            .filter(|key| state.chains.get(*key).is_some());
+        let with_fade = bound.map(|key| {
+            let fade = state.rules.rule(style, key).and_then(|rule| rule.fade);
+            (key, fade)
+        });
+        let Some(shown) = fades.step(
+            owner,
+            slot,
+            with_fade,
+            |key| state.chains.get(key).is_some(),
+            now,
+        ) else {
+            continue;
+        };
+        let Some(chain) = state.chains.get(shown.key) else {
+            continue;
+        };
+        // A T2 chain on a part no xray layer lies below (a part on
+        // `background`) reads nothing: no slot, and no problem (Ruling
+        // F29). `effect::xray::tests::a_part_reads_the_xray_layers_strictly_below_its_band`.
+        if chain.tier == crate::effect::rules::Tier::Xray && t2_cut(state, owner, chain).is_none() {
+            continue;
+        }
+        slots.want(owner.clone(), slot, shown.key);
+        if shown.opacity < 1.0 {
+            slots.set_opacity(owner.clone(), slot, shown.opacity);
+        }
+    }
+}
+
+/// What a slot's owner is captured from, owned so the state is free while
+/// its job is built: [`PartSource`]'s parts, and the titlebar, whose own
+/// pixels wait for P15 and which has a box but no capture.
+/// `state::tests::real_client::only_a_chain_reading_its_part_asks_for_a_capture`.
+#[derive(Clone, Debug)]
+pub(crate) enum Found {
+    Client(Window),
+    Popups(Window),
+    Layer(crate::pane::PaneId, usize),
+    Pane(Window),
+    Surface(crate::scripted::SurfaceId, smithay::output::Output),
+    LayerShell(LayerSurface),
+    Titlebar(crate::pane::PaneId),
+}
+
+impl Found {
+    /// What it is captured from; `None` for the titlebar.
+    pub(crate) fn source(&self) -> Option<PartSource<'_>> {
+        Some(match self {
+            Self::Client(window) => PartSource::Client(window),
+            Self::Popups(window) => PartSource::Popups(window),
+            Self::Layer(pane, index) => PartSource::Layer(*pane, *index),
+            Self::Pane(window) => PartSource::Pane(window),
+            Self::Surface(id, output) => PartSource::Surface(*id, output),
+            Self::LayerShell(surface) => PartSource::LayerShell(surface),
+            Self::Titlebar(_) => return None,
+        })
+    }
+}
+
+/// What a slot's owner is captured from, and its monitor's scale, which a
+/// self input is captured at (Ruling 16): a pane's, a scripted surface's
+/// output's, a layer surface's output's. `None` for an owner that has gone,
+/// and for a pane's client part while it shows its scene (Ruling 15).
+/// `state::tests::real_client::every_wanted_slot_has_its_part_box_padded_by_its_reach`.
+fn part_of(state: &Solium, owner: &crate::effect::plan::Owner) -> Option<(Found, f64)> {
+    use crate::effect::plan::Owner;
+    use smithay::reexports::wayland_server::Resource as _;
+    let scale_of = |output: &smithay::output::Output| output.current_scale().fractional_scale();
+    match owner {
+        Owner::Pane(pane, part) => {
+            let held = state.panes.get(*pane)?;
+            let scale = state.scale_of(state.pane_outer(held));
+            let client = || held.client().cloned();
+            let found = match part {
+                PaneSlot::Client => Found::Client(client()?),
+                PaneSlot::Popups => Found::Popups(client()?),
+                PaneSlot::Pane => Found::Pane(client()?),
+                PaneSlot::Layer(index) => Found::Layer(*pane, *index),
+                PaneSlot::Titlebar => Found::Titlebar(*pane),
+            };
+            Some((found, scale))
+        }
+        Owner::Surface(id, name) => {
+            let output = state
+                .space
+                .outputs()
+                .find(|output| output.name() == *name)?;
+            Some((Found::Surface(*id, output.clone()), scale_of(output)))
+        }
+        Owner::LayerShell(object) => state.space.outputs().find_map(|output| {
+            let layer = layer_map_for_output(output)
+                .layers()
+                .find(|layer| layer.wl_surface().id() == *object)
+                .cloned()?;
+            Some((Found::LayerShell(layer), scale_of(output)))
+        }),
+    }
+}
+
+/// How far a part's self capture is padded: its chain's reach on its
+/// monitor, rounded up to a whole physical pixel (Ruling 16).
+/// `state::tests::real_client::every_wanted_slot_has_its_part_box_padded_by_its_reach`.
+fn padding(reach: f64, scale: f64) -> i32 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a reach in pixels, far below 2^31"
+    )]
+    let pad = (reach * scale).ceil().max(0.0) as i32;
+    pad
+}
+
+/// A part's mask radii in physical pixels at `scale`, top-left, top-right,
+/// bottom-left, bottom-right ([`mask_radii`]): the client's own rounding,
+/// the pane's largest at every corner, none for the rest.
+/// `tests::a_parts_radii_are_its_masks_at_its_scale`.
+pub(crate) fn part_radii(state: &Solium, source: &PartSource<'_>, scale: f64) -> [f32; 4] {
+    let rounding = |window: &Window| {
+        state
+            .panes
+            .id_of(window)
+            .and_then(|pane| declared_rounding(state, pane))
+            .map(|effect| effect.radii())
+    };
+    match source {
+        PartSource::Client(window) => mask_radii(rounding(window), false, scale),
+        PartSource::Pane(window) => mask_radii(rounding(window), true, scale),
+        PartSource::Popups(_)
+        | PartSource::Layer(..)
+        | PartSource::Surface(..)
+        | PartSource::LayerShell(_) => [0.0; 4],
+    }
+}
+
+/// A rounded part's mask radii at `scale`, as a run reads them (top-left,
+/// top-right, bottom-left, bottom-right): its own corners, or for a whole
+/// pane its largest at every corner, as `effect::mask::client_mask` and
+/// `pane_mask` cut; square with no rounding.
+/// `tests::a_parts_radii_are_its_masks_at_its_scale`.
+pub(crate) fn mask_radii(rounding: Option<Corners>, whole_pane: bool, scale: f64) -> [f32; 4] {
+    let corners = match rounding {
+        None => Corners::all(0.0),
+        Some(radii) if whole_pane => Corners::all(radii.largest()),
+        Some(radii) => radii,
+    };
+    radii_of(corners_times(corners, scale))
+}
+
+/// Corners as a run reads them, top-left, top-right, bottom-left,
+/// bottom-right. `tests::a_parts_radii_are_its_masks_at_its_scale`.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a radius in pixels, given to GL as a float"
+)]
+fn radii_of(radii: Corners) -> [f32; 4] {
+    [
+        radii.top_left as f32,
+        radii.top_right as f32,
+        radii.bottom_left as f32,
+        radii.bottom_right as f32,
+    ]
+}
+
+/// The titlebar's box ([`region_box`] over the insets' regions): it has no
+/// capture until P15, but a chain reading nothing of the frame still runs
+/// over its box.
+fn titlebar_box(
+    state: &Solium,
+    pane: crate::pane::PaneId,
+    scale: f64,
+    pad: i32,
+) -> Option<crate::effect::plan::PartBox> {
+    let held = state.panes.get(pane)?;
+    let regions = crate::effect::mask::FromInsets {
+        insets: held.decoration()?.insets(),
+        outer: state.pane_outer(held).size,
+        radii: declared_rounding(state, pane).map_or(Corners::all(0.0), |effect| effect.radii()),
+    };
+    region_box(&regions, "titlebar", scale, pad)
+}
+
+/// A named region's box: its band at `scale`, padded by `pad`, its corners
+/// as the region gives them. `None` for a region the source does not have.
+/// `tests::the_titlebars_box_is_its_band_padded_with_its_outer_corners`.
+pub(crate) fn region_box(
+    regions: &dyn crate::effect::mask::RegionSource,
+    name: &str,
+    scale: f64,
+    pad: i32,
+) -> Option<crate::effect::plan::PartBox> {
+    let (band, radii) = regions.region(name)?;
+    Some(crate::effect::plan::PartBox::around(
+        crate::offscreen::client_pixels(band.size, scale),
+        pad,
+        radii_of(corners_times(radii, scale)),
+    ))
+}
+
+/// Record every wanted slot's padded box, whatever its tier: the part's own
+/// pixels on its monitor, padded by its chain's reach, the part inside it,
+/// its radii. GPU-free; what the runs read whether or not a capture was
+/// drawn this pass. Nothing with no slot wanted.
+/// `state::tests::real_client::every_wanted_slot_has_its_part_box_padded_by_its_reach`.
+pub(crate) fn record_boxes(state: &Solium, slots: &mut Slots) {
+    if slots.is_empty() {
+        return;
+    }
+    let wanted: Vec<(
+        crate::effect::plan::Owner,
+        Slot,
+        crate::effect::rules::RuleKey,
+    )> = slots
+        .wants()
+        .map(|(owner, slot, key)| (owner.clone(), slot, key))
+        .collect();
+    for (owner, slot, key) in wanted {
+        let Some(chain) = state.chains.get(key) else {
+            continue;
+        };
+        let Some((found, scale)) = part_of(state, &owner) else {
+            continue;
+        };
+        let pad = padding(chain.reach, scale);
+        let part = match (&found, found.source()) {
+            (_, Some(source)) => crate::offscreen::part_box(state, &source, scale, pad),
+            (Found::Titlebar(pane), None) => titlebar_box(state, *pane, scale, pad),
+            (_, None) => None,
+        };
+        let Some(part) = part else {
+            continue;
+        };
+        // A T2 slot's places, one per monitor its padded box overlaps
+        // (Ruling F30), measured where the part is drawn this pass (Ruling
+        // F37: `measured`), each logged as `effect slot` for the nested
+        // checks:
+        // `state::tests::real_client::a_window_across_two_monitors_has_a_t2_place_on_each`,
+        // `state::tests::real_client::a_gliding_windows_t2_place_follows_its_drawn_rectangle`.
+        if chain.tier == crate::effect::rules::Tier::Xray
+            && let Some(cut) = t2_cut(state, &owner, chain)
+        {
+            let measured = measured(state, &owner, slot, &found);
+            // Drawn beneath its pane's warp, out of the pane's capture:
+            // `state::tests::real_client::a_warped_panes_behind_slot_is_drawn_beneath_its_warp`.
+            if matches!(measured, Some(Measured::Beneath(_))) {
+                slots.set_beneath(owner.clone(), slot);
+            }
+            let places = measured.map_or_else(Vec::new, |measured| {
+                t2_places(state, &owner, &found, (cut, scale, pad), &measured, part)
+            });
+            for place in &places {
+                let at = place.screen;
+                tracing::debug!(
+                    ?owner,
+                    part = part_name(&owner),
+                    monitor = %place.monitor,
+                    padded = %format!("{},{},{},{}", at.loc.x, at.loc.y, at.size.w, at.size.h),
+                    "effect slot"
+                );
+            }
+            slots.set_places(owner.clone(), slot, places);
+        }
+        slots.set_box(owner, slot, part);
+    }
+}
+
+/// A slot owner's part as a rule names it, for the `effect slot` log line
+/// Task 46's nested frost check reads.
+fn part_name(owner: &crate::effect::plan::Owner) -> String {
+    use crate::effect::plan::Owner as Whose;
+    match owner {
+        Whose::Pane(_, PaneSlot::Pane) => "pane".to_owned(),
+        Whose::Pane(_, PaneSlot::Client) => "client".to_owned(),
+        Whose::Pane(_, PaneSlot::Popups) => "popup".to_owned(),
+        Whose::Pane(_, PaneSlot::Titlebar) => "region:titlebar".to_owned(),
+        Whose::Pane(_, PaneSlot::Layer(index)) => format!("layer:{index}"),
+        Whose::Surface(..) => "surface".to_owned(),
+        Whose::LayerShell(_) => "layer_shell".to_owned(),
+    }
+}
+
+/// One slot's self input to capture this pass.
+/// `state::tests::real_client::only_a_chain_reading_its_part_asks_for_a_capture`.
+#[derive(Debug)]
+pub(crate) struct SelfInput {
+    pub(crate) owner: crate::effect::plan::Owner,
+    pub(crate) slot: Slot,
+    found: Found,
+    scale: f64,
+    pad: i32,
+}
+
+/// The wanted slots whose chain reads its part's own pixels (T1,
+/// `Tier::Own`), each with what its part is captured from, at its monitor's
+/// scale, padded by its chain's reach: what `prepare` captures. A chain
+/// reading nothing of the frame (T0) asks for no capture, and nor does the
+/// titlebar, whose self rules are refused until P15.
+/// `state::tests::real_client::only_a_chain_reading_its_part_asks_for_a_capture`.
+pub(crate) fn self_inputs(state: &Solium, slots: &Slots) -> Vec<SelfInput> {
+    slots
+        .wants()
+        .filter_map(|(owner, slot, key)| {
+            let chain = state.chains.get(key)?;
+            if chain.tier != crate::effect::rules::Tier::Own {
+                return None;
+            }
+            let (found, scale) = part_of(state, owner)?;
+            found.source()?;
+            Some(SelfInput {
+                owner: owner.clone(),
+                slot,
+                found,
+                scale,
+                pad: padding(chain.reach, scale),
+            })
+        })
+        .collect()
+}
+
+/// The fields of `Solium` a pass's chain runs touch, borrowed apart so the
+/// pool can be lent to [`with_carrier`] beside them.
+/// `tests::a_self_slot_with_no_input_runs_nothing_and_opens_no_region`.
+pub(crate) struct RunCx<'a> {
+    pub(crate) store: &'a mut crate::effect::store::Store,
+    pub(crate) effects: &'a crate::effect::host::Host,
+    pub(crate) chains: &'a mut crate::effect::plan::Chains,
+    /// What a result is drawn through (`pass::Programs::masked`, compiled at
+    /// the top of `prepare` while a slot is wanted); with none, no slot is
+    /// ready and the walk draws as if every chain had failed.
+    pub(crate) masked: Option<GlesTexProgram>,
+    /// Seconds, from the one clock (#164).
+    pub(crate) now: f32,
+    /// The store's pass, which a slot run in it is marked with.
+    pub(crate) pass: u64,
+    /// Every memo: what `run_xray` runs into and a T2 place reads.
+    pub(crate) memos: &'a mut crate::effect::memo::Memos,
+    /// Every xray cut: what a memo prefix and a T2 run bind as `backdrop`.
+    pub(crate) xrays: &'a crate::effect::xray::Xrays,
+    /// The pass's instant, which a run is marked with, and
+    /// `effects.motion_hz`: how often, at most, a chain moved only by its
+    /// part's place or size runs again
+    /// ([`crate::effect::store::SlotState::waits`],
+    /// [`crate::effect::store::T2State::waits`]).
+    pub(crate) motion: (std::time::Duration, f64),
+    /// Whether a chain waited for its next motion tick this pass: the pass
+    /// that runs it at its part's last place and size is then owed, whether
+    /// or not the part moves again.
+    pub(crate) waited: bool,
+}
+
+impl std::fmt::Debug for RunCx<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunCx")
+            .field("now", &self.now)
+            .field("pass", &self.pass)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What runs a chain: the GPU in `prepare`, `tests::NoGpu` in the tests.
+pub(crate) trait Runner {
+    /// Before a phase's first run: `GlRunner` opens the phase's one
+    /// `Region::Effect` (Ruling 10).
+    fn begin(&mut self);
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "run::run's own, less the renderer and carrier the runner holds"
+    )]
+    fn run<'p>(
+        &mut self,
+        pool: &mut crate::pool::Pool,
+        programs: &dyn Fn(u64) -> crate::effect::run::Lookup<'p>,
+        formats: Option<crate::pool::Formats>,
+        plan: &solium_effects::stage::Plan,
+        held: &mut crate::effect::run::Held,
+        inputs: &crate::effect::run::Inputs<'_>,
+        keys: &crate::effect::run::Keys,
+    ) -> crate::effect::run::Outcome;
+    /// After a phase's last run: closes the region.
+    fn end(&mut self);
+    /// What a generated (T0) chain's first input reads, which names no frame
+    /// texture: `GlRunner`'s is the pool's 1x1 transparent texture
+    /// (`pool::Pool::blank`), `tests::NoGpu`'s none.
+    /// `tests::twenty_runs_in_a_phase_open_one_region`, `dev/effects-check.sh t0`.
+    fn blank(&mut self, pool: &mut crate::pool::Pool) -> Option<GlesTexture>;
+}
+
+/// The GPU's runner: `run::run` on the carrier [`with_carrier`] bound, the
+/// phase timed as one region.
+pub(crate) struct GlRunner<'r, 'c> {
+    renderer: &'r mut GlesRenderer,
+    carrier: &'r mut smithay::backend::renderer::gles::GlesTarget<'c>,
+    timer: Option<&'r mut crate::gputime::Timer>,
+    open: Option<crate::gputime::Stamp>,
+}
+
+impl std::fmt::Debug for GlRunner<'_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GlRunner")
+            .field("timed", &self.timer.is_some())
+            .field("open", &self.open.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'r, 'c> GlRunner<'r, 'c> {
+    pub(crate) fn new(
+        renderer: &'r mut GlesRenderer,
+        carrier: &'r mut smithay::backend::renderer::gles::GlesTarget<'c>,
+        timer: Option<&'r mut crate::gputime::Timer>,
+    ) -> Self {
+        Self {
+            renderer,
+            carrier,
+            timer,
+            open: None,
+        }
+    }
+}
+
+impl Runner for GlRunner<'_, '_> {
+    fn begin(&mut self) {
+        if self.open.is_none() {
+            self.open = self
+                .timer
+                .as_deref_mut()
+                .map(|timer| timer.open(self.renderer, crate::gputime::Region::Effect));
+        }
+    }
+
+    fn run<'p>(
+        &mut self,
+        pool: &mut crate::pool::Pool,
+        programs: &dyn Fn(u64) -> crate::effect::run::Lookup<'p>,
+        formats: Option<crate::pool::Formats>,
+        plan: &solium_effects::stage::Plan,
+        held: &mut crate::effect::run::Held,
+        inputs: &crate::effect::run::Inputs<'_>,
+        keys: &crate::effect::run::Keys,
+    ) -> crate::effect::run::Outcome {
+        crate::effect::run::run(
+            self.renderer,
+            self.carrier,
+            pool,
+            programs,
+            formats,
+            plan,
+            held,
+            inputs,
+            keys,
+        )
+    }
+
+    fn end(&mut self) {
+        if let (Some(timer), Some(stamp)) = (self.timer.as_deref_mut(), self.open.take()) {
+            timer.close(self.renderer, stamp);
+        }
+    }
+
+    fn blank(&mut self, pool: &mut crate::pool::Pool) -> Option<GlesTexture> {
+        pool.blank(self.renderer)
+    }
+}
+
+/// Bind the pool's carrier once and hand it, the renderer and the pool to
+/// `f`, as `offscreen::draw` binds it for its jobs, then put framebuffer 0
+/// back as it does (`warp::release_framebuffer`). `None` with no carrier or
+/// one that would not bind. Nothing in `f` may touch a QML scene.
+pub(crate) fn with_carrier<R>(
+    pool: &mut crate::pool::Pool,
+    renderer: &mut GlesRenderer,
+    f: impl FnOnce(
+        &mut GlesRenderer,
+        &mut smithay::backend::renderer::gles::GlesTarget<'_>,
+        &mut crate::pool::Pool,
+    ) -> R,
+) -> Option<R> {
+    use smithay::backend::renderer::Bind as _;
+    let Some(mut carrier) = pool.carrier(renderer) else {
+        tracing::warn!("no carrier to run this pass's effects on");
+        return None;
+    };
+    let done = match renderer.bind(&mut carrier) {
+        Err(err) => {
+            tracing::warn!(?err, "could not bind the effects' carrier");
+            None
+        }
+        Ok(mut bound) => {
+            let _frame = crate::qml::frame_in_flight();
+            Some(f(renderer, &mut bound, pool))
+        }
+    };
+    crate::warp::release_framebuffer(renderer);
+    done
+}
+
+/// The key a `depends = "shape"` state is rebuilt on: the part's box in the
+/// padded box and its radii, by their bits.
+/// `tests::the_shape_key_moves_with_the_box_and_the_radii`.
+pub(crate) fn shape_hash(content: [f32; 4], radii: [f32; 4]) -> u64 {
+    let bytes: Vec<u8> = content
+        .iter()
+        .chain(radii.iter())
+        .flat_map(|each| each.to_bits().to_le_bytes())
+        .collect();
+    solium_effects::glsl::content_hash(&[&bytes])
+}
+
+/// Which of `prepare`'s two run phases a slot's chain runs in (Ruling 17):
+/// a whole pane's self chain in the later one, since its capture walks what
+/// the inner phase made ([`inner_pieces`]), and every other in the first.
+/// `tests::only_a_whole_panes_self_chain_runs_in_the_later_phase`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Nest {
+    Inner,
+    Whole,
+}
+
+impl Nest {
+    /// `tests::only_a_whole_panes_self_chain_runs_in_the_later_phase`.
+    pub(crate) fn of(owner: &crate::effect::plan::Owner, tier: crate::effect::rules::Tier) -> Self {
+        match (owner, tier) {
+            (
+                crate::effect::plan::Owner::Pane(_, PaneSlot::Pane),
+                crate::effect::rules::Tier::Own,
+            ) => Self::Whole,
+            _ => Self::Inner,
+        }
+    }
+}
+
+/// Whether a slot's first input counts as redrawn this pass: only a self
+/// (T1) input that was captured anew. A generated (T0) chain reads nothing
+/// of the frame, so nothing committing under it re-runs it; only its params
+/// or its padded size do (`SlotState::needs_run`).
+/// `tests::a_t0_slot_never_counts_as_redrawn`,
+/// `effect::store::tests::a_generated_effect_runs_once_and_not_again_until_its_size_or_params_change`.
+pub(crate) fn input_redrawn(tier: crate::effect::rules::Tier, captured: bool) -> bool {
+    tier == crate::effect::rules::Tier::Own && captured
+}
+
+/// Run every wanted slot of `nest` whose tier runs here, each only when
+/// `needs_run` says so, else its last result placed again with the same id
+/// and commit (Ruling 16). A T1 slot reads its self input from `drawn`
+/// (redrawn this pass, or kept); with neither there is nothing to run and
+/// the part is drawn plain. A T0 slot reads the runner's blank and is never
+/// redrawn. One `begin` before the phase's first run and one `end` after its
+/// last (Ruling 10).
+/// `tests::a_self_slot_with_no_input_runs_nothing_and_opens_no_region`,
+/// `tests::twenty_runs_in_a_phase_open_one_region`,
+/// `effect::store::tests::a_self_chain_runs_once_until_its_part_commits`.
+pub(crate) fn run_slots(
+    cx: &mut RunCx<'_>,
+    pool: &mut crate::pool::Pool,
+    runner: &mut dyn Runner,
+    slots: &mut Slots,
+    drawn: &crate::effect::store::Drawn,
+    nest: Nest,
+) {
+    use crate::effect::rules::Tier;
+    use crate::effect::run::{BoxMap, Inputs, Keys, Outcome};
+    let wanted: Vec<(
+        crate::effect::plan::Owner,
+        Slot,
+        crate::effect::rules::RuleKey,
+    )> = slots
+        .wants()
+        .map(|(owner, slot, key)| (owner.clone(), slot, key))
+        .collect();
+    let mut began = false;
+    for (owner, slot, key) in wanted {
+        let (Some(chain), Some(part)) = (cx.chains.get(key), slots.boxed(&owner, slot)) else {
+            continue;
+        };
+        if Nest::of(&owner, chain.tier) != nest {
+            continue;
+        }
+        // T2: each place on its own monitor, from that monitor's memo
+        // (Ruling F30;
+        // `state::tests::real_client::a_window_across_two_monitors_has_a_t2_place_on_each`).
+        if chain.tier == Tier::Xray {
+            if run_t2(cx, pool, runner, slots, &owner, slot, key, &mut began) {
+                let _ = cx.chains.refuse_once(
+                    key,
+                    "an effect's chain failed; its part is drawn without it",
+                );
+            }
+            continue;
+        }
+        let (first, redrawn) = match chain.tier {
+            Tier::Own => match drawn.get(&owner, slot) {
+                Some((texture, captured)) => {
+                    (Some(texture.clone()), input_redrawn(chain.tier, captured))
+                }
+                None => continue,
+            },
+            // A generated chain reads nothing of the frame: no capture, never
+            // redrawn, its first input the pool's blank, so it runs on its
+            // first pass and again only when its params or its padded size
+            // change (`tests::twenty_runs_in_a_phase_open_one_region`,
+            // `effect::store::tests::a_generated_effect_runs_once_and_not_again_until_its_size_or_params_change`).
+            Tier::Generated => (runner.blank(pool), input_redrawn(chain.tier, false)),
+            // T3 was refused at load (Ruling 14); T2 ran above.
+            Tier::Xray | Tier::Live => continue,
+        };
+        let size = part.size();
+        let params = chain.params_hash;
+        let keys = Keys {
+            params,
+            own: drawn.commit(&owner, slot),
+            shape: shape_hash(part.content, part.radii),
+        };
+        let (instant, hz) = cx.motion;
+        let state = cx.store.slot_mut(&owner, slot, key);
+        state.seen = cx.pass;
+        // Run again only when its input was redrawn, its params changed or
+        // its box changed size; a T0 chain whose box only changed size, run
+        // already in this tick of `effects.motion_hz`, draws its last result
+        // stretched over the part and runs at the next tick
+        // (`effect::store::tests::a_resized_parts_t0_chain_runs_at_most_motion_hz_times_a_second`).
+        let motion = crate::effect::store::Motion {
+            hz,
+            phase: motion_phase(&owner, slot, ""),
+        };
+        let waits = chain.tier == Tier::Generated
+            && state.held.output().is_some()
+            && state.waits(redrawn, params, size, instant, motion);
+        cx.waited |= waits;
+        if waits || !state.needs_run(redrawn, params, size) {
+            if let Some(texture) = state.held.output().cloned()
+                && let Some(ready) = ready_from(state, cx.masked.as_ref(), texture, false, part)
+            {
+                slots.set_ready(owner, slot, ready);
+            }
+            continue;
+        }
+        let textures: Vec<(&str, GlesTexture, BoxMap)> = first
+            .into_iter()
+            .map(|texture| (chain.plan.first_input.as_str(), texture, BoxMap::WHOLE))
+            .collect();
+        let inputs = Inputs {
+            padded: size,
+            content: part.content,
+            textures: &textures,
+            radii: part.radii,
+            time: cx.now,
+            transition: crate::effect::run::Transition::default(),
+            // Ruling 6's edge rule: a self chain in `replace` reads the
+            // part's own edge beyond it, in `behind` and `front` transparent
+            // (`effect::run::tests::the_first_input_is_clamped_to_its_edge_texels`).
+            clamp_first: slot == Slot::Replace && chain.tier == Tier::Own,
+        };
+        if !began {
+            runner.begin();
+            began = true;
+        }
+        let effects = cx.effects;
+        let outcome = runner.run(
+            pool,
+            &|key| effects.lookup(key),
+            effects.formats(),
+            &chain.plan,
+            &mut state.held,
+            &inputs,
+            &keys,
+        );
+        match outcome {
+            Outcome::Done(texture, sync) => {
+                let _ = crate::offscreen::settle(
+                    Ok::<_, std::convert::Infallible>(sync),
+                    crate::dev::fence_wait(),
+                    "an effect",
+                );
+                crate::pacing::effect_ran();
+                state.ran(params, size);
+                state.ran_at = Some(instant);
+                if let Some(ready) = ready_from(state, cx.masked.as_ref(), texture, true, part) {
+                    slots.set_ready(owner, slot, ready);
+                }
+            }
+            // Its program is not compiled yet, or its format waits for the
+            // rebind: the part is drawn plain this pass, and nothing is
+            // latched or said (Ruling 10,
+            // `effect::run::tests::a_program_not_compiled_yet_is_pending_not_failed`).
+            Outcome::Pending => {}
+            // Latched in `Held`, said once per rule, and no `Ready`: the walk
+            // draws the part (`replace`) or nothing (`behind`, `front`), [16]
+            // §5 (`tests::a_wanted_slot_with_nothing_ready_draws_what_no_slot_draws`,
+            // `effect::plan::tests::a_failed_chain_is_said_once_per_rule`).
+            Outcome::Failed => {
+                let _ = cx.chains.refuse_once(
+                    key,
+                    "an effect's chain failed; its part is drawn without it",
+                );
+            }
+        }
+    }
+    if began {
+        runner.end();
+    }
+}
+
+/// One T2 slot's places, each on its own monitor (Ruling F30): a crop of
+/// its memo placed with no pass (`T2Work::Crop`), else its suffix or, over
+/// `effects.memo.budget_mib`, its whole plan run at the part's own size,
+/// reading the cut through the place's `BoxMap`, only when its `T2Key`
+/// moved and otherwise its last result placed again. Each place reads its
+/// own `part`, the drawn part's box where it moves (Ruling F37). A place
+/// whose cut or memo has no picture yet draws nothing this pass. A slot
+/// drawn beneath its pane's warp also leaves each place's texture for the
+/// warp's `Under`s (`Slots::set_screened`). Whether a run failed.
+/// `tests::an_empty_suffix_is_a_crop_and_a_suffix_runs`,
+/// `state::tests::real_client::a_t2_slot_with_memo_false_reruns_when_its_xray_is_redrawn`;
+/// what it draws is wirecheck 13a and 13b's (Task 45), and beneath a warp
+/// 13i's.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "`run_slots`' own context, and the one slot it is on"
+)]
+fn run_t2(
+    cx: &mut RunCx<'_>,
+    pool: &mut crate::pool::Pool,
+    runner: &mut dyn Runner,
+    slots: &mut Slots,
+    owner: &crate::effect::plan::Owner,
+    slot: Slot,
+    rule: crate::effect::rules::RuleKey,
+    began: &mut bool,
+) -> bool {
+    use crate::effect::memo::MemoKey;
+    use crate::effect::run::{BoxMap, Inputs, Keys, Outcome};
+    use smithay::backend::renderer::Texture as _;
+    let Some(chain) = cx.chains.get(rule) else {
+        return false;
+    };
+    let Some(memo) = chain.memo() else {
+        return false;
+    };
+    let places = slots.places(owner, slot).to_vec();
+    let (instant, hz) = cx.motion;
+    let waited = &mut cx.waited;
+    let state = cx.store.slot_mut(owner, slot, rule);
+    state.seen = cx.pass;
+    // A monitor the part left gives its result's targets back
+    // (`effect::store::tests::a_t2_result_on_a_monitor_left_is_given_back`,
+    // `state::tests::real_client::a_part_that_left_a_monitor_gives_its_t2_result_there_back`).
+    let on: Vec<&str> = places.iter().map(|place| place.monitor.as_str()).collect();
+    state.keep_t2(&on, pool);
+    let mut failed = false;
+    for place in places {
+        let Some(xray) = cx.xrays.texture(&place.monitor, place.cut).cloned() else {
+            continue;
+        };
+        let work = t2_work(memo, slots.shared_on(owner, slot, &place.monitor));
+        let motion = crate::effect::store::Motion {
+            hz,
+            phase: motion_phase(owner, slot, &place.monitor),
+        };
+        let part = place.part;
+        let now = t2_key(
+            cx.memos,
+            cx.xrays,
+            &place,
+            chain,
+            &work,
+            part.content,
+            part.radii,
+            None,
+        );
+        let memo_of = |upto: u64| MemoKey {
+            monitor: place.monitor.clone(),
+            cut: place.cut,
+            upto,
+        };
+        let t2 = state.t2_mut(&place.monitor);
+        let (texture, rerun, crop) = match &work {
+            // No pass: the memo, cropped to the part's padded box, its
+            // commit moved when the memo re-ran or the crop moved, and
+            // nothing part-sized held for it
+            // (`effect::store::tests::a_t2_place_that_turns_to_a_crop_gives_its_targets_back`).
+            T2Work::Crop(export) => {
+                let Some(upto) = memo
+                    .exports
+                    .iter()
+                    .position(|each| each == export)
+                    .and_then(|index| chain.memo_keys().get(index))
+                else {
+                    continue;
+                };
+                let Some(texture) = cx.memos.output(&memo_of(*upto)).cloned() else {
+                    continue;
+                };
+                let rerun = t2.cropped(now, pool);
+                let size = texture.size();
+                let crop = crop_of(
+                    place.map,
+                    (
+                        u32::try_from(size.w).unwrap_or(1),
+                        u32::try_from(size.h).unwrap_or(1),
+                    ),
+                );
+                (texture, rerun, Some(crop))
+            }
+            T2Work::Suffix | T2Work::Whole if !t2.needs_run(now) => {
+                let Some(texture) = t2.held.output().cloned() else {
+                    continue;
+                };
+                (texture, false, None)
+            }
+            // Moved only by its part's place or size, and run already in this
+            // tick of `effects.motion_hz`: its last result is drawn
+            // where the part is, and it runs again at the next tick
+            // (`effect::store::tests::a_moving_parts_suffix_runs_at_most_motion_hz_times_a_second`).
+            T2Work::Suffix | T2Work::Whole
+                if t2.held.output().is_some() && t2.waits(now, instant, motion) =>
+            {
+                let Some(texture) = t2.held.output().cloned() else {
+                    continue;
+                };
+                *waited = true;
+                (texture, false, None)
+            }
+            T2Work::Suffix | T2Work::Whole => {
+                let plan = if work == T2Work::Whole {
+                    &chain.plan
+                } else {
+                    &memo.suffix
+                };
+                let mut textures: Vec<(&str, GlesTexture, BoxMap)> =
+                    vec![("backdrop", xray, place.map)];
+                if work == T2Work::Suffix {
+                    let mut missing = false;
+                    for (export, upto) in memo.exports.iter().zip(chain.memo_keys()) {
+                        match cx.memos.output(&memo_of(*upto)) {
+                            Some(texture) => {
+                                textures.push((export.name.as_str(), texture.clone(), place.map));
+                            }
+                            None => missing = true,
+                        }
+                    }
+                    if missing {
+                        continue;
+                    }
+                }
+                let inputs = Inputs {
+                    padded: (
+                        u32::try_from(place.own.w).unwrap_or(1),
+                        u32::try_from(place.own.h).unwrap_or(1),
+                    ),
+                    content: part.content,
+                    textures: &textures,
+                    radii: part.radii,
+                    time: cx.now,
+                    transition: crate::effect::run::Transition::default(),
+                    clamp_first: false,
+                };
+                let keys = Keys {
+                    params: chain.params_hash,
+                    own: None,
+                    shape: shape_hash(part.content, part.radii),
+                };
+                if !*began {
+                    runner.begin();
+                    *began = true;
+                }
+                let effects = cx.effects;
+                match runner.run(
+                    pool,
+                    &|program| effects.lookup(program),
+                    effects.formats(),
+                    plan,
+                    &mut t2.held,
+                    &inputs,
+                    &keys,
+                ) {
+                    Outcome::Done(texture, sync) => {
+                        let _ = crate::offscreen::settle(
+                            Ok::<_, std::convert::Infallible>(sync),
+                            crate::dev::fence_wait(),
+                            "an effect",
+                        );
+                        crate::pacing::effect_ran();
+                        t2.key = Some(now);
+                        t2.ran_at = Some(instant);
+                        (texture, true, None)
+                    }
+                    // Not compiled yet, or a format waiting for the rebind:
+                    // nothing behind the part this pass, nothing latched.
+                    Outcome::Pending => continue,
+                    Outcome::Failed => {
+                        failed = true;
+                        continue;
+                    }
+                }
+            }
+        };
+        if slots.is_beneath(owner, slot) {
+            // Drawn beneath the warp, sampled where each fragment is: a
+            // crop's whole memo spans the monitor, a run's result its box
+            // (Ruling F37). `tests::a_beneath_slot_is_a_hole_only_inside_a_capture`.
+            slots.set_screened(
+                owner.clone(),
+                slot,
+                &place.monitor,
+                crate::effect::beneath::Screened {
+                    texture: texture.clone(),
+                    over: if crop.is_some() {
+                        crate::effect::beneath::Over::Monitor
+                    } else {
+                        crate::effect::beneath::Over::Box(place.screen)
+                    },
+                    rerun,
+                },
+            );
+        }
+        if let Some(ready) = t2_ready(t2, cx.masked.as_ref(), texture, rerun, part, crop) {
+            slots.set_ready_on(owner.clone(), slot, &place.monitor, ready);
+        }
+    }
+    failed
+}
+
+/// Where in one interval of `effects.motion_hz` a slot's ticks fall, 0 to
+/// 1, from its owner, slot and monitor (a T2 place's own; `""` for a T0
+/// slot's one result): fixed for the slot, and spread across slots, so the
+/// glass and the shade of windows that start moving together run on
+/// different passes rather than all on one.
+/// `effect::store::tests::a_moving_parts_suffix_runs_at_most_motion_hz_times_a_second`.
+fn motion_phase(owner: &crate::effect::plan::Owner, slot: Slot, monitor: &str) -> f64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (owner, slot, monitor).hash(&mut hasher);
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a share of 1024, exact in an f64"
+    )]
+    let share = (hasher.finish() % 1024) as f64 / 1024.0;
+    share
+}
+
+/// A T2 place's result as the walk places it on its monitor: the texture in
+/// an `EffectElement` with that monitor's own id, cropped when it is a
+/// memo's, the crop kept by every later `at` (`EffectElement::cropped`),
+/// its commit moved only when it re-ran or its placement (a crop included)
+/// differs; `None` with no masked program, as [`ready_from`].
+/// `effect::store::tests::a_t2_results_commit_moves_only_when_rerun_or_placed_elsewhere`,
+/// `effect::element::tests::a_cropped_result_placed_again_keeps_its_crop`.
+fn t2_ready(
+    t2: &mut crate::effect::store::T2State,
+    masked: Option<&GlesTexProgram>,
+    texture: GlesTexture,
+    rerun: bool,
+    part: crate::effect::plan::PartBox,
+    crop: Option<Rectangle<f64, smithay::utils::Buffer>>,
+) -> Option<crate::effect::plan::Ready> {
+    let program = masked?.clone();
+    let placement = crate::effect::element::Placement::of(part.padded, None, 1.0);
+    let placement = crop.map_or(placement, |crop| placement.cropped(crop));
+    let commit = t2.commit_for(placement, rerun);
+    let element =
+        crate::effect::element::EffectElement::new(t2.id.clone(), commit, texture, program);
+    let element = match crop {
+        Some(crop) => element.cropped(crop),
+        None => element,
+    };
+    Some(crate::effect::plan::Ready {
+        element,
+        padded: part.padded,
+        reach: part.reach,
+    })
+}
+
+/// The output of this name, if it is still in the space.
+/// `state::tests::real_client::reflow_on_close::stacking::the_scenes_phase_renders_only_what_a_wanted_cut_holds`.
+fn output_named(state: &Solium, name: &str) -> Option<smithay::output::Output> {
+    state
+        .space
+        .outputs()
+        .find(|output| output.name() == name)
+        .cloned()
+}
+
+/// One hosted scene instance whose pixels this pass needs before
+/// `elements` (Ruling F31). Task 60 adds pane-style decorations and the
+/// pointer. `tests::the_scenes_phase_renders_only_what_a_wanted_cut_holds`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum SceneRef {
+    Surface(crate::scripted::SurfaceId, String),
+}
+
+/// Every scripted surface in a wanted xray cut, on that cut's monitor, each
+/// once: what the `scenes` phase renders.
+/// `state::tests::real_client::reflow_on_close::stacking::the_scenes_phase_renders_only_what_a_wanted_cut_holds`.
+pub(crate) fn scenes_needed(state: &Solium) -> Vec<SceneRef> {
+    use crate::effect::xray::XraySource as _;
+    let mut needed: Vec<SceneRef> = Vec::new();
+    for (monitor, cut) in state.xrays.wanted() {
+        let Some(output) = output_named(state, &monitor) else {
+            continue;
+        };
+        for each in crate::effect::xray::SessionLayers.entries(state, &output, cut) {
+            if let Stacked::Surface(id, ..) = each {
+                let scene = SceneRef::Surface(id, monitor.clone());
+                if !needed.contains(&scene) {
+                    needed.push(scene);
+                }
+            }
+        }
+    }
+    needed
+}
+
+/// Where a scripted surface's instance on `output` is drawn this pass, and
+/// at what alpha: its declared area carried by its selection, as
+/// [`stacked`] lists it (`wanted`'s two calls). `None` with no instance
+/// there. What the `scenes` phase renders it at, so `elements`' sample is a
+/// hit: `dev/effects-check.sh xray` finds a moving wallpaper's `rendered`
+/// once a pass with a T2 rule, as without one.
+fn surface_drawn_at(
+    state: &Solium,
+    id: crate::scripted::SurfaceId,
+    output: &smithay::output::Output,
+) -> Option<(Rectangle<i32, Logical>, f32)> {
+    let geometry = state.space.output_geometry(output)?;
+    let primary = state.primary_output();
+    let area = state
+        .surfaces
+        .get(id)?
+        .area_on(output, geometry, primary.as_ref())?;
+    Some((
+        state.carried(id, output, area),
+        state.carried_alpha(id, output),
+    ))
+}
+
+/// The wanted memos whose xray was redrawn since they ran (or that never
+/// ran, or whose run made nothing), each once, in the order wanted; a memo
+/// whose cut has no picture yet waits for one.
+/// `tests::a_memo_runs_when_its_xray_was_redrawn_and_once_for_every_slot`.
+pub(crate) fn memos_to_run(
+    memos: &crate::effect::memo::Memos,
+    xrays: &crate::effect::xray::Xrays,
+    wanted: &[crate::effect::memo::MemoKey],
+) -> Vec<crate::effect::memo::MemoKey> {
+    let mut run: Vec<crate::effect::memo::MemoKey> = Vec::new();
+    for key in wanted {
+        let Some(generation) = xrays.generation(&key.monitor, key.cut) else {
+            continue;
+        };
+        if memos.needs_run(key, generation) && !run.contains(key) {
+            run.push(key.clone());
+        }
+    }
+    run
+}
+
+/// What a T2 place does with its memo: place a crop of it (an empty
+/// suffix, no pass), run its suffix, or, when its memos were not held (over
+/// `effects.memo.budget_mib`), run its whole plan at the part's size.
+/// `tests::an_empty_suffix_is_a_crop_and_a_suffix_runs`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum T2Work {
+    /// An empty suffix: a crop of this export's memo, no pass.
+    Crop(solium_effects::stage::Export),
+    /// The suffix, at the part's own size, over the memos and the xray.
+    Suffix,
+    /// No memo held (over `effects.memo.budget_mib`): the whole plan at the
+    /// part's own size, over the xray.
+    Whole,
+}
+
+/// `tests::an_empty_suffix_is_a_crop_and_a_suffix_runs`.
+pub(crate) fn t2_work(memo: &solium_effects::stage::Memo, shared: bool) -> T2Work {
+    if !shared {
+        return T2Work::Whole;
+    }
+    match (memo.suffix.steps.is_empty(), memo.exports.first()) {
+        (true, Some(export)) => T2Work::Crop(export.clone()),
+        _ => T2Work::Suffix,
+    }
+}
+
+/// What a T2 place's result is made from (Ruling F52's struct): a hash of
+/// the memos it reads, each as its prefix key (`upto`) with its generation,
+/// so reading another memo of the same generation moves it too (0 for
+/// `Whole`, and for a chain with no memo); the generation of the cut it
+/// binds as `backdrop`, which every T2 run reads, so a run that reads no
+/// memo still re-runs when the wallpaper or a `bottom` surface redraws; the
+/// padded box in the monitor's own physical pixels (`T2Place.screen`, never
+/// its xray pixels, so a drag finer than an xray pixel re-runs it, Ruling
+/// F37); the params; the shape; and the self capture's commit (Task 52).
+/// Pure. `tests::a_t2_key_reads_each_memo_by_its_prefix_and_generation`,
+/// `tests::a_t2_key_moves_with_a_drag_finer_than_an_xray_pixel`,
+/// `state::tests::real_client::a_drag_finer_than_an_xray_pixel_moves_the_t2_key_at_half_scale`,
+/// `state::tests::real_client::a_t2_slot_with_memo_false_reruns_when_its_xray_is_redrawn`,
+/// `state::tests::real_client::a_t2_slot_over_the_memo_budget_reruns_when_its_xray_is_redrawn`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "everything a T2 result is made from, as the plan names it"
+)]
+pub(crate) fn t2_key(
+    memos: &crate::effect::memo::Memos,
+    xrays: &crate::effect::xray::Xrays,
+    place: &crate::effect::plan::T2Place,
+    chain: &crate::effect::plan::BoundChain,
+    work: &T2Work,
+    content: [f32; 4],
+    radii: [f32; 4],
+    own: Option<u64>,
+) -> crate::effect::memo::T2Key {
+    use std::hash::{Hash, Hasher};
+    let memo = match work {
+        T2Work::Whole => 0,
+        T2Work::Crop(_) | T2Work::Suffix if chain.memo_keys().is_empty() => 0,
+        T2Work::Crop(_) | T2Work::Suffix => {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            for upto in chain.memo_keys() {
+                let key = crate::effect::memo::MemoKey {
+                    monitor: place.monitor.clone(),
+                    cut: place.cut,
+                    upto: *upto,
+                };
+                (*upto, memos.generation(&key)).hash(&mut hasher);
+            }
+            hasher.finish()
+        }
+    };
+    crate::effect::memo::T2Key {
+        memo,
+        xray: xrays.generation(&place.monitor, place.cut).unwrap_or(0),
+        padded: place.screen,
+        params: chain.params_hash,
+        shape: shape_hash(content, radii),
+        own,
+    }
+}
+
+/// A part's box in a memo's own pixels.
+/// `tests::a_crop_is_the_parts_box_in_the_memos_pixels`.
+pub(crate) fn crop_of(
+    map: crate::effect::run::BoxMap,
+    memo: (u32, u32),
+) -> Rectangle<f64, smithay::utils::Buffer> {
+    let (w, h) = (f64::from(memo.0), f64::from(memo.1));
+    Rectangle::new(
+        (f64::from(map.offset[0]) * w, f64::from(map.offset[1]) * h).into(),
+        (f64::from(map.scale[0]) * w, f64::from(map.scale[1]) * h).into(),
+    )
+}
+
+/// The cut a T2 chain on `owner` reads: the configured xray layers
+/// strictly below its part's band (`effects.xray.layers`), then the rule's
+/// `cut`, `background` turning a bottom cut into the wallpaper alone; none
+/// for a part on `background`, which then wants no slot.
+/// `state::tests::real_client::a_rule_may_read_the_wallpaper_alone`.
+fn t2_cut(
+    state: &Solium,
+    owner: &crate::effect::plan::Owner,
+    chain: &crate::effect::plan::BoundChain,
+) -> Option<crate::effect::xray::Cut> {
+    use crate::effect::plan::Owner as Whose;
+    use crate::stack::{Band, Owner as By};
+    use smithay::reexports::wayland_server::Resource as _;
+    let band = match owner {
+        Whose::Pane(..) => Band::Windows,
+        Whose::Surface(id, _) => Band::Layer(state.surfaces.get(*id)?.layer(), By::Script),
+        Whose::LayerShell(object) => state.space.outputs().find_map(|output| {
+            layer_map_for_output(output)
+                .layers()
+                .find(|layer| layer.wl_surface().id() == *object)
+                .map(|layer| Band::Layer(layer::ours(layer.layer()), By::Client))
+        })?,
+    };
+    let cut = state.effect_settings.xray.cut_below(band)?;
+    Some(match chain.cut {
+        crate::effect::rules::CutChoice::Below => cut,
+        crate::effect::rules::CutChoice::Background => crate::effect::xray::Cut::Background,
+    })
+}
+
+/// Where a part lies at rest, in global logical pixels: the rectangle its
+/// T2 places are measured from (Ruling F37: a warped pane's at rest).
+/// `state::tests::real_client::a_window_across_two_monitors_has_a_t2_place_on_each`.
+fn part_rect(state: &Solium, found: &Found) -> Option<Rectangle<i32, Logical>> {
+    let outer_of = |window: &Window| {
+        state
+            .panes
+            .of(window)
+            .map(|pane| state.pane_outer(pane))
+            .or_else(|| state.outer_geometry(window))
+    };
+    let client_of = |window: &Window| {
+        let outer = outer_of(window)?;
+        let client = flat(state, window)?.client;
+        Some(Rectangle::new(outer.loc + client.loc, client.size))
+    };
+    match found {
+        Found::Client(window) => client_of(window),
+        Found::Popups(window) => {
+            let client = client_of(window)?;
+            let covered = popups_covered(window)?;
+            Some(Rectangle::new(client.loc + covered.loc, covered.size))
+        }
+        Found::Pane(window) => outer_of(window),
+        Found::Layer(pane, index) => {
+            let outer = state.pane_outer_of(*pane)?;
+            let canvas = layer_canvas(state, *pane, *index)?;
+            Some(Rectangle::new(outer.loc + canvas.loc, canvas.size))
+        }
+        Found::Titlebar(pane) => {
+            let held = state.panes.get(*pane)?;
+            let outer = state.pane_outer(held);
+            let regions = crate::effect::mask::FromInsets {
+                insets: held.decoration()?.insets(),
+                outer: outer.size,
+                radii: declared_rounding(state, *pane)
+                    .map_or(Corners::all(0.0), |effect| effect.radii()),
+            };
+            let (band, _) = regions.region("titlebar")?;
+            Some(Rectangle::new(outer.loc + band.loc, band.size))
+        }
+        Found::Surface(id, output) => instance_area(state, *id, output),
+        Found::LayerShell(surface) => state.space.outputs().find_map(|output| {
+            let at = layer_map_for_output(output).layer_geometry(surface)?;
+            let screen = state.space.output_geometry(output)?;
+            Some(Rectangle::new(screen.loc + at.loc, at.size))
+        }),
+    }
+}
+
+/// The monitor a part is its own on: a pane's by its centre (where it is
+/// drawn while it moves, `moved`), a scripted surface's instance's, a layer
+/// surface's map's. What `effects.xray.straddle = "own"` keeps.
+/// `state::tests::real_client::a_window_across_two_monitors_has_a_t2_place_on_each`.
+fn own_monitor(
+    state: &Solium,
+    owner: &crate::effect::plan::Owner,
+    found: &Found,
+    moved: Option<Rectangle<f64, Logical>>,
+) -> Option<String> {
+    use crate::effect::plan::Owner as Whose;
+    if let (Whose::Pane(..), Some(moved)) = (owner, moved) {
+        return state
+            .output_of(moved.to_i32_round())
+            .map(|output| output.name());
+    }
+    match (owner, found) {
+        (Whose::Surface(_, name), _) => Some(name.clone()),
+        (_, Found::LayerShell(surface)) => state
+            .space
+            .outputs()
+            .find(|output| {
+                layer_map_for_output(output)
+                    .layer_geometry(surface)
+                    .is_some()
+            })
+            .map(smithay::output::Output::name),
+        (Whose::Pane(pane, _), _) => state
+            .pane_outer_of(*pane)
+            .and_then(|outer| state.output_of(outer))
+            .map(|output| output.name()),
+        (Whose::LayerShell(_), _) => None,
+    }
+}
+
+/// A T2 slot's places: one per monitor its padded box (the part where it
+/// is `measured`, grown by `pad` physical pixels at `scale`, its own
+/// monitor's) overlaps, or only its own monitor's under
+/// `effects.xray.straddle = "own"`. Each holds its box in the xray's pixels
+/// and in the monitor's own, which the T2 key reads, and what its run reads
+/// there: `part`, the slot's own box, at rest; anywhere else the drawn
+/// part's own pixels on that monitor, padded as the slot is, its radii
+/// scaled with the picture (Ruling F37, amended 2026-10-14).
+/// `state::tests::real_client::a_window_across_two_monitors_has_a_t2_place_on_each`,
+/// `state::tests::real_client::a_drag_finer_than_an_xray_pixel_moves_the_t2_key_at_half_scale`,
+/// `state::tests::real_client::a_gliding_windows_t2_place_follows_its_drawn_rectangle`.
+fn t2_places(
+    state: &Solium,
+    owner: &crate::effect::plan::Owner,
+    found: &Found,
+    (cut, scale, pad): (crate::effect::xray::Cut, f64, i32),
+    measured: &Measured,
+    part: crate::effect::plan::PartBox,
+) -> Vec<crate::effect::plan::T2Place> {
+    let (rect, zoom) = match measured {
+        Measured::Drawn(rect, zoom) => (*rect, *zoom),
+        Measured::Rest(rect) => (rect.to_f64(), 1.0),
+        Measured::Beneath(rect) => (*rect, 1.0),
+    };
+    let at_rest = matches!(measured, Measured::Rest(_));
+    let grow = f64::from(pad) / scale.max(f64::EPSILON);
+    let padded = Rectangle::<f64, Logical>::new(
+        (rect.loc.x - grow, rect.loc.y - grow).into(),
+        (rect.size.w + 2.0 * grow, rect.size.h + 2.0 * grow).into(),
+    );
+    let only = match state.effect_settings.xray.straddle {
+        crate::effect::xray::Straddle::Each => None,
+        crate::effect::xray::Straddle::Own => {
+            Some(own_monitor(state, owner, found, (!at_rest).then_some(rect)))
+        }
+    };
+    let mut places = Vec::new();
+    for output in state.space.outputs() {
+        let Some(geometry) = state.space.output_geometry(output) else {
+            continue;
+        };
+        if !padded.overlaps(geometry.to_f64()) {
+            continue;
+        }
+        let monitor = output.name();
+        if only
+            .as_ref()
+            .is_some_and(|only| only.as_deref() != Some(monitor.as_str()))
+        {
+            continue;
+        }
+        let at = output.current_scale().fractional_scale();
+        let xray = crate::offscreen::xray_size(state, output);
+        let (px, map, own) = crate::effect::plan::place_on(padded, geometry, at, xray);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a zoom near 1, given to GL"
+        )]
+        let read = if at_rest {
+            part
+        } else {
+            crate::effect::plan::PartBox::around(
+                rect.size.to_physical_precise_round(at),
+                pad,
+                part.radii.map(|radius| radius * zoom as f32),
+            )
+        };
+        places.push(crate::effect::plan::T2Place {
+            monitor,
+            cut,
+            padded: px,
+            screen: crate::effect::plan::screen_box(padded, geometry, at),
+            map,
+            own,
+            part: read,
+        });
+    }
+    places.sort_by(|a, b| a.monitor.cmp(&b.monitor));
+    places
+}
+
+/// Where a T2 slot's places are measured from this pass (Ruling F37,
+/// amended 2026-10-14, live under motion and warps).
+/// `state::tests::real_client::a_gliding_windows_t2_place_follows_its_drawn_rectangle`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Measured {
+    /// Where the walk draws a pane part away from its rest without a mesh,
+    /// and the zoom its picture is drawn at: through a glide, a drag, an
+    /// open, a `sol.present` rectangle.
+    Drawn(Rectangle<f64, Logical>, f64),
+    /// Where it rests ([`part_rect`], from `pane_outer`), today's place: a
+    /// part that is not a pane's, a pane drawn at rest, a warped pane's
+    /// slot kept in its capture, every warped slot under `"rest"`.
+    Rest(Rectangle<i32, Logical>),
+    /// A warped pane's behind slot drawn beneath its warp: the bounds of
+    /// the part's cells of the mesh, global logical.
+    Beneath(Rectangle<f64, Logical>),
+}
+
+/// A part's rest rectangle carried into the frame's rectangle: its offset
+/// in the pane and its size scaled by the frame's size over the pane's.
+/// `tests::a_glided_parts_box_is_where_it_is_drawn`.
+pub(crate) fn within(
+    part: Rectangle<i32, Logical>,
+    outer: Rectangle<i32, Logical>,
+    drawn: Rectangle<f64, Logical>,
+) -> Rectangle<f64, Logical> {
+    let across = drawn.size.w / f64::from(outer.size.w.max(1));
+    let down = drawn.size.h / f64::from(outer.size.h.max(1));
+    Rectangle::new(
+        (
+            drawn.loc.x + f64::from(part.loc.x - outer.loc.x) * across,
+            drawn.loc.y + f64::from(part.loc.y - outer.loc.y) * down,
+        )
+            .into(),
+        (
+            f64::from(part.size.w) * across,
+            f64::from(part.size.h) * down,
+        )
+            .into(),
+    )
+}
+
+/// Where a wanted T2 slot's places are measured: a surface or a layer
+/// surface where it is; a pane part under a warp beneath it (a behind slot
+/// under `effects.xray.warped = "drawn"`, with neither program refused by
+/// the driver, and under `straddle = "own"` only on one monitor) or at rest
+/// (any other slot, or `"rest"`); a pane part without a warp where the walk
+/// draws it ([`presented_part`]), which at rest is where it rests.
+/// `state::tests::real_client::a_gliding_windows_t2_place_follows_its_drawn_rectangle`,
+/// `state::tests::real_client::a_warped_panes_behind_slot_is_drawn_beneath_its_warp`,
+/// `state::tests::real_client::a_warped_slot_across_two_monitors_under_own_stays_in_its_capture`.
+pub(crate) fn measured(
+    state: &Solium,
+    owner: &crate::effect::plan::Owner,
+    slot: Slot,
+    found: &Found,
+) -> Option<Measured> {
+    let rest = part_rect(state, found)?;
+    let crate::effect::plan::Owner::Pane(pane, part) = owner else {
+        return Some(Measured::Rest(rest));
+    };
+    match state.presented.get(*pane) {
+        Some(Planned::Warp { frame, grid, .. }) => {
+            let beneath = state.effect_settings.xray.warped == crate::effect::xray::Warped::Drawn
+                && slot == Slot::Behind
+                && *part != PaneSlot::Popups
+                && !state.programs.warp_refused()
+                && !state.programs.beneath_refused();
+            if !beneath {
+                return Some(Measured::Rest(rest));
+            }
+            let outer = state.pane_outer_of(*pane)?;
+            let (w, h) = (
+                f64::from(outer.size.w.max(1)),
+                f64::from(outer.size.h.max(1)),
+            );
+            let unit = crate::warp::UnitRect {
+                u0: f64::from(rest.loc.x - outer.loc.x) / w,
+                v0: f64::from(rest.loc.y - outer.loc.y) / h,
+                u1: f64::from(rest.loc.x - outer.loc.x + rest.size.w) / w,
+                v1: f64::from(rest.loc.y - outer.loc.y + rest.size.h) / h,
+            };
+            let bounds = beneath_bounds(frame, grid.as_ref(), unit)?;
+            // One place cannot feed the draw beneath a second monitor, whose
+            // hole would show the screen below: under "own" a warp across
+            // monitors keeps the slot in its capture, the cheaper rule that
+            // setting asks for (amended 2026-10-14, live under motion and warps).
+            // `state::tests::real_client::a_warped_slot_across_two_monitors_under_own_stays_in_its_capture`.
+            if state.effect_settings.xray.straddle == crate::effect::xray::Straddle::Own
+                && monitors_overlapped(state, bounds) > 1
+            {
+                return Some(Measured::Rest(rest));
+            }
+            Some(Measured::Beneath(bounds))
+        }
+        _ => presented_part(state, *pane, *part, rest),
+    }
+}
+
+/// How many monitors a rectangle overlaps with a positive area, as
+/// [`t2_places`] asks of each.
+fn monitors_overlapped(state: &Solium, rect: Rectangle<f64, Logical>) -> usize {
+    state
+        .space
+        .outputs()
+        .filter_map(|output| state.space.output_geometry(output))
+        .filter(|geometry| rect.overlaps(geometry.to_f64()))
+        .count()
+}
+
+/// A pane part's bounds under a warp, global logical: with a grid (a
+/// geometry folder's mesh, a present deform) the bounds of the part's
+/// cells of it; with a matrix alone (a tilt, an open or close that warps:
+/// one cell, the pane's corners) the part's own quad, projected exactly as
+/// `warp::mesh_part` projects a part, so a titlebar's bounds are its own
+/// band and not the whole pane's box (amended 2026-10-14, live under motion
+/// and warps).
+/// `tests::a_tilted_parts_beneath_bounds_are_its_own_band`,
+/// `warp::tests::a_parts_bounds_on_a_mesh_are_its_cells`.
+pub(crate) fn beneath_bounds(
+    frame: &present::Frame,
+    grid: Option<&crate::warp::Grid>,
+    unit: crate::warp::UnitRect,
+) -> Option<Rectangle<f64, Logical>> {
+    // Global logical: a "screen" at the origin, at scale 1.
+    let origin = Rectangle::from_size((1, 1).into());
+    let bounds = match grid {
+        Some(grid) => warp_mesh_on(origin, frame, Some(grid), crate::warp::UnitRect::WHOLE, 1.0)?
+            .part_bounds(unit)?,
+        // The part's own mesh: its texture runs 0 to 1 across the part, so
+        // every one of its triangles is the part's.
+        None => warp_mesh_on(origin, frame, None, unit, 1.0)?
+            .part_bounds(crate::warp::UnitRect::WHOLE)?,
+    };
+    Some(Rectangle::new(
+        (bounds.loc.x, bounds.loc.y).into(),
+        (bounds.size.w, bounds.size.h).into(),
+    ))
+}
+
+/// A pane part where the walk draws it this pass without a mesh, from the
+/// frame `elements` draws the pane with (`state.drawn_id_at` over
+/// `pane_outer_of` at the pass's instant, the call `stacked` makes): the
+/// client and its popups through the walk's own [`place_client`], every
+/// other part carried by the frame's rectangle ([`within`]); and the zoom
+/// (the client's fit, else the frame's width over the pane's), which
+/// scales the part's radii. At rest, today's place exactly.
+/// `state::tests::real_client::a_gliding_windows_t2_place_follows_its_drawn_rectangle`,
+/// `state::tests::real_client::a_gliding_windows_t2_place_is_measured_at_the_passs_instant`.
+fn presented_part(
+    state: &Solium,
+    pane: crate::pane::PaneId,
+    part: PaneSlot,
+    rest: Rectangle<i32, Logical>,
+) -> Option<Measured> {
+    let held = state.panes.get(pane)?;
+    let outer = state.pane_outer_of(pane)?;
+    let frame = state.drawn_id_at(pane, outer, pass_now(state));
+    if frame.rect == outer.to_f64() {
+        return Some(Measured::Rest(rest));
+    }
+    let zoom = frame.rect.size.w / f64::from(outer.size.w.max(1));
+    match part {
+        PaneSlot::Client | PaneSlot::Popups => {
+            let window = held.client()?;
+            let real = state.real_geometry(window)?;
+            let placed = place_client(state, held, &frame, outer.size, real.size);
+            let rect = match part {
+                PaneSlot::Popups => {
+                    let covered = popups_covered(window)?;
+                    Rectangle::new(
+                        (
+                            placed.origin.x + f64::from(covered.loc.x) * placed.fit.factor.x,
+                            placed.origin.y + f64::from(covered.loc.y) * placed.fit.factor.y,
+                        )
+                            .into(),
+                        (
+                            f64::from(covered.size.w) * placed.fit.factor.x,
+                            f64::from(covered.size.h) * placed.fit.factor.y,
+                        )
+                            .into(),
+                    )
+                }
+                _ => placed.client,
+            };
+            Some(Measured::Drawn(rect, placed.fit.factor.x))
+        }
+        _ => Some(Measured::Drawn(within(rest, outer, frame.rect), zoom)),
+    }
+}
+
+/// After [`record_boxes`]: each T2 place's cut wanted, and its memos judged
+/// together under `effects.memo.budget_mib` (`memo::Memos::admit_pass`,
+/// once a pass), a place that read its memos last pass first; an admitted
+/// place's memos wanted with the plan their key was made from, a refused
+/// place unshared (it runs its whole plan). Every cut and memo nobody reads
+/// this pass is not wanted. The memos wanted go into `slots` for the
+/// `xray` phase.
+/// `state::tests::real_client::xray_is_wanted_only_on_a_monitor_a_t2_slot_reads`,
+/// `state::tests::real_client::two_windows_with_one_blur_want_one_memo`,
+/// `state::tests::real_client::over_the_memo_budget_a_slot_runs_its_whole_plan`,
+/// `state::tests::real_client::two_parts_under_a_one_memo_budget_do_not_trade_it_as_their_keys_move`.
+pub(crate) fn want_t2(state: &mut Solium, slots: &mut Slots, pass: u64) {
+    use crate::effect::memo::{Ask, MemoKey};
+    state.xrays.clear_wants();
+    if slots.is_empty() {
+        slots.set_memos(Vec::new());
+        return;
+    }
+    let mut placed: Vec<(
+        crate::effect::plan::Owner,
+        Slot,
+        crate::effect::rules::RuleKey,
+        String,
+    )> = Vec::new();
+    let mut asks: Vec<Ask> = Vec::new();
+    let wanted: Vec<_> = slots
+        .wants()
+        .map(|(owner, slot, key)| (owner.clone(), slot, key))
+        .collect();
+    for (owner, slot, key) in wanted {
+        let Some(chain) = state.chains.get(key) else {
+            continue;
+        };
+        let Some(memo) = chain.memo() else {
+            continue;
+        };
+        for place in slots.places(&owner, slot) {
+            state.xrays.want(&place.monitor, place.cut);
+            let size = output_named(state, &place.monitor).map_or((1, 1), |output| {
+                let xray = crate::offscreen::xray_size(state, &output);
+                (
+                    u32::try_from(xray.w).unwrap_or(1),
+                    u32::try_from(xray.h).unwrap_or(1),
+                )
+            });
+            let memos = memo
+                .prefix
+                .as_ref()
+                .map(|prefix| {
+                    memo.exports
+                        .iter()
+                        .zip(chain.memo_keys())
+                        .map(|(export, upto)| {
+                            let key = MemoKey {
+                                monitor: place.monitor.clone(),
+                                cut: place.cut,
+                                upto: *upto,
+                            };
+                            let bytes =
+                                crate::effect::memo::plan_bytes(&prefix.upto(export.step), size);
+                            (key, bytes)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let read_last_pass = state
+                .store
+                .get(&owner, slot)
+                .filter(|held| held.rule == key)
+                .and_then(|held| held.t2.get(&place.monitor))
+                .is_some_and(|t2| t2.read_last_pass(pass));
+            asks.push(Ask {
+                memos,
+                read_last_pass,
+            });
+            placed.push((owner.clone(), slot, key, place.monitor.clone()));
+        }
+    }
+    let answers = state.memos.admit_pass(
+        &asks,
+        state.effect_settings.memo.budget_mib,
+        pass,
+        &mut state.pool,
+    );
+    let mut wanted_memos: Vec<MemoKey> = Vec::new();
+    for (((owner, slot, key, monitor), ask), admitted) in placed.into_iter().zip(asks).zip(answers)
+    {
+        if !admitted {
+            slots.set_unshared(owner, slot, &monitor);
+            continue;
+        }
+        if let Some(chain) = state.chains.get(key)
+            && let Some(prefix) = chain.memo().and_then(|memo| memo.prefix.as_ref())
+        {
+            let steps: Vec<usize> = chain
+                .memo()
+                .map(|memo| memo.exports.iter().map(|export| export.step).collect())
+                .unwrap_or_default();
+            for ((memo_key, _), step) in ask.memos.iter().zip(steps) {
+                state.memos.set_plan(memo_key, || prefix.upto(step));
+                if !wanted_memos.contains(memo_key) {
+                    wanted_memos.push(memo_key.clone());
+                }
+            }
+        }
+        state
+            .store
+            .slot_mut(&owner, slot, key)
+            .t2_mut(&monitor)
+            .read_at = Some(pass);
+    }
+    wanted_memos.sort();
+    slots.set_memos(wanted_memos);
+}
+
+/// Run each memo of `run` (`memos_to_run`'s) over its cut: its plan, the
+/// prefix up to the export it holds, at the xray's size, `backdrop` the
+/// cut's picture, held in the memo. `Done` moves its generation and counts
+/// `memo_runs`; `Pending` and `Failed` leave it with no result, so it runs
+/// again. One `begin` and one `end` around them (Ruling 10).
+/// `tests::a_memo_runs_when_its_xray_was_redrawn_and_once_for_every_slot`;
+/// what it draws is wirecheck 13a's (Task 45).
+pub(crate) fn run_xray(
+    cx: &mut RunCx<'_>,
+    pool: &mut crate::pool::Pool,
+    runner: &mut dyn Runner,
+    run: &[crate::effect::memo::MemoKey],
+) {
+    use crate::effect::run::{BoxMap, Inputs, Keys, Outcome};
+    use smithay::backend::renderer::Texture as _;
+    let mut began = false;
+    for key in run {
+        let (Some(generation), Some(texture)) = (
+            cx.xrays.generation(&key.monitor, key.cut),
+            cx.xrays.texture(&key.monitor, key.cut).cloned(),
+        ) else {
+            continue;
+        };
+        let size = texture.size();
+        let textures = [("backdrop", texture, BoxMap::WHOLE)];
+        let inputs = Inputs {
+            padded: (
+                u32::try_from(size.w).unwrap_or(1),
+                u32::try_from(size.h).unwrap_or(1),
+            ),
+            content: [0.0, 0.0, 1.0, 1.0],
+            textures: &textures,
+            radii: [0.0; 4],
+            time: cx.now,
+            transition: crate::effect::run::Transition::default(),
+            clamp_first: false,
+        };
+        let keys = Keys {
+            params: key.upto,
+            own: None,
+            shape: 0,
+        };
+        let effects = cx.effects;
+        let outcome = {
+            let Some(memo) = cx.memos.get_mut(key) else {
+                continue;
+            };
+            let crate::effect::memo::Memo { plan, held, .. } = memo;
+            let Some(plan) = plan.as_ref() else {
+                continue;
+            };
+            if !began {
+                runner.begin();
+                began = true;
+            }
+            runner.run(
+                pool,
+                &|program| effects.lookup(program),
+                effects.formats(),
+                plan,
+                held,
+                &inputs,
+                &keys,
+            )
+        };
+        match outcome {
+            Outcome::Done(_, sync) => {
+                let _ = crate::offscreen::settle(
+                    Ok::<_, std::convert::Infallible>(sync),
+                    crate::dev::fence_wait(),
+                    "a memo",
+                );
+                cx.memos.ran(key, generation);
+                crate::pacing::memo_ran();
+            }
+            // No result: it runs again on a later pass, and the places that
+            // read it draw nothing behind their part meanwhile ([16] §5).
+            Outcome::Pending | Outcome::Failed => {
+                if let Some(memo) = cx.memos.get_mut(key) {
+                    memo.made = false;
+                }
+            }
+        }
+    }
+    if began {
+        runner.end();
+    }
+}
+
+/// A slot's result as the walk places it: its texture in an
+/// `EffectElement` with the slot's own id, its commit moved only when the
+/// chain re-ran or its box changed, drawn through the masked program; `None`
+/// with no program, and then the walk draws as if the chain had failed.
+/// `effect::store::tests::an_unchanged_chain_keeps_its_outputs_id_and_commit`.
+fn ready_from(
+    state: &mut crate::effect::store::SlotState,
+    masked: Option<&GlesTexProgram>,
+    texture: GlesTexture,
+    rerun: bool,
+    part: crate::effect::plan::PartBox,
+) -> Option<crate::effect::plan::Ready> {
+    let program = masked?.clone();
+    let commit = state.commit_for(
+        crate::effect::element::Placement::of(part.padded, None, 1.0),
+        rerun,
+    );
+    Some(crate::effect::plan::Ready {
+        element: crate::effect::element::EffectElement::new(
+            state.id.clone(),
+            commit,
+            texture,
+            program,
+        ),
+        padded: part.padded,
+        reach: part.reach,
+    })
 }
 
 /// The rounding a pane's style declares, if any: the one inline effect today.
@@ -764,7 +3760,7 @@ pub(crate) fn capture_clip(
 pub(crate) fn wanted_capture(route: Route) -> Option<crate::keyed::Kind> {
     match route {
         Route::Warp => Some(crate::keyed::Kind::Pane),
-        Route::Flat => None,
+        Route::Flat | Route::Hidden => None,
     }
 }
 
@@ -781,6 +3777,9 @@ pub(crate) enum Piece {
     /// The client's own surface and the popups above it — or, for a pane whose
     /// application has not arrived, the scene standing in for one.
     Client,
+    /// An effect's slot around a part of the pane (Ruling 15). Only
+    /// [`pane_walk`] yields one.
+    Slot(PaneSlot, Slot),
 }
 
 /// A pane's pieces, topmost first: `above`, `frame`, the client, `behind`.
@@ -820,6 +3819,463 @@ pub(crate) fn pane_pieces<T>(into: &mut Vec<T>, mut piece: impl FnMut(&mut Vec<T
     }
 }
 
+/// A pane's pieces with its slots, topmost first (Ruling 15): the pane's
+/// `front`, then `PANE_ORDER` with the client's slots around the client, then
+/// the pane's `behind`; a pane `replace` is the whole of it; a client
+/// `replace` takes the client's place. Layer and titlebar slots are inside
+/// `Layers`, around their layer ([`around_layer`]), and the popups' around
+/// the popups, which go in ahead of the walk.
+/// `tests::with_no_slots_the_pane_walk_is_pane_order`,
+/// `tests::client_slots_bracket_the_client_and_replace_takes_its_place`,
+/// `tests::pane_slots_are_around_the_sandwich_and_below_the_popups`.
+pub(crate) fn pane_walk<T>(
+    into: &mut Vec<T>,
+    has: &dyn Fn(PaneSlot, Slot) -> bool,
+    mut piece: impl FnMut(&mut Vec<T>, Piece),
+) {
+    if has(PaneSlot::Pane, Slot::Replace) {
+        piece(into, Piece::Slot(PaneSlot::Pane, Slot::Replace));
+        return;
+    }
+    if has(PaneSlot::Pane, Slot::Front) {
+        piece(into, Piece::Slot(PaneSlot::Pane, Slot::Front));
+    }
+    for each in PANE_ORDER {
+        match each {
+            Piece::Client => {
+                if has(PaneSlot::Client, Slot::Replace) {
+                    piece(into, Piece::Slot(PaneSlot::Client, Slot::Replace));
+                    continue;
+                }
+                if has(PaneSlot::Client, Slot::Front) {
+                    piece(into, Piece::Slot(PaneSlot::Client, Slot::Front));
+                }
+                piece(into, Piece::Client);
+                if has(PaneSlot::Client, Slot::Behind) {
+                    piece(into, Piece::Slot(PaneSlot::Client, Slot::Behind));
+                }
+            }
+            other => piece(into, other),
+        }
+    }
+    if has(PaneSlot::Pane, Slot::Behind) {
+        piece(into, Piece::Slot(PaneSlot::Pane, Slot::Behind));
+    }
+}
+
+/// The layer the titlebar's slots bracket: the one named `bar`, else the
+/// first `frame` layer, else none.
+/// `tests::titlebar_slots_bracket_the_bar_layer`.
+pub(crate) fn titlebar_layer(layers: &[(usize, Depth, &str)]) -> Option<usize> {
+    layers
+        .iter()
+        .find(|(_, _, name)| *name == "bar")
+        .or_else(|| layers.iter().find(|(_, depth, _)| *depth == Depth::Frame))
+        .map(|(index, _, _)| *index)
+}
+
+/// Where a slot around one of a style's layers goes: just before the layer
+/// (over it), in its place, or just after it (under it).
+/// `tests::around_a_layer_its_own_slots_are_outermost_and_the_titlebars_inside`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Around {
+    Before,
+    InPlace,
+    After,
+}
+
+/// The slots around the style's layer at `index`, topmost first, and where
+/// each goes: the layer's own outermost, and the titlebar's inside them when
+/// `titlebar` names this layer, a titlebar being a band of its layer. A
+/// layer's `replace` goes in its place; the titlebar's goes over the layer.
+/// `tests::around_a_layer_its_own_slots_are_outermost_and_the_titlebars_inside`.
+pub(crate) fn around_layer(
+    index: usize,
+    titlebar: Option<usize>,
+) -> impl Iterator<Item = (PaneSlot, Slot, Around)> {
+    let bar = titlebar == Some(index);
+    let layer = PaneSlot::Layer(index);
+    [
+        Some((layer, Slot::Front, Around::Before)),
+        bar.then_some((PaneSlot::Titlebar, Slot::Front, Around::Before)),
+        bar.then_some((PaneSlot::Titlebar, Slot::Replace, Around::Before)),
+        Some((layer, Slot::Replace, Around::InPlace)),
+        bar.then_some((PaneSlot::Titlebar, Slot::Behind, Around::After)),
+        Some((layer, Slot::Behind, Around::After)),
+    ]
+    .into_iter()
+    .flatten()
+}
+
+/// `Decoration::layer_elements`' hook over the slots [`layer_slots`] placed:
+/// before the layer at `index`, those that go before it; after it, its
+/// `replace` in place of what the layer pushed, then those that go after.
+/// Each is pushed once. `tests::a_layers_replace_takes_its_place_and_its_other_slots_go_around_it`.
+pub(crate) fn place_around<T>(
+    placed: &mut [(usize, Around, Option<T>)],
+    mark: &mut usize,
+    into: &mut Vec<T>,
+    index: usize,
+    before: bool,
+) {
+    let mut push = |into: &mut Vec<T>, around: Around| {
+        into.extend(
+            placed
+                .iter_mut()
+                .filter(|(at, place, _)| *at == index && *place == around)
+                .filter_map(|(_, _, element)| element.take()),
+        );
+    };
+    if before {
+        push(into, Around::Before);
+        *mark = into.len();
+        return;
+    }
+    let len = into.len();
+    push(into, Around::InPlace);
+    if into.len() > len {
+        into.drain(*mark..len);
+    }
+    push(into, Around::After);
+}
+
+/// Whether a pane's slot has a result to draw: readiness and not wanting,
+/// so a wanted slot whose chain failed, or has not run, draws the part
+/// (`replace`) or nothing (`behind`, `front`). The one predicate the pane
+/// walk asks; on `monitor` a T2 slot is ready where it has that monitor's
+/// result (`effect::plan::tests::a_monitors_own_result_wins_over_the_slots_one`).
+/// `tests::a_wanted_slot_with_nothing_ready_draws_what_no_slot_draws`.
+pub(crate) fn slot_ready<'a>(
+    slots: &'a Slots,
+    pane: crate::pane::PaneId,
+    monitor: Option<&'a str>,
+) -> impl Fn(PaneSlot, Slot) -> bool + 'a {
+    move |part, slot| {
+        let owner = crate::effect::plan::Owner::Pane(pane, part);
+        match monitor {
+            // On one monitor, a T2 slot's result there or the slot's one.
+            Some(monitor) => slots.is_ready_on(&owner, slot, monitor),
+            None => slots.is_ready(&owner, slot),
+        }
+    }
+}
+
+/// A warped pane's capture: every slot ready this pass, in the flat path's
+/// order. `tests::a_warped_panes_capture_walks_its_client_slot`.
+pub(crate) fn capture_pieces(slots: &Slots, pane: crate::pane::PaneId) -> Vec<Piece> {
+    let mut pieces = Vec::new();
+    pane_walk(
+        &mut pieces,
+        &slot_ready(slots, pane, None),
+        |into, piece| {
+            into.push(piece);
+        },
+    );
+    pieces
+}
+
+/// A whole pane's self capture: its inner parts' results, never its own
+/// `pane` slots, which would read the last pass's result of the effect being
+/// run. `tests::a_whole_panes_capture_walks_its_inner_slots_and_not_its_own`.
+pub(crate) fn inner_pieces(slots: &Slots, pane: crate::pane::PaneId) -> Vec<Piece> {
+    let ready = slot_ready(slots, pane, None);
+    let mut pieces = Vec::new();
+    pane_walk(
+        &mut pieces,
+        &|part, slot| part != PaneSlot::Pane && ready(part, slot),
+        |into, piece| into.push(piece),
+    );
+    pieces
+}
+
+/// Whether a run phase has a chain to run: a wanted slot whose bound chain
+/// runs in `nest`. One that has none binds no carrier (Ruling 17).
+/// `tests::a_run_phase_with_no_chain_of_its_own_binds_nothing`.
+pub(crate) fn runs_in(slots: &Slots, chains: &crate::effect::plan::Chains, nest: Nest) -> bool {
+    slots.wants().any(|(owner, _, key)| {
+        chains
+            .get(key)
+            .is_some_and(|chain| Nest::of(owner, chain.tier) == nest)
+    })
+}
+
+/// Whether a pane drawn over `drawn` reaches `screen` once grown by `reach`
+/// on every side, the furthest its slots' results reach past it: the bleed
+/// cull. `tests::the_bleed_cull_counts_an_effects_reach`.
+pub(crate) fn reaches(
+    drawn: Rectangle<f64, Logical>,
+    reach: i32,
+    screen: Rectangle<i32, Logical>,
+) -> bool {
+    let reach = f64::from(reach);
+    Rectangle::<f64, Logical>::new(
+        (drawn.loc.x - reach, drawn.loc.y - reach).into(),
+        (drawn.size.w + 2.0 * reach, drawn.size.h + 2.0 * reach).into(),
+    )
+    .overlaps(screen.to_f64())
+}
+
+/// Where a ready slot's result goes on an output: its padded box over
+/// `part`, the part's own rectangle there in physical pixels, grown by the
+/// result's `reach` scaled as the part is drawn against the size it was
+/// padded at; and the part, with its `radii`, as the mask inside that box.
+/// `tests::a_slot_is_placed_over_its_part_grown_by_its_reach_as_the_part_is_drawn`.
+pub(crate) fn slot_placement(
+    part: Rectangle<f64, Physical>,
+    padded: Size<i32, Physical>,
+    reach: i32,
+    radii: Corners,
+) -> (
+    Rectangle<i32, Physical>,
+    (Rectangle<f64, Physical>, Corners),
+) {
+    let own = |padded: i32| f64::from((padded - 2 * reach).max(1));
+    let across = f64::from(reach) * part.size.w / own(padded.w);
+    let down = f64::from(reach) * part.size.h / own(padded.h);
+    let dst = Rectangle::<f64, Physical>::new(
+        (part.loc.x - across, part.loc.y - down).into(),
+        (part.size.w + 2.0 * across, part.size.h + 2.0 * down).into(),
+    )
+    .to_i32_round();
+    let mask = Rectangle::new(
+        (
+            part.loc.x - f64::from(dst.loc.x),
+            part.loc.y - f64::from(dst.loc.y),
+        )
+            .into(),
+        part.size,
+    );
+    (dst, (mask, radii))
+}
+
+/// Whether a slot's result is cut by its part's shape (\[16\] §2): unless
+/// its rule asks for the self capture's alpha, or its chain reads `shape`
+/// and so draws its own edges.
+/// `tests::a_result_is_cut_by_its_parts_shape_unless_it_owns_its_edges`.
+pub(crate) fn cut_by_shape(mask: MaskKind, reads_shape: bool) -> bool {
+    mask == MaskKind::Shape && !reads_shape
+}
+
+/// Every corner times `by`.
+fn corners_times(radii: Corners, by: f64) -> Corners {
+    Corners {
+        top_left: radii.top_left * by,
+        top_right: radii.top_right * by,
+        bottom_left: radii.bottom_left * by,
+        bottom_right: radii.bottom_right * by,
+    }
+}
+
+/// Which walk a slot is placed in: the frame's own, or a pane's capture.
+/// `tests::a_beneath_slot_is_a_hole_only_inside_a_capture`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Within {
+    Screen,
+    Capture,
+}
+
+/// What a ready slot draws in a walk.
+/// `tests::a_beneath_slot_is_a_hole_only_inside_a_capture`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SlotDraw {
+    /// Its result, over its part.
+    Result,
+    /// A hole in its part's shape: the slot is drawn beneath the pane's
+    /// warp, and what the pane's lower layers drew there is taken out.
+    Hole,
+    /// Nothing: a beneath slot with no texture on some monitor this pass
+    /// (its memo pending, its run failed), drawn as the flat path draws a
+    /// slot not ready there, the pane's lower layers showing, and never a
+    /// hole with nothing beneath it (amended 2026-10-14, live under motion
+    /// and warps).
+    Skip,
+}
+
+/// A beneath slot is a hole inside its pane's capture and nowhere else,
+/// and only while every one of its places has its texture this pass
+/// (`Slots::screened_all`): the capture is one picture for every monitor
+/// the warp is drawn on, so a monitor without its `Under` would show the
+/// screen below through the hole. Both captures of a pane are inside: the
+/// warp's, and a whole pane's self or mask capture, whose result lies over
+/// the client's hole in the warp's capture (Ruling F37).
+/// `tests::a_beneath_slot_is_a_hole_only_inside_a_capture`.
+pub(crate) fn slot_draw(within: Within, beneath: bool, screened: bool) -> SlotDraw {
+    match (within, beneath, screened) {
+        (Within::Capture, true, true) => SlotDraw::Hole,
+        (Within::Capture, true, false) => SlotDraw::Skip,
+        _ => SlotDraw::Result,
+    }
+}
+
+/// A ready slot's result placed over its part, `part` being the part's
+/// mask on this output in logical pixels (`effect::mask`), cut by it as
+/// [`cut_by_shape`] says, at `alpha`; nothing for a slot with no result on
+/// `monitor`, the output it is drawn on. In a capture, a slot drawn beneath
+/// its pane's warp is a hole, or nothing ([`slot_draw`]).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one slot placed: whose, which, over what, on which monitor and in which walk, at what scale and alpha"
+)]
+fn slot_element(
+    state: &Solium,
+    slots: &Slots,
+    owner: &crate::effect::plan::Owner,
+    slot: Slot,
+    part: Mask,
+    scale: f64,
+    alpha: f32,
+    (monitor, within): (Option<&str>, Within),
+) -> Option<Element> {
+    match slot_draw(
+        within,
+        slots.is_beneath(owner, slot),
+        slots.screened_all(owner, slot),
+    ) {
+        SlotDraw::Result => {}
+        SlotDraw::Skip => return None,
+        SlotDraw::Hole => {
+            let Mask::Rect { rect, radii } = part else {
+                return None;
+            };
+            let program = state.programs.beneath_compiled()?;
+            let id = state.store.get(owner, slot)?.hole.clone();
+            return Some(Element::Hole(crate::effect::beneath::Hole::new(
+                owner.clone(),
+                slot,
+                id,
+                rect.to_physical(scale),
+                radii_of(corners_times(radii, scale)),
+                program,
+            )));
+        }
+    }
+    // On `monitor`, its own result there (a T2 slot's) or the slot's one
+    // (`effect::plan::tests::a_monitors_own_result_wins_over_the_slots_one`).
+    let ready = match monitor {
+        Some(monitor) => slots.at_on(owner, slot, monitor),
+        None => slots.at(owner, slot),
+    }?;
+    let Mask::Rect { rect, radii } = part else {
+        return None;
+    };
+    let key = slots.key(owner, slot)?;
+    let style = match owner {
+        crate::effect::plan::Owner::Pane(pane, _) => state
+            .panes
+            .get(*pane)
+            .map_or(&[][..], |held| style_rules(held.frame()).0),
+        crate::effect::plan::Owner::Surface(..) | crate::effect::plan::Owner::LayerShell(_) => &[],
+    };
+    let cut = cut_by_shape(
+        state
+            .rules
+            .rule(style, key)
+            .map_or(MaskKind::Shape, |rule| rule.mask),
+        state
+            .chains
+            .get(key)
+            .is_some_and(|chain| chain.plan.reads.shape),
+    );
+    let (dst, mask) = slot_placement(
+        rect.to_physical(scale),
+        ready.padded.size,
+        ready.reach,
+        corners_times(radii, scale),
+    );
+    // A slot fading in or out with its rule is drawn at its fade's opacity,
+    // its result as it is (`effect::fade`).
+    Some(Element::Effect(ready.element.at(
+        dst,
+        cut.then_some(mask),
+        alpha * slots.opacity(owner, slot),
+    )))
+}
+
+/// The ready slots around a pane's layers at `depth`, placed, each with its
+/// layer's place and where it goes ([`around_layer`]): what `chrome`'s hook
+/// pushes ([`place_around`]), made before the decoration is borrowed to draw
+/// them.
+fn layer_slots(
+    state: &Solium,
+    slots: &Slots,
+    (monitor, within): (Option<&str>, Within),
+    pane: crate::pane::PaneId,
+    depth: Depth,
+    drawing: crate::decoration::Drawing,
+) -> Vec<(usize, Around, Option<Element>)> {
+    let mut placed = Vec::new();
+    if slots.is_empty() {
+        return placed;
+    }
+    let Some(decoration) = state.panes.get(pane).and_then(Pane::decoration) else {
+        return placed;
+    };
+    let places: Vec<(usize, Depth, &str)> = decoration.layer_places().collect();
+    let titlebar = titlebar_layer(&places);
+    let regions = crate::effect::mask::FromInsets {
+        insets: decoration.insets(),
+        outer: drawing.outer,
+        radii: declared_rounding(state, pane).map_or(Corners::all(0.0), |effect| effect.radii()),
+    };
+    let zoom = (
+        drawing.rect.size.w / f64::from(drawing.outer.w.max(1)),
+        drawing.rect.size.h / f64::from(drawing.outer.h.max(1)),
+    );
+    for &(index, at, _) in &places {
+        if at != depth {
+            continue;
+        }
+        for (part, slot, around) in around_layer(index, titlebar) {
+            let owner = crate::effect::plan::Owner::Pane(pane, part);
+            let ready = match monitor {
+                Some(monitor) => slots.is_ready_on(&owner, slot, monitor),
+                None => slots.is_ready(&owner, slot),
+            };
+            if !ready {
+                continue;
+            }
+            let mask = match part {
+                PaneSlot::Titlebar => regions.region("titlebar").map(|(band, radii)| Mask::Rect {
+                    rect: Rectangle::new(
+                        (
+                            drawing.rect.loc.x + f64::from(band.loc.x) * zoom.0,
+                            drawing.rect.loc.y + f64::from(band.loc.y) * zoom.1,
+                        )
+                            .into(),
+                        (
+                            f64::from(band.size.w) * zoom.0,
+                            f64::from(band.size.h) * zoom.1,
+                        )
+                            .into(),
+                    ),
+                    radii: corners_times(radii, zoom.0),
+                }),
+                _ => decoration
+                    .layer_canvas(index, drawing)
+                    .map(|canvas| Mask::Rect {
+                        rect: canvas,
+                        radii: Corners::all(0.0),
+                    }),
+            };
+            if let Some(element) = mask.and_then(|mask| {
+                slot_element(
+                    state,
+                    slots,
+                    &owner,
+                    slot,
+                    mask,
+                    drawing.scale,
+                    drawing.alpha,
+                    (monitor, within),
+                )
+            }) {
+                placed.push((index, around, Some(element)));
+            }
+        }
+    }
+    placed
+}
+
 /// The frame around a pane, at one depth.
 ///
 /// Takes the pane's whole transform — through [`crate::decoration::Drawing`] —
@@ -835,17 +4291,25 @@ pub(crate) fn pane_pieces<T>(into: &mut Vec<T>, mut piece: impl FnMut(&mut Vec<T
 /// appears on hover, a border that does not push the client around — is a
 /// decoration too. And it covers the whole window rather than a strip of it,
 /// which is what lets one put its bar on any side, or draw a border, or both.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the frame's own state, and the slots and monitor its layers' slots are placed from"
+)]
 fn chrome(
     state: &mut Solium,
     renderer: &mut GlesRenderer,
     elements: &mut Vec<Element>,
+    slots: Option<&Slots>,
+    monitor: (Option<&str>, Within),
     pane: crate::pane::PaneId,
     depth: Depth,
     drawing: crate::decoration::Drawing,
 ) {
     let title = state.pane_title(pane);
+    let app_id = state.pane_app_id(pane);
     let look = crate::decoration::Look {
         title: &title,
+        app_id: &app_id,
         focused: state.looks_focused(pane),
         pointer_inside: state.pointer_over(pane),
         // `text_input::tests::only_the_pane_whose_window_has_the_caret_is_given_it`.
@@ -853,6 +4317,9 @@ fn chrome(
         // `decoration::tests::a_layer_is_told_the_configurations_values_and_told_again_when_they_change`.
         values: state.decorations.values(),
     };
+    let mut around = slots
+        .map(|slots| layer_slots(state, slots, monitor, pane, depth, drawing))
+        .unwrap_or_default();
     let mut animating = false;
     if let Some(decoration) = state.panes.get_mut(pane).and_then(Pane::decoration_mut) {
         // Already `Element`s: a layer is a memory buffer on the software path
@@ -862,7 +4329,11 @@ fn chrome(
         // And already an answer about whether they are still moving, out of the
         // same call: asking afterwards is asking the flag the draw just spent.
         // See [`Drawn`].
-        animating = decoration.layer_elements(renderer, depth, &look, drawing, elements);
+        let mut mark = 0;
+        let mut hook = |into: &mut Vec<Element>, index: usize, before: bool| {
+            place_around(&mut around, &mut mark, into, index, before);
+        };
+        animating = decoration.layer_elements(renderer, depth, &look, drawing, elements, &mut hook);
     }
     // Ask for another frame while the decoration is still moving. The client
     // has not damaged anything, so without this the next frame never comes and
@@ -872,22 +4343,146 @@ fn chrome(
     }
 }
 
+/// The rectangle the layer at `index` of a pane's style is rasterised into,
+/// at rest: the pane grown by that layer's bleed (`decoration::canvas`), its
+/// corner as far above and left of the pane's as the bleed reaches. What a
+/// layer's self capture holds, its corner at the pad
+/// (`tests::a_layers_capture_puts_its_canvas_corner_at_the_pad`).
+pub(crate) fn layer_canvas(
+    state: &Solium,
+    pane: crate::pane::PaneId,
+    index: usize,
+) -> Option<Rectangle<i32, Logical>> {
+    let held = state.panes.get(pane)?;
+    let outer = state.pane_outer(held).size;
+    let drawing = crate::decoration::Drawing {
+        rect: present::logical((0.0, 0.0), (f64::from(outer.w), f64::from(outer.h))),
+        outer,
+        alpha: 1.0,
+        scale: 1.0,
+        // Only the canvas is asked of it, which no instant changes.
+        now: std::time::Duration::ZERO,
+    };
+    held.decoration()?
+        .layer_canvas(index, drawing)
+        .map(|canvas| canvas.to_i32_round())
+}
+
+/// The one layer at `index` of a pane's style, its canvas's corner at `at`
+/// in the target's physical pixels ([`layer_drawing_at`]):
+/// `Decoration::layer_elements` at that layer's depth, keeping only what its
+/// hook saw pushed for that layer ([`only_layer`]). A layer's self capture
+/// (`offscreen::part_job`); `None` for a dormant layer, or one the pane's
+/// style does not have. `tests::a_layers_capture_puts_its_canvas_corner_at_the_pad`,
+/// `tests::one_layer_keeps_only_the_layer_it_names`.
+pub(crate) fn one_layer(
+    state: &mut Solium,
+    renderer: &mut GlesRenderer,
+    pane: crate::pane::PaneId,
+    index: usize,
+    at: Point<i32, Physical>,
+    scale: f64,
+) -> Option<Element> {
+    let canvas = layer_canvas(state, pane, index)?;
+    let held = state.panes.get(pane)?;
+    let outer = state.pane_outer(held).size;
+    let (_, depth, _) = held
+        .decoration()?
+        .layer_places()
+        .find(|(each, ..)| *each == index)?;
+    let drawing = layer_drawing_at(canvas, outer, at, scale, pass_now(state));
+    let title = state.pane_title(pane);
+    let app_id = state.pane_app_id(pane);
+    let look = crate::decoration::Look {
+        title: &title,
+        app_id: &app_id,
+        focused: state.looks_focused(pane),
+        pointer_inside: state.pointer_over(pane),
+        caret: state.caret_in(pane),
+        values: state.decorations.values(),
+    };
+    let decoration = state.panes.get_mut(pane)?.decoration_mut()?;
+    let mut animating = false;
+    let element = only_layer(index, |into, hook| {
+        animating = decoration.layer_elements(renderer, depth, &look, drawing, into, hook);
+    });
+    // As `chrome` asks: the decoration has damaged nothing, so a frame not
+    // asked for here never comes and its animation stops where it stood.
+    if animating {
+        state.redraw = true;
+    }
+    element
+}
+
+/// The drawing that puts a layer's `canvas` (its rectangle at rest, from
+/// [`layer_canvas`]) with its corner at `at`, in physical pixels at `scale`:
+/// the pane's own corner the layer's bleed inside it.
+/// `tests::a_layers_capture_puts_its_canvas_corner_at_the_pad`.
+pub(crate) fn layer_drawing_at(
+    canvas: Rectangle<i32, Logical>,
+    outer: Size<i32, Logical>,
+    at: Point<i32, Physical>,
+    scale: f64,
+    now: std::time::Duration,
+) -> crate::decoration::Drawing {
+    let corner = at.to_f64().to_logical(scale);
+    crate::decoration::Drawing {
+        rect: present::logical(
+            (
+                corner.x - f64::from(canvas.loc.x),
+                corner.y - f64::from(canvas.loc.y),
+            ),
+            (f64::from(outer.w), f64::from(outer.h)),
+        ),
+        outer,
+        alpha: 1.0,
+        scale,
+        now,
+    }
+}
+
+/// What `draw` pushes for the layer at `index` and nothing else: `draw` is
+/// handed the list and `Decoration::layer_elements`' hook, which is called
+/// before and after each layer it draws. `None` when that layer pushed
+/// nothing or was not drawn. `tests::one_layer_keeps_only_the_layer_it_names`.
+pub(crate) fn only_layer<T>(
+    index: usize,
+    draw: impl FnOnce(&mut Vec<T>, &mut dyn FnMut(&mut Vec<T>, usize, bool)),
+) -> Option<T> {
+    let mut list = Vec::new();
+    let (mut start, mut kept) = (0, None);
+    draw(&mut list, &mut |into: &mut Vec<T>, each, before| {
+        if each == index {
+            if before {
+                start = into.len();
+            } else {
+                kept = Some(start..into.len());
+            }
+        }
+    });
+    list.drain(kept?).next()
+}
+
 /// The compositor's own scene for a pane, across the whole window.
 ///
 /// The whole window and not the client's share of it, on purpose: while this is
 /// what you are looking at there is no bar over it, and once there is, this is
 /// drawn *over* the bar as it fades. Either way it covers the window, which is
 /// what makes it the window rather than something sitting in one.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the frame's own state, and the pane, its transform and its own size"
+)]
 fn scene(
     state: &mut Solium,
     renderer: &mut GlesRenderer,
     elements: &mut Vec<Element>,
     pane: crate::pane::PaneId,
     frame: present::Frame,
+    outer: Size<i32, Logical>,
     now: std::time::Duration,
     scale: f64,
 ) {
-    let rect = frame.rect;
     let waited = state.panes.get(pane).map_or(0, |held| {
         i32::try_from(held.waited(now).as_millis()).unwrap_or(i32::MAX)
     });
@@ -901,15 +4496,7 @@ fn scene(
             .panes
             .get(pane)
             .map_or(1.0, |held| held.scene_alpha(now, fade));
-    #[expect(clippy::cast_possible_truncation, reason = "a rect on this screen")]
-    let area = smithay::utils::Rectangle::new(
-        (rect.loc.x.round() as i32, rect.loc.y.round() as i32).into(),
-        (
-            (rect.size.w.round() as i32).max(1),
-            (rect.size.h.round() as i32).max(1),
-        )
-            .into(),
-    );
+    let (laid_out, drawn) = standing_layout(outer, &frame);
     let Some(held) = state.panes.get_mut(pane).and_then(Pane::scene_mut) else {
         return;
     };
@@ -917,7 +4504,17 @@ fn scene(
     // Already an `Element`: a shell surface is a memory buffer on the software
     // path and a texture on the GPU one, and which of the two it is is its own
     // business rather than this function's.
-    elements.extend(held.element(renderer, area, now, alpha, scale).element);
+    elements.extend(
+        held.element_over(
+            renderer,
+            laid_out,
+            drawn,
+            now,
+            alpha,
+            crate::surface::Raster::at(scale),
+        )
+        .element,
+    );
     // A scene animates on its own clock and damages nothing, so the next frame
     // has to be asked for or it stops where it stands -- mid-fade, most of all.
     //
@@ -929,6 +4526,25 @@ fn scene(
     // it is waiting for its application or dissolving into one, so this asks
     // for frames for as long as that lasts and not a moment longer.
     state.redraw = true;
+}
+
+/// What a pane's standing-in scene is laid out at, and where its picture is
+/// drawn: the pane's own outer size, and the rectangle its frame presents
+/// this instant, which it is scaled into.
+///
+/// **Its own size and not the presented one**, as the pane's layers are
+/// (`Decoration::layer_elements`): a window zooming open, gliding to a new
+/// tile, or fading out is drawn from the picture it has, and only a new
+/// size of the window itself is a new picture. Laid out at the presented
+/// rectangle, it was a new size on every frame of every such animation, and
+/// on the GPU a new buffer each time: what made `loading/window` the costliest
+/// scene of the 2026-10-15 TTY trace (504 renders, 3.1 ms each).
+/// `tests::a_standing_in_scene_is_laid_out_at_its_windows_own_size`.
+pub(crate) fn standing_layout(
+    outer: Size<i32, Logical>,
+    frame: &present::Frame,
+) -> (Size<i32, Logical>, Rectangle<f64, Logical>) {
+    ((outer.w.max(1), outer.h.max(1)).into(), frame.rect)
 }
 
 /// One picture to draw: which part of the desktop, at what scale, with or
@@ -1082,12 +4698,23 @@ pub(crate) fn elements(
     // 7 ms of Qt and a pane walk that costs 7 ms of Rust look identical from
     // out here and want completely different fixes.
     let _elements = crate::pacing::span(crate::pacing::Phase::Elements);
+    // The first frame's gate holds: the frame is the clear colour, as a
+    // monitor with nothing on it is today, until what it shows is ready.
+    // No unit test reaches this: `dev/effects-check.sh xray`'s
+    // `xray-first-on`, under `SOLIUM_WARM_INJECT=3`, finds its first three
+    // frames only the clear colour, and fails with this return removed.
+    if prepared.held {
+        return Vec::new();
+    }
     let Picture {
         screen,
         scale,
         cursor: with_cursor,
     } = picture;
-    let now = state.clock.now();
+    // At the pass's one instant, the one its T2 places were measured at,
+    // however late this runs (amended 2026-10-14, live under motion and
+    // warps): `tests::the_walk_draws_at_the_passs_instant`.
+    let now = walk_instant(prepared.now, state.clock.now());
     let output_scale = Scale::from(scale);
     let mut elements = Vec::new();
     // From global coordinates into this output's own, as a float offset so a
@@ -1191,51 +4818,151 @@ pub(crate) fn elements(
     }
 
     // Everything else, in the one order there is: [`stacked`] lists it,
-    // topmost first, and this turns each entry into elements and nothing more.
+    // topmost first, and [`stacked_elements`] turns each entry into elements
+    // and nothing more, with the slots beside a surface when any slot is
+    // wanted ([`stacked_walk`]).
     let output = state.output_for(screen);
-    for each in stacked(state, screen, now) {
-        match each {
-            Stacked::Layer(surface, geometry) => {
-                // A layer map's geometry is already in its own output's
-                // coordinates, so these are the one thing on this list that
-                // must *not* be shifted.
-                let origin = geometry.loc.to_physical_precise_round(scale);
-                let layer_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
-                    surface.render_elements(renderer, origin, output_scale, 1.0);
-                elements.extend(layer_elements.into_iter().map(|element| {
-                    Element::Window(RescaleRenderElement::from_element(
-                        element,
-                        origin,
-                        Scale::from(1.0),
-                    ))
-                }));
-            }
-            Stacked::Surface(id, area, alpha) => {
-                if let Some(output) = output.as_ref() {
-                    elements.extend(scripted(
-                        state, renderer, output, id, area, alpha, screen, now, scale,
-                    ));
+    // The monitor a T2 slot's result is placed from (Ruling F30), named only
+    // while a slot is wanted (spec §8.4):
+    // `effect::plan::tests::a_monitors_own_result_wins_over_the_slots_one`.
+    let monitor = output
+        .as_ref()
+        .filter(|_| !prepared.slots.is_empty())
+        .map(smithay::output::Output::name);
+    let listed = stacked(state, screen, now);
+    let mut draw = |each: Walked| match each {
+        Walked::Stacked(each) => stacked_elements(
+            state,
+            renderer,
+            prepared,
+            output.as_ref(),
+            each,
+            screen,
+            now,
+            crate::surface::Raster::at(scale),
+            &mut elements,
+        ),
+        Walked::Slot(owner, slot, rect, alpha) => {
+            let rect = match owner {
+                crate::effect::plan::Owner::LayerShell(_) => rect,
+                crate::effect::plan::Owner::Surface(..) | crate::effect::plan::Owner::Pane(..) => {
+                    Rectangle::new(rect.loc - screen.loc, rect.size)
                 }
-            }
-            Stacked::Panes(nodes) => {
-                panes(
-                    state,
-                    renderer,
-                    prepared,
-                    &mut elements,
-                    nodes,
-                    screen,
-                    now,
-                    scale,
-                );
-            }
+            };
+            let part = Mask::Rect {
+                rect: rect.to_f64(),
+                radii: Corners::all(0.0),
+            };
+            elements.extend(slot_element(
+                state,
+                &prepared.slots,
+                &owner,
+                slot,
+                part,
+                scale,
+                alpha,
+                (monitor.as_deref(), Within::Screen),
+            ));
         }
+    };
+    match monitor.as_deref() {
+        Some(on) => stacked_walk(
+            listed,
+            on,
+            &|owner, slot| prepared.slots.is_ready_on(owner, slot, on),
+            &mut draw,
+        ),
+        None => listed.into_iter().map(Walked::Stacked).for_each(&mut draw),
     }
 
     elements
 }
 
+/// One entry of [`stacked`] as elements, pushed onto `elements`:
+/// `elements`' arm for each entry, factored out so `elements` and an xray
+/// draw one the same way (Ruling F29). A client's layer surface through its
+/// own surface tree, at its place in its output's own coordinates; a
+/// script's surface through [`scripted`], on `output`, which holds its
+/// instance (none with no output, as before); panes through [`panes`], which
+/// reads the pass's `prepared`. Pushed onto the caller's list, as [`panes`]
+/// does, so the frame of an unstyled desktop allocates nothing it did not
+/// before. Everything is placed at `raster.place`, the target's scale; a
+/// script's surface is rasterised at `raster.scale`, its monitor's own
+/// even inside an xray cut (`surface::Raster`).
+/// `state::tests::real_client::reflow_on_close::stacking`'s tests show
+/// `elements` unchanged; `offscreen::xray_job` draws a cut through it.
+/// `state::tests::real_client::the_xray_rasterises_its_scenes_at_the_monitors_scale`
+/// pins the raster a cut hands in, not this draw, which needs a renderer:
+/// `dev/effects-check.sh xray`'s `xray-half` and `xray-half-anim` do, a
+/// scene drawn at the cut's own size rendering up to three times a pass and
+/// its still cut rebuilt on every pass.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the frame's own state, handed down from `elements` or an xray's job"
+)]
+pub(crate) fn stacked_elements(
+    state: &mut Solium,
+    renderer: &mut GlesRenderer,
+    prepared: &Prepared,
+    output: Option<&smithay::output::Output>,
+    each: Stacked,
+    screen: Rectangle<i32, Logical>,
+    now: std::time::Duration,
+    raster: crate::surface::Raster,
+    elements: &mut Vec<Element>,
+) {
+    let scale = raster.place;
+    match each {
+        Stacked::Layer(surface, geometry) => {
+            // A layer map's geometry is already in its own output's
+            // coordinates, so these are the one thing on this list that
+            // must *not* be shifted.
+            let origin = geometry.loc.to_physical_precise_round(scale);
+            let layer_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+                surface.render_elements(renderer, origin, Scale::from(scale), 1.0);
+            elements.extend(layer_elements.into_iter().map(|element| {
+                Element::Window(RescaleRenderElement::from_element(
+                    element,
+                    origin,
+                    Scale::from(1.0),
+                ))
+            }));
+        }
+        Stacked::Surface(id, area, alpha) => {
+            if let Some(output) = output {
+                elements.extend(scripted(
+                    state, renderer, output, id, area, alpha, screen, now, raster,
+                ));
+            }
+        }
+        Stacked::Panes(nodes) => panes(
+            state, renderer, prepared, elements, nodes, screen, now, scale,
+        ),
+    }
+}
+
+/// The band an entry of [`stacked`] is drawn in: a client's layer surface
+/// at its layer, a script's surface at its declared one, and the windows'
+/// band for panes. What an xray's cut is chosen by
+/// (`effect::xray::XrayConfig::cut_below`) and its entries kept by
+/// (`effect::xray::SessionLayers`). A script's surface no longer declared
+/// is in no layer's band, so no cut holds it; [`stacked`] lists only
+/// declared ones.
+/// `state::tests::real_client::reflow_on_close::stacking::xray_holds_the_cuts_bands_and_nothing_else`.
+pub(crate) fn band_of(state: &Solium, each: &Stacked) -> Band {
+    match each {
+        Stacked::Layer(surface, _) => Band::Layer(layer::ours(surface.layer()), Owner::Client),
+        Stacked::Surface(id, ..) => state.surfaces.get(*id).map_or(Band::Windows, |surface| {
+            Band::Layer(surface.layer(), Owner::Script)
+        }),
+        Stacked::Panes(_) => Band::Windows,
+    }
+}
+
 /// One entry of a monitor's frame, before it is turned into elements.
+/// `Clone` and `PartialEq` so a test compares an xray's entries with
+/// [`stacked`]'s (`state::tests::real_client::reflow_on_close::stacking::xray_holds_the_cuts_bands_and_nothing_else`).
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Stacked {
     /// A client's layer surface, and where it is in its output's own
     /// coordinates.
@@ -1245,6 +4972,80 @@ pub(crate) enum Stacked {
     Surface(crate::scripted::SurfaceId, Rectangle<i32, Logical>, f32),
     /// Panes, in the order they are drawn in.
     Panes(Vec<(Node, f32)>),
+}
+
+/// One entry of [`stacked_walk`]: an entry of [`stacked`], or an effect's
+/// slot beside a layer surface or a scripted surface, with the rectangle and
+/// alpha that surface is drawn with, as its [`Stacked`] carries them.
+#[derive(Debug)]
+pub(crate) enum Walked {
+    Stacked(Stacked),
+    Slot(
+        crate::effect::plan::Owner,
+        Slot,
+        Rectangle<i32, Logical>,
+        f32,
+    ),
+}
+
+/// [`stacked`]'s entries with their slots (Ruling 15), `elements`' loop: a
+/// layer surface's or a scripted surface's `front` just over it, its
+/// `replace` in its place and its `behind` just under it, where `ready` says
+/// a slot has a result. `output` names the output they are on, which a
+/// scripted surface's slots are kept under.
+/// `state::tests::real_client::reflow_on_close::stacking::a_layer_shell_behind_slot_is_drawn_just_under_its_surface_and_a_surface_front_slot_just_over_it`;
+/// with no slot ready, every stacking test.
+pub(crate) fn stacked_walk(
+    stacked: Vec<Stacked>,
+    output: &str,
+    ready: &dyn Fn(&crate::effect::plan::Owner, Slot) -> bool,
+    mut push: impl FnMut(Walked),
+) {
+    use smithay::reexports::wayland_server::Resource as _;
+    for each in stacked {
+        let (owner, rect, alpha) = match &each {
+            Stacked::Layer(surface, geometry) => (
+                crate::effect::plan::Owner::LayerShell(surface.wl_surface().id()),
+                *geometry,
+                1.0,
+            ),
+            Stacked::Surface(id, area, alpha) => (
+                crate::effect::plan::Owner::Surface(*id, output.to_owned()),
+                *area,
+                *alpha,
+            ),
+            Stacked::Panes(_) => {
+                push(Walked::Stacked(each));
+                continue;
+            }
+        };
+        let mut each = Some(each);
+        bracket(
+            |slot| ready(&owner, slot),
+            |slot| match slot {
+                Some(slot) => push(Walked::Slot(owner.clone(), slot, rect, alpha)),
+                None => {
+                    if let Some(each) = each.take() {
+                        push(Walked::Stacked(each));
+                    }
+                }
+            },
+        );
+    }
+}
+
+/// A part with its slots, topmost first: its `front`, then its `replace` in
+/// its place or the part itself (`None`), then its `behind`, each slot only
+/// where `has` says. A layer surface, a scripted surface and a window's
+/// popups are walked so. `tests::a_part_is_bracketed_by_its_front_and_behind_and_replaced_in_its_place`.
+pub(crate) fn bracket(has: impl Fn(Slot) -> bool, mut piece: impl FnMut(Option<Slot>)) {
+    if has(Slot::Front) {
+        piece(Some(Slot::Front));
+    }
+    piece(has(Slot::Replace).then_some(Slot::Replace));
+    if has(Slot::Behind) {
+        piece(Some(Slot::Behind));
+    }
 }
 
 /// Everything on one monitor below the drag icon, topmost first.
@@ -1351,30 +5152,23 @@ pub(crate) fn stacked(
 }
 
 /// A warp's mesh on one screen, over `part` of the pane's unit square: the
-/// frame and its deform's target, both in global space, moved onto the screen
-/// together. `tests::a_genie_on_the_second_monitor_lands_on_its_target`,
+/// frame and the grid a geometry placed, both in global space, moved onto the
+/// screen together; with no grid, the part where the frame puts it.
+/// `tests::a_genie_on_the_second_monitor_lands_on_its_target`,
 /// `tests::a_genie_on_the_first_monitor_is_unchanged`.
 pub(crate) fn warp_mesh_on(
     screen: Rectangle<i32, Logical>,
     frame: &present::Frame,
-    aimed: Option<present::Aimed>,
+    grid: Option<&crate::warp::Grid>,
     part: crate::warp::UnitRect,
     scale: f64,
 ) -> Option<crate::warp::Mesh> {
     let shift = Point::<f64, Logical>::from((-f64::from(screen.loc.x), -f64::from(screen.loc.y)));
-    let onto = |rect: Rectangle<f64, Logical>| Rectangle::new(rect.loc + shift, rect.size);
-    let aimed = aimed.map(|aimed| present::Aimed {
-        to: onto(aimed.to),
-        ..aimed
-    });
-    crate::warp::mesh_part(
-        onto(frame.rect),
-        part,
-        frame.matrix,
-        aimed,
-        frame.pivot,
-        scale,
-    )
+    let rect = Rectangle::new(frame.rect.loc + shift, frame.rect.size);
+    match grid {
+        Some(grid) => crate::warp::mesh_grid(grid, shift, rect, frame.matrix, frame.pivot, scale),
+        None => crate::warp::mesh_part(rect, part, frame.matrix, frame.pivot, scale),
+    }
 }
 
 /// Draw panes, in the order given.
@@ -1400,6 +5194,14 @@ fn panes(
     ));
     let onto = |rect: smithay::utils::Rectangle<f64, smithay::utils::Logical>| {
         smithay::utils::Rectangle::new(rect.loc + shift, rect.size)
+    };
+    // The monitor a T2 slot's result is placed from (Ruling F30), asked once
+    // and only while a slot is wanted (spec §8.4):
+    // `effect::plan::tests::a_monitors_own_result_wins_over_the_slots_one`.
+    let monitor = if prepared.slots.is_empty() {
+        None
+    } else {
+        state.output_for(screen).map(|output| output.name())
     };
 
     for ((pane, window, global, mut frame), _) in order {
@@ -1480,13 +5282,16 @@ fn panes(
         // Through the same `spread` the layers themselves are placed by, so the
         // rectangle this keeps a pane alive for is the rectangle its widest
         // layer will actually occupy — including the scaling, since a window
-        // enlarged by a mode has its bleed enlarged with it.
-        let reach = crate::decoration::spread(
+        // enlarged by a mode has its bleed enlarged with it. And grown by the
+        // furthest its effects' results reach
+        // (`tests::the_bleed_cull_counts_an_effects_reach`).
+        let bled = crate::decoration::spread(
             crate::decoration::Drawing {
                 rect: frame.rect,
                 outer: outer.size,
                 alpha: frame.opacity,
                 scale,
+                now,
             },
             state
                 .panes
@@ -1498,7 +5303,9 @@ fn panes(
                 ),
         )
         .drawn;
-        if frame.matrix.is_identity() && frame.deform.is_none() && !reach.overlaps(screen.to_f64())
+        if frame.matrix.is_identity()
+            && frame.deform.is_none()
+            && !reaches(bled, prepared.slots.reach(pane), screen)
         {
             continue;
         }
@@ -1510,6 +5317,7 @@ fn panes(
             outer: outer.size,
             alpha: frame.opacity,
             scale,
+            now,
         };
 
         // Its client has gone: its frame's layers, fading with the rest of it,
@@ -1517,8 +5325,20 @@ fn panes(
         if remains {
             let mut client = Some(remains_elements(state, pane, &frame, outer.size, scale));
             pane_pieces(elements, |elements, piece| match piece {
-                Piece::Layers(depth) => chrome(state, renderer, elements, pane, depth, drawing),
+                Piece::Layers(depth) => {
+                    chrome(
+                        state,
+                        renderer,
+                        elements,
+                        None,
+                        (None, Within::Screen),
+                        pane,
+                        depth,
+                        drawing,
+                    );
+                }
                 Piece::Client => elements.extend(client.take().into_iter().flatten()),
+                Piece::Slot(..) => {}
             });
             continue;
         }
@@ -1536,10 +5356,23 @@ fn panes(
             // cover the client, and the handover does not restack anything.
             pane_pieces(elements, |elements, piece| match piece {
                 Piece::Layers(depth) if state.loading.decorated => {
-                    chrome(state, renderer, elements, pane, depth, drawing);
+                    chrome(
+                        state,
+                        renderer,
+                        elements,
+                        None,
+                        (None, Within::Screen),
+                        pane,
+                        depth,
+                        drawing,
+                    );
                 }
-                Piece::Layers(_) => (),
-                Piece::Client => scene(state, renderer, elements, pane, frame, now, scale),
+                Piece::Layers(_) | Piece::Slot(..) => (),
+                Piece::Client => {
+                    scene(
+                        state, renderer, elements, pane, frame, outer.size, now, scale,
+                    );
+                }
             });
             continue;
         }
@@ -1547,13 +5380,20 @@ fn panes(
         let Some(window) = window else {
             continue;
         };
+        // A refused present geometry under `failed = "hide"`: nothing of it
+        // this pass (`tests::a_refused_present_follows_its_failed_policy`).
+        if prepared.hidden(&window) {
+            continue;
+        }
 
         // The application has painted and the scene is fading off it. Pushed
         // before the frame and before the client, so it is above both: what is
         // underneath is already the window, and this dissolves to reveal it
         // rather than being swapped for it.
         if state.pane_has_scene(pane) {
-            scene(state, renderer, elements, pane, frame, now, scale);
+            scene(
+                state, renderer, elements, pane, frame, outer.size, now, scale,
+            );
         }
 
         let Some(real) = state.real_geometry(&window) else {
@@ -1574,17 +5414,25 @@ fn panes(
         // that resolves to nothing leaves `aimed` empty, and a window with no
         // matrix then takes the flat path below as if it had never asked for
         // an effect.
+        // Its grid is the one `prepare` built this pass, once for every
+        // output (`present_grid`).
         let aimed = state.aimed_at_for(pane, frame.deform);
         if (!frame.matrix.is_identity() || aimed.is_some())
-            && let Some((texture, program, id, commit)) = prepared.warp(&window)
+            && let Some(warped) = prepared.warp(&window)
             && let Some(pane_mesh) = warp_mesh_on(
                 screen,
                 &drawn_global,
-                aimed,
+                warped.grid.as_ref(),
                 crate::warp::UnitRect::WHOLE,
                 scale,
             )
         {
+            let (texture, program, id, commit) = (
+                warped.texture.clone(),
+                warped.program,
+                warped.id.clone(),
+                warped.commit,
+            );
             // The pane's own mesh first: it can fail (a vertex behind the
             // viewer), and then nothing of the warp is pushed and the pane
             // falls through to the flat path below, as before. A popups' mesh
@@ -1596,18 +5444,22 @@ fn panes(
             for piece in WARP_ORDER {
                 match piece {
                     WarpPiece::Over => {
-                        if let Some((over_texture, over_program, over_id, over_commit, part)) =
-                            prepared.over(&window)
-                            && let Some(mesh) =
-                                warp_mesh_on(screen, &drawn_global, aimed, part, scale)
+                        if let Some(over) = prepared.over(&window)
+                            && let Some(mesh) = warp_mesh_on(
+                                screen,
+                                &drawn_global,
+                                over.grid.as_ref(),
+                                over.part,
+                                scale,
+                            )
                         {
                             elements.push(Element::Warped(crate::warp::Warp::new(
-                                over_id,
-                                over_commit,
-                                over_texture,
+                                over.id.clone(),
+                                over.commit,
+                                over.texture.clone(),
                                 mesh,
                                 frame.opacity,
-                                over_program,
+                                over.program,
                             )));
                         }
                     }
@@ -1621,10 +5473,41 @@ fn panes(
                                 id,
                                 commit,
                                 texture,
-                                mesh,
+                                mesh.clone(),
                                 frame.opacity,
                                 program,
                             )));
+                            // Beneath the warp, in its capture's order, through
+                            // its mesh, each fragment reading the backdrop where
+                            // it is on this monitor (Ruling F37, amended
+                            // 2026-10-14): `dev/effects-check.sh motion`'s
+                            // `genie`, and wirecheck case 13i.
+                            if let Some(beneath) = state.programs.beneath_compiled() {
+                                for each in warped.under.iter().filter(|each| {
+                                    monitor.as_deref() == Some(each.monitor.as_str())
+                                }) {
+                                    let map = match each.over {
+                                        crate::effect::beneath::Over::Monitor => {
+                                            crate::effect::beneath::ScreenMap::monitor(
+                                                screen.size,
+                                                scale,
+                                            )
+                                        }
+                                        crate::effect::beneath::Over::Box(screen_box) => {
+                                            crate::effect::beneath::ScreenMap::of_box(screen_box)
+                                        }
+                                    };
+                                    elements.push(Element::Beneath(
+                                        crate::effect::beneath::Beneath::new(
+                                            each,
+                                            mesh.clone(),
+                                            map,
+                                            frame.opacity,
+                                            beneath,
+                                        ),
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
@@ -1732,17 +5615,60 @@ fn panes(
         // In front on both paths: a warped pane's popups are a capture of
         // their own, drawn as a warp in front of the pane's above
         // (`tests::a_warped_panes_popups_are_in_front_of_it`).
-        let (popups, _) = popup_elements(renderer, &window, origin, output_scale, frame.opacity);
-        // Scaled with the window and not cut to its tile: a menu has to reach
-        // past its parent's tile, and a menu cut to it would lose every item
-        // past the tile's edge. The window's own fit with the cut taken off,
-        // which is `a_popup_reaches_past_its_parents_tile`. This is the only
-        // place a toplevel's popups are drawn on this path -- the toplevel
-        // itself is drawn from its own surface tree, which holds no popups;
-        // see [`toplevel_elements`].
-        elements.extend(popups.into_iter().filter_map(|element| {
-            fitted(element, origin, fitting.uncut(), output_scale).map(Fitted::into_element)
-        }));
+        let (popups, covered) =
+            popup_elements(renderer, &window, origin, output_scale, frame.opacity);
+        let popups_part = covered.map(|covered| Mask::Rect {
+            rect: Rectangle::new(
+                (
+                    placed.origin.x + f64::from(covered.loc.x) * fitting.factor.x,
+                    placed.origin.y + f64::from(covered.loc.y) * fitting.factor.y,
+                )
+                    .into(),
+                (
+                    f64::from(covered.size.w) * fitting.factor.x,
+                    f64::from(covered.size.h) * fitting.factor.y,
+                )
+                    .into(),
+            ),
+            radii: Corners::all(0.0),
+        });
+        let popups_owner = crate::effect::plan::Owner::Pane(pane, PaneSlot::Popups);
+        let mut popups = Some(popups);
+        // With their slots around them, as any part's (`bracket`).
+        bracket(
+            |slot| match monitor.as_deref() {
+                Some(monitor) => prepared.slots.is_ready_on(&popups_owner, slot, monitor),
+                None => prepared.slots.is_ready(&popups_owner, slot),
+            },
+            |slot| match slot {
+                Some(slot) => elements.extend(popups_part.and_then(|part| {
+                    slot_element(
+                        state,
+                        &prepared.slots,
+                        &popups_owner,
+                        slot,
+                        part,
+                        scale,
+                        frame.opacity,
+                        (monitor.as_deref(), Within::Screen),
+                    )
+                })),
+                // Scaled with the window and not cut to its tile: a menu has
+                // to reach past its parent's tile, and a menu cut to it would
+                // lose every item past the tile's edge. The window's own fit
+                // with the cut taken off, which is
+                // `a_popup_reaches_past_its_parents_tile`. This is the only
+                // place a toplevel's popups are drawn on this path -- the
+                // toplevel itself is drawn from its own surface tree, which
+                // holds no popups; see [`toplevel_elements`].
+                None => {
+                    elements.extend(popups.take().into_iter().flatten().filter_map(|element| {
+                        fitted(element, origin, fitting.uncut(), output_scale)
+                            .map(Fitted::into_element)
+                    }))
+                }
+            },
+        );
 
         // **This is the sandwich.** The client goes into the list between the
         // layers its own style produced -- `above` and `frame` are already in
@@ -1783,8 +5709,45 @@ fn panes(
                 )
             })
             .unwrap_or_default();
-        pane_pieces(elements, |elements, piece| match piece {
-            Piece::Layers(depth) => chrome(state, renderer, elements, pane, depth, drawing),
+        // With its slots: what is ready this pass goes around the pieces it
+        // belongs to, and with none the walk is `PANE_ORDER`
+        // (`tests::with_no_slots_the_pane_walk_is_pane_order`).
+        let ready = slot_ready(&prepared.slots, pane, monitor.as_deref());
+        let zoom = frame.rect.size.w / f64::from(outer.size.w.max(1));
+        pane_walk(elements, &ready, |elements, piece| match piece {
+            Piece::Layers(depth) => chrome(
+                state,
+                renderer,
+                elements,
+                Some(&prepared.slots),
+                (monitor.as_deref(), Within::Screen),
+                pane,
+                depth,
+                drawing,
+            ),
+            Piece::Slot(part, slot) => {
+                let radii = declared_rounding(state, pane).map(|effect| effect.radii());
+                let mask = match part {
+                    PaneSlot::Client => crate::effect::mask::client_mask(
+                        client,
+                        radii.map(|radii| corners_times(radii, fitting.factor.x)),
+                    ),
+                    _ => crate::effect::mask::pane_mask(
+                        frame.rect,
+                        radii.map(|radii| corners_times(radii, zoom)),
+                    ),
+                };
+                elements.extend(slot_element(
+                    state,
+                    &prepared.slots,
+                    &crate::effect::plan::Owner::Pane(pane, part),
+                    slot,
+                    mask,
+                    scale,
+                    frame.opacity,
+                    (monitor.as_deref(), Within::Screen),
+                ));
+            }
             Piece::Client => {
                 // Popups are not here: they went in above the whole sandwich,
                 // before this walk started. See the comment there.
@@ -1905,7 +5868,7 @@ fn scripted(
     alpha: f32,
     screen: smithay::utils::Rectangle<i32, smithay::utils::Logical>,
     now: std::time::Duration,
-    scale: f64,
+    raster: crate::surface::Raster,
 ) -> Vec<Element> {
     let Some(surface) = state.surfaces.get_mut(id) else {
         return Vec::new();
@@ -1918,7 +5881,7 @@ fn scripted(
         smithay::utils::Rectangle::new(area.loc - screen.loc, area.size),
         now,
         alpha,
-        scale,
+        raster,
     );
     // Ask for another frame while it is still moving, exactly as `chrome`
     // does for a window frame.
@@ -1934,6 +5897,64 @@ fn scripted(
         state.redraw = true;
     }
     painted.element.into_iter().collect()
+}
+
+/// Where a scripted surface's instance on `output` goes, if it goes there.
+/// What its self capture holds.
+/// `state::tests::real_client::every_wanted_slot_has_its_part_box_padded_by_its_reach`.
+pub(crate) fn instance_area(
+    state: &Solium,
+    id: crate::scripted::SurfaceId,
+    output: &smithay::output::Output,
+) -> Option<Rectangle<i32, Logical>> {
+    let geometry = state.space.output_geometry(output)?;
+    let primary = state.primary_output();
+    state
+        .surfaces
+        .get(id)?
+        .area_on(output, geometry, primary.as_ref())
+}
+
+/// A scripted surface's instance on `output`, its corner at `at` in the
+/// target's physical pixels, rounded to the logical pixel a scene is placed
+/// on: its self capture (`offscreen::part_job`). `None` with no instance
+/// there or nothing drawn.
+pub(crate) fn scripted_instance(
+    state: &mut Solium,
+    renderer: &mut GlesRenderer,
+    id: crate::scripted::SurfaceId,
+    output: &smithay::output::Output,
+    at: Point<i32, Physical>,
+    scale: f64,
+) -> Option<Element> {
+    let area = instance_area(state, id, output)?;
+    let now = state.clock.now();
+    let corner = at.to_f64().to_logical(scale).to_i32_round();
+    let painted = state.surfaces.get_mut(id)?.instance_mut(output)?.element(
+        renderer,
+        Rectangle::new(corner, area.size),
+        now,
+        1.0,
+        crate::surface::Raster::at(scale),
+    );
+    // Still moving: the next frame is asked for, as `scripted` asks.
+    if painted.animating {
+        state.redraw = true;
+    }
+    painted.element
+}
+
+/// A client layer surface's rectangle on the output whose layer map holds
+/// it, in that output's coordinates. What its self capture holds.
+/// `state::tests::real_client::every_wanted_slot_has_its_part_box_padded_by_its_reach`.
+pub(crate) fn layer_shell_geometry(
+    state: &Solium,
+    surface: &LayerSurface,
+) -> Option<Rectangle<i32, Logical>> {
+    state
+        .space
+        .outputs()
+        .find_map(|output| layer_map_for_output(output).layer_geometry(surface))
 }
 
 /// Where *in the image* the pointer actually points, as the client set it.
@@ -2165,14 +6186,70 @@ fn cursor(
 /// sat under the titlebar and were cut at the window's edge.
 /// `state::tests::a_warped_panes_capture_holds_no_popups`,
 /// `tests::a_warped_panes_popups_are_in_front_of_it`.
+///
+/// **With its slots** (Ruling 17): every slot ready this pass, walked as the
+/// flat path walks them ([`capture_pieces`]), each result placed over its
+/// part in the capture, so a blurred window stays blurred while it is
+/// warped. `prepare` builds this only once the chains have run
+/// (`tests::a_warped_panes_capture_walks_its_client_slot`,
+/// `tests::prepare_compiles_first_and_builds_the_warps_after_the_chains`).
 pub(crate) fn flat_window_elements(
     state: &mut Solium,
     renderer: &mut GlesRenderer,
     window: &Window,
     scale: f64,
+    slots: &Slots,
+) -> Vec<Element> {
+    let pieces = state
+        .panes
+        .id_of(window)
+        .map_or_else(|| PANE_ORDER.to_vec(), |pane| capture_pieces(slots, pane));
+    flat_pane(
+        state,
+        renderer,
+        window,
+        scale,
+        (0, 0).into(),
+        slots,
+        &pieces,
+    )
+}
+
+/// [`flat_window_elements`] with the pane's corner at `at`, in the target's
+/// physical pixels ([`pane_drawing_at`]): a whole pane's self capture,
+/// padded by its chain's reach (`offscreen::part_job`), holding its inner
+/// parts' results and never its own ([`inner_pieces`]).
+/// `tests::a_pane_drawn_at_the_pad_has_its_client_inside_it`,
+/// `tests::a_whole_panes_capture_walks_its_inner_slots_and_not_its_own`.
+pub(crate) fn flat_window_elements_at(
+    state: &mut Solium,
+    renderer: &mut GlesRenderer,
+    window: &Window,
+    scale: f64,
+    at: Point<i32, Physical>,
+    slots: &Slots,
+) -> Vec<Element> {
+    let pieces = state
+        .panes
+        .id_of(window)
+        .map_or_else(|| PANE_ORDER.to_vec(), |pane| inner_pieces(slots, pane));
+    flat_pane(state, renderer, window, scale, at, slots, &pieces)
+}
+
+/// One pane drawn flat at its own size, its corner at `at`, walking
+/// `pieces`: what both captures of a pane are drawn from.
+/// `tests::a_warped_panes_capture_walks_its_client_slot`.
+fn flat_pane(
+    state: &mut Solium,
+    renderer: &mut GlesRenderer,
+    window: &Window,
+    scale: f64,
+    at: Point<i32, Physical>,
+    slots: &Slots,
+    pieces: &[Piece],
 ) -> Vec<Element> {
     let mut elements = Vec::new();
-    let Some(Flat { outer, insets }) = flat(state, window) else {
+    let Some(Flat { outer, insets, .. }) = flat(state, window) else {
         return elements;
     };
     let output_scale = Scale::from(scale);
@@ -2182,81 +6259,160 @@ pub(crate) fn flat_window_elements(
     // around the old single `frame` call did: a window drawn without its chrome
     // is a window, and one skipped entirely is a hole in the picture.
     let pane = state.panes.id_of(window);
+    // A T2 slot's result is placed from the pane's own monitor's, where its
+    // capture is taken (Ruling F30;
+    // `effect::plan::tests::a_monitors_own_result_wins_over_the_slots_one`).
+    let monitor = if slots.is_empty() {
+        None
+    } else {
+        pane.and_then(|pane| state.pane_outer_of(pane))
+            .and_then(|outer| state.output_of(outer))
+            .map(|output| output.name())
+    };
 
     // Fully opaque, and over the whole texture: this pass draws the window flat
     // at its real size and the warp applies the transform's opacity to the
     // whole texture afterwards, so applying it here as well would fade the
-    // frame squared.
-    let drawing = crate::decoration::Drawing {
-        rect: present::logical((0.0, 0.0), (f64::from(outer.w), f64::from(outer.h))),
-        outer,
-        alpha: 1.0,
-        scale,
-    };
-
-    // The client within it.
-    let origin =
-        Point::<i32, Logical>::from((insets.left, insets.top)).to_physical_precise_round(scale);
+    // frame squared. The client within it.
+    let (drawing, origin) = pane_drawing_at(outer, insets, at, scale, pass_now(state));
 
     // Asked before the walk, which holds the state.
     let rounded = pane.and_then(|pane| clipped(state, pane));
+    let radii = pane
+        .and_then(|pane| declared_rounding(state, pane))
+        .map(|effect| effect.radii());
 
-    // The same `PANE_ORDER` a flat window goes through, so a tilted window
-    // carries its layers in the order it would have had standing still. A
+    // The same walk a flat window goes through, so a tilted window carries its
+    // layers and its slots in the order it would have had standing still. A
     // second sequence of calls here is how a deformed window would come to have
     // its `above` layer underneath its client.
-    pane_pieces(&mut elements, |elements, piece| match piece {
-        Piece::Layers(depth) => {
-            if let Some(pane) = pane {
-                chrome(state, renderer, elements, pane, depth, drawing);
-            }
-        }
-        // A style's rounding, drawn here as on the flat path, so a deformed
-        // window keeps its corners: each surface through the clipped
-        // programs, at real size, cut to what the capture holds of the client
-        // (`tests::in_a_capture_a_client_is_clipped_to_what_the_capture_holds_of_it`).
-        Piece::Client => {
-            // **#232.** This path drew the raw surface at `origin`, nothing
-            // taken off, so a client with client-side shadows (its window
-            // geometry has a non-zero offset) had its picture shifted away
-            // from its frame in every captured draw: warps, genies, close
-            // fades (`pane_job`), and tilted `sol.present` presentations.
-            // The same `window_surface_origin` the flat path (`elements`)
-            // already used, so the two cannot drift apart again.
-            // `state::tests::window_surface_origin_matches_a_csd_clients_shadow_offset`.
-            let surface_origin = window_surface_origin(origin, window, scale);
-            let surfaces = client_piece(renderer, window, surface_origin, output_scale);
-            match &rounded {
-                Some((effect, programs)) => {
-                    // `origin` for the room, `surface_origin` for the tree:
-                    // the frame's content area does not move when the tree
-                    // is shifted to re-place a CSD client's shadow, so the
-                    // two anchors `capture_clip` takes must not be collapsed
-                    // into one (`tests::a_shifted_tree_does_not_shrink_the_room_its_client_is_cut_to`).
-                    let clip = capture_clip(
-                        origin,
-                        Size::<i32, Logical>::from((
-                            outer.w - insets.horizontal(),
-                            outer.h - insets.vertical(),
-                        ))
-                        .to_physical_precise_round(scale),
-                        surface_origin,
-                        window.geometry().to_physical_precise_round(scale),
-                        crate::pass::physical_radii(*effect, scale),
+    for &piece in pieces {
+        match piece {
+            // Inside a capture, where a slot drawn beneath the pane's warp
+            // is its hole (`slot_draw`; Ruling F37).
+            Piece::Layers(depth) => {
+                if let Some(pane) = pane {
+                    chrome(
+                        state,
+                        renderer,
+                        &mut elements,
+                        Some(slots),
+                        (monitor.as_deref(), Within::Capture),
+                        pane,
+                        depth,
+                        drawing,
                     );
-                    elements.extend(surfaces.into_iter().map(|surface| {
-                        Element::Clipped2(crate::clip::Clipped::new(
-                            surface,
-                            clip,
-                            programs.clone(),
-                        ))
-                    }));
                 }
-                None => elements.extend(surfaces.into_iter().map(Element::Window2)),
+            }
+            // A slot's result over its part at rest, unfaded: the client's
+            // hole for the client, the pane's outer rectangle for the rest,
+            // as the flat path's masks are at a zoom of one
+            // (`tests::a_warped_panes_capture_walks_its_client_slot`).
+            Piece::Slot(part, slot) => {
+                let Some(pane) = pane else {
+                    continue;
+                };
+                let mask = match part {
+                    PaneSlot::Client => crate::effect::mask::client_mask(
+                        present::logical(
+                            (
+                                drawing.rect.loc.x + f64::from(insets.left),
+                                drawing.rect.loc.y + f64::from(insets.top),
+                            ),
+                            (
+                                f64::from((outer.w - insets.horizontal()).max(1)),
+                                f64::from((outer.h - insets.vertical()).max(1)),
+                            ),
+                        ),
+                        radii,
+                    ),
+                    _ => crate::effect::mask::pane_mask(drawing.rect, radii),
+                };
+                elements.extend(slot_element(
+                    state,
+                    slots,
+                    &crate::effect::plan::Owner::Pane(pane, part),
+                    slot,
+                    mask,
+                    scale,
+                    1.0,
+                    (monitor.as_deref(), Within::Capture),
+                ));
+            }
+            // A style's rounding, drawn here as on the flat path, so a deformed
+            // window keeps its corners: each surface through the clipped
+            // programs, at real size, cut to what the capture holds of the client
+            // (`tests::in_a_capture_a_client_is_clipped_to_what_the_capture_holds_of_it`).
+            Piece::Client => {
+                // **#232.** This path drew the raw surface at `origin`, nothing
+                // taken off, so a client with client-side shadows (its window
+                // geometry has a non-zero offset) had its picture shifted away
+                // from its frame in every captured draw: warps, genies, close
+                // fades (`pane_job`), and tilted `sol.present` presentations.
+                // The same `window_surface_origin` the flat path (`elements`)
+                // already used, so the two cannot drift apart again.
+                // `state::tests::window_surface_origin_matches_a_csd_clients_shadow_offset`.
+                let surface_origin = window_surface_origin(origin, window, scale);
+                let surfaces = client_piece(renderer, window, surface_origin, output_scale);
+                match &rounded {
+                    Some((effect, programs)) => {
+                        // `origin` for the room, `surface_origin` for the tree:
+                        // the frame's content area does not move when the tree
+                        // is shifted to re-place a CSD client's shadow, so the
+                        // two anchors `capture_clip` takes must not be collapsed
+                        // into one (`tests::a_shifted_tree_does_not_shrink_the_room_its_client_is_cut_to`).
+                        let clip = capture_clip(
+                            origin,
+                            Size::<i32, Logical>::from((
+                                outer.w - insets.horizontal(),
+                                outer.h - insets.vertical(),
+                            ))
+                            .to_physical_precise_round(scale),
+                            surface_origin,
+                            window.geometry().to_physical_precise_round(scale),
+                            crate::pass::physical_radii(*effect, scale),
+                        );
+                        elements.extend(surfaces.into_iter().map(|surface| {
+                            Element::Clipped2(crate::clip::Clipped::new(
+                                surface,
+                                clip,
+                                programs.clone(),
+                            ))
+                        }));
+                    }
+                    None => elements.extend(surfaces.into_iter().map(Element::Window2)),
+                }
             }
         }
-    });
+    }
     elements
+}
+
+/// A pane drawn flat at its own size with its corner at `at`, in a target's
+/// physical pixels at `scale`: the drawing its layers are drawn with, and
+/// where its client's corner goes, the insets inside it. At `(0, 0)`, a
+/// warp's capture. `tests::a_pane_drawn_at_the_pad_has_its_client_inside_it`.
+pub(crate) fn pane_drawing_at(
+    outer: Size<i32, Logical>,
+    insets: crate::decoration::Insets,
+    at: Point<i32, Physical>,
+    scale: f64,
+    now: std::time::Duration,
+) -> (crate::decoration::Drawing, Point<i32, Physical>) {
+    let corner = at.to_f64().to_logical(scale);
+    let drawing = crate::decoration::Drawing {
+        rect: present::logical(
+            (corner.x, corner.y),
+            (f64::from(outer.w), f64::from(outer.h)),
+        ),
+        outer,
+        alpha: 1.0,
+        scale,
+        now,
+    };
+    let client = at
+        + Point::<i32, Logical>::from((insets.left, insets.top)).to_physical_precise_round(scale);
+    (drawing, client)
 }
 
 /// The rectangle a warped window is captured at, and where its client sits in
@@ -2267,6 +6423,10 @@ pub(crate) struct Flat {
     pub(crate) outer: Size<i32, Logical>,
     /// The frame's share of it, which puts the client's corner.
     pub(crate) insets: crate::decoration::Insets,
+    /// The client's hole in it: `outer` less the insets, at their corner.
+    /// What a client's self capture holds
+    /// (`state::tests::real_client::the_self_capture_is_padded_by_the_effects_reach`).
+    pub(crate) client: Rectangle<i32, Logical>,
 }
 
 /// What `offscreen::pane_job` and [`flat_window_elements`] draw a warped window
@@ -2281,16 +6441,26 @@ pub(crate) struct Flat {
 /// half is read from the two functions and is not tested. A window with no
 /// pane, which only smithay can put in the space, keeps `outer_geometry`.
 pub(crate) fn flat(state: &Solium, window: &Window) -> Option<Flat> {
-    match state.panes.of(window) {
-        Some(pane) => Some(Flat {
-            outer: state.pane_outer(pane).size,
-            insets: state.insets_of(pane.id()),
-        }),
-        None => Some(Flat {
-            outer: state.outer_geometry(window)?.size,
-            insets: state.frame_insets(window),
-        }),
-    }
+    let (outer, insets) = match state.panes.of(window) {
+        Some(pane) => (state.pane_outer(pane).size, state.insets_of(pane.id())),
+        None => (
+            state.outer_geometry(window)?.size,
+            state.frame_insets(window),
+        ),
+    };
+    let client = Rectangle::new(
+        (insets.left, insets.top).into(),
+        (
+            (outer.w - insets.horizontal()).max(1),
+            (outer.h - insets.vertical()).max(1),
+        )
+            .into(),
+    );
+    Some(Flat {
+        outer,
+        insets,
+        client,
+    })
 }
 
 /// Where a pane's client is drawn inside a frame, and how its buffer is put
@@ -2921,12 +7091,11 @@ where
     R::TextureId: Clone + 'static,
 {
     let mut elements = Vec::new();
-    let mut covered: Option<Rectangle<i32, Logical>> = None;
     let Some(surface) = window
         .toplevel()
         .map(|toplevel| toplevel.wl_surface().clone())
     else {
-        return (elements, covered);
+        return (elements, None);
     };
     for (popup, offset) in PopupManager::popups_for_surface(&surface) {
         let at = origin + (offset - popup.geometry().loc).to_physical_precise_round(scale);
@@ -2938,17 +7107,26 @@ where
             alpha,
             Kind::Unspecified,
         ));
-        // The tree where it is drawn, not the popup's window geometry: a popup
-        // that sets none has a zero-sized one, and what a capture of it must
-        // hold is everything drawn above.
-        // `state::tests::a_warped_panes_capture_holds_no_popups`.
-        let rect = smithay::desktop::utils::bbox_from_surface_tree(
-            popup.wl_surface(),
-            offset - popup.geometry().loc,
-        );
-        covered = Some(covered.map_or(rect, |held| held.merge(rect)));
     }
-    (elements, covered)
+    (elements, popups_covered(window))
+}
+
+/// The rectangle a toplevel's popups cover, relative to its client's corner,
+/// which may reach past the window; `None` with none open. The tree where it
+/// is drawn, not each popup's window geometry: a popup that sets none has a
+/// zero-sized one, and what a capture of it must hold is everything drawn.
+/// `state::tests::a_warped_panes_capture_holds_no_popups`,
+/// `state::tests::a_popup_past_the_window_is_captured_whole`.
+pub(crate) fn popups_covered(window: &Window) -> Option<Rectangle<i32, Logical>> {
+    let surface = window.toplevel()?.wl_surface().clone();
+    PopupManager::popups_for_surface(&surface)
+        .map(|(popup, offset)| {
+            smithay::desktop::utils::bbox_from_surface_tree(
+                popup.wl_surface(),
+                offset - popup.geometry().loc,
+            )
+        })
+        .reduce(|held, rect| held.merge(rect))
 }
 
 /// Where a client's surface itself is drawn, given the corner `origin`
@@ -3009,12 +7187,358 @@ pub(crate) fn ratio(drawn: f64, real: i32) -> f64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         Drawn, Fit, Fitted, Painted, background_colour, by_depth, fit, fitted, origin_at, ratio,
         uncovered,
     };
     use crate::qml::qt_test::on_the_qt_thread;
+
+    /// **A standing-in scene is laid out at its window's own size**: the
+    /// shipped loading scene, told how long it has waited on every frame as
+    /// `render::scene` tells it, is drawn once through a window zooming open
+    /// from 0.88 and once more through a glide that takes the window to a new
+    /// size, and not at all through a fade. Laid out at the presented
+    /// rectangle, as it was, every frame of the zoom and of the glide was a
+    /// new size and a new picture (on the GPU, a new buffer).
+    #[test]
+    fn a_standing_in_scene_is_laid_out_at_its_windows_own_size() {
+        use smithay::utils::{Logical, Rectangle, Size};
+        on_the_qt_thread(|| {
+            if crate::qml::on_gpu() {
+                return;
+            }
+            let mut scene = crate::surface::ShellSurface::new(
+                crate::pane::loading_source(None),
+                r#"{"program":"kitty","waited":0}"#,
+            )
+            .expect("the shipped loading scene builds");
+            let raster = crate::surface::Raster::at(1.0);
+            let mut drawn = 0;
+            let mut waited = 0;
+            // One frame of `render::scene`'s: whether it drew a new picture.
+            let mut frame = |scene: &mut crate::surface::ShellSurface,
+                             outer: Size<i32, Logical>,
+                             rect: Rectangle<f64, Logical>,
+                             opacity: f32| {
+                let mut at = crate::present::Frame::real(Rectangle::from_size(outer));
+                at.rect = rect;
+                at.opacity = opacity;
+                let (laid_out, placed) = super::standing_layout(outer, &at);
+                assert_eq!(placed, rect, "the picture is drawn where the frame is");
+                waited += 16;
+                scene.set_int("waited", waited);
+                scene.lay_out(raster.pixels(laid_out), 1.0);
+                let qt = scene.scene_for_test();
+                let fresh = qt.needs_render();
+                if fresh {
+                    let _ = qt.render();
+                }
+                u32::from(fresh)
+            };
+            let outer: Size<i32, Logical> = (400, 300).into();
+            // Zooming open about its centre, 0.88 to 1, as `open.lua` does.
+            for step in 0..=30 {
+                let zoom = 0.88 + 0.12 * f64::from(step) / 30.0;
+                let (w, h) = (400.0 * zoom, 300.0 * zoom);
+                let rect = Rectangle::new(
+                    (100.0 + (400.0 - w) / 2.0, 80.0 + (300.0 - h) / 2.0).into(),
+                    (w, h).into(),
+                );
+                drawn += frame(&mut scene, outer, rect, 1.0);
+            }
+            assert_eq!(drawn, 1, "drawn through the zoom");
+            // Its tile becomes 600 by 300: the pane has its new size at once,
+            // and the frame glides there from the old rectangle.
+            let wider: Size<i32, Logical> = (600, 300).into();
+            for step in 0..=30 {
+                let t = f64::from(step) / 30.0;
+                let rect = Rectangle::new(
+                    (100.0 - 100.0 * t, 80.0).into(),
+                    (400.0 + 200.0 * t, 300.0).into(),
+                );
+                drawn += frame(&mut scene, wider, rect, 1.0);
+            }
+            assert_eq!(drawn, 2, "drawn through the glide to a new size");
+            // And fading as its application arrives.
+            let rest = Rectangle::new((0.0, 80.0).into(), (600.0, 300.0).into());
+            for step in 0_u8..=10 {
+                drawn += frame(&mut scene, wider, rest, 1.0 - f32::from(step) / 10.0);
+            }
+            assert_eq!(drawn, 2, "drawn through the fade");
+        });
+    }
+
+    /// **The shape key moves with the part's box and its radii**, and only
+    /// with them: what a `depends = "shape"` state is rebuilt on.
+    #[test]
+    fn the_shape_key_moves_with_the_box_and_the_radii() {
+        let content = [0.1, 0.1, 0.8, 0.8];
+        assert_eq!(
+            super::shape_hash(content, [6.0; 4]),
+            super::shape_hash(content, [6.0; 4])
+        );
+        assert_ne!(
+            super::shape_hash(content, [6.0; 4]),
+            super::shape_hash(content, [8.0; 4])
+        );
+        assert_ne!(
+            super::shape_hash(content, [6.0; 4]),
+            super::shape_hash([0.1, 0.1, 0.8, 0.79], [6.0; 4])
+        );
+    }
+
+    /// A machine whose every draw fails: it counts the phase's `begin`, its
+    /// runs and its `end`, and answers each run with `run::preflight`'s
+    /// outcome, else `Outcome::Failed`; it has no blank, so a T0 chain runs
+    /// on it with no texture (Tasks 22 and 24 drive it).
+    #[derive(Debug, Default)]
+    pub(crate) struct NoGpu {
+        pub(crate) begins: u32,
+        pub(crate) runs: u32,
+        pub(crate) ends: u32,
+    }
+
+    impl super::Runner for NoGpu {
+        fn begin(&mut self) {
+            self.begins += 1;
+        }
+        fn run<'p>(
+            &mut self,
+            _pool: &mut crate::pool::Pool,
+            programs: &dyn Fn(u64) -> crate::effect::run::Lookup<'p>,
+            formats: Option<crate::pool::Formats>,
+            plan: &solium_effects::stage::Plan,
+            _held: &mut crate::effect::run::Held,
+            _inputs: &crate::effect::run::Inputs<'_>,
+            _keys: &crate::effect::run::Keys,
+        ) -> crate::effect::run::Outcome {
+            self.runs += 1;
+            crate::effect::run::preflight(plan, programs, formats)
+                .unwrap_or(crate::effect::run::Outcome::Failed)
+        }
+        fn end(&mut self) {
+            self.ends += 1;
+        }
+        fn blank(
+            &mut self,
+            _pool: &mut crate::pool::Pool,
+        ) -> Option<smithay::backend::renderer::gles::GlesTexture> {
+            None
+        }
+    }
+
+    /// **Only a whole pane's self chain runs in the later phase**: its
+    /// capture walks what the inner slots made (Task 25), so it is `Whole`;
+    /// every other slot, and a whole pane's chain that reads nothing of the
+    /// frame, is `Inner`.
+    #[test]
+    fn only_a_whole_panes_self_chain_runs_in_the_later_phase() {
+        use super::Nest;
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Tier;
+        let pane = crate::pane::PaneId::from_raw(1);
+        assert_eq!(
+            Nest::of(&Owner::Pane(pane, PaneSlot::Pane), Tier::Own),
+            Nest::Whole
+        );
+        for part in [
+            PaneSlot::Client,
+            PaneSlot::Popups,
+            PaneSlot::Layer(0),
+            PaneSlot::Titlebar,
+        ] {
+            assert_eq!(Nest::of(&Owner::Pane(pane, part), Tier::Own), Nest::Inner);
+        }
+        assert_eq!(
+            Nest::of(&Owner::Pane(pane, PaneSlot::Pane), Tier::Generated),
+            Nest::Inner
+        );
+        assert_eq!(
+            Nest::of(
+                &Owner::Surface(crate::scripted::SurfaceId::from_raw(1), "DP-1".to_owned()),
+                Tier::Own
+            ),
+            Nest::Inner
+        );
+    }
+
+    /// **A self slot with no input this pass runs nothing**: its capture was
+    /// neither drawn nor kept (its owner gone, or no target for it), so its
+    /// slot is not ready and the walk draws the part as with no rule; and a
+    /// phase that runs nothing opens no GPU region (Ruling 10).
+    #[test]
+    fn a_self_slot_with_no_input_runs_nothing_and_opens_no_region() {
+        use crate::effect::plan::{Chains, Owner, PaneSlot, PartBox, Slots};
+        use crate::effect::rules::{Origin, RuleKey, Slot};
+        let place = crate::effect::host::tests::scratch("render-no-input");
+        crate::effect::host::tests::folder(
+            &place,
+            "tint",
+            "return { api = 1, inputs = { 'self' }, frag = 'effect.frag' }",
+            &[(
+                "effect.frag",
+                "vec4 sol_effect(vec2 uv) { return sol_tex(uv); }\n",
+            )],
+        );
+        let mut host = crate::effect::host::Host::new(crate::effect::host::Library::with(
+            Some(place.clone()),
+            place.join("none"),
+        ));
+        host.want("rules", ["tint".to_owned()]);
+        let lua = mlua::Lua::new();
+        let value: mlua::Value = lua
+            .load(r#"{ { match = "*", part = "client", slot = "behind", effect = "tint" } }"#)
+            .eval()
+            .expect("the test's Lua");
+        let tree = crate::effect::tree::Tree::from_lua(&value)
+            .expect("readable")
+            .expect("a value");
+        let rule = crate::effect::rules::parse(&tree)
+            .expect("parses")
+            .remove(0);
+        let key = RuleKey {
+            origin: Origin::User,
+            index: 0,
+            generation: 1,
+        };
+        let mut chains = Chains::default();
+        chains.insert(key, Chains::bind(&mut host, &rule).expect("binds"));
+        let owner = Owner::Pane(crate::pane::PaneId::from_raw(1), PaneSlot::Client);
+        let mut slots = Slots::default();
+        slots.want(owner.clone(), Slot::Behind, key);
+        slots.set_box(
+            owner.clone(),
+            Slot::Behind,
+            PartBox::around((100, 80).into(), 0, [0.0; 4]),
+        );
+        let mut store = crate::effect::store::Store::default();
+        let (mut memos, xrays) = (
+            crate::effect::memo::Memos::default(),
+            crate::effect::xray::Xrays::default(),
+        );
+        let mut cx = super::RunCx {
+            store: &mut store,
+            effects: &host,
+            chains: &mut chains,
+            masked: None,
+            now: 0.0,
+            pass: 1,
+            memos: &mut memos,
+            xrays: &xrays,
+            motion: (std::time::Duration::ZERO, 0.0),
+            waited: false,
+        };
+        let (mut runner, mut pool) = (NoGpu::default(), crate::pool::Pool::new(0));
+        for nest in [super::Nest::Inner, super::Nest::Whole] {
+            super::run_slots(
+                &mut cx,
+                &mut pool,
+                &mut runner,
+                &mut slots,
+                &crate::effect::store::Drawn::default(),
+                nest,
+            );
+        }
+        assert_eq!((runner.begins, runner.runs, runner.ends), (0, 0, 0));
+        assert!(!slots.is_ready(&owner, Slot::Behind));
+        let _ = std::fs::remove_dir_all(place);
+    }
+
+    /// A T0 slot never counts its input as redrawn, so a client committing
+    /// under a generated effect does not re-run it.
+    #[test]
+    fn a_t0_slot_never_counts_as_redrawn() {
+        use crate::effect::rules::Tier;
+        assert!(!super::input_redrawn(Tier::Generated, true));
+        assert!(super::input_redrawn(Tier::Own, true));
+        assert!(!super::input_redrawn(Tier::Own, false));
+    }
+
+    /// **Twenty runs in a phase open one GPU region** (Ruling 10): \[fx0\]
+    /// Task 3's ring times sixteen regions a pass and counts the rest as
+    /// `refused`, so one region per run would read low with a dozen slots.
+    /// The twenty are generated (T0) chains, which read nothing of the frame
+    /// and so run with no self input drawn.
+    #[test]
+    fn twenty_runs_in_a_phase_open_one_region() {
+        use crate::effect::plan::{Chains, Owner, PaneSlot, PartBox, Slots};
+        use crate::effect::rules::{Origin, RuleKey, Slot};
+        let place = crate::effect::host::tests::scratch("twenty-runs");
+        crate::effect::host::tests::folder(
+            &place,
+            "glow",
+            "return { api = 1, inputs = { 'shape' }, frag = 'effect.frag' }",
+            &[(
+                "effect.frag",
+                "vec4 sol_effect(vec2 uv) { return vec4(sol_shape(uv)); }\n",
+            )],
+        );
+        let mut host = crate::effect::host::Host::new(crate::effect::host::Library::with(
+            Some(place.clone()),
+            place.join("none"),
+        ));
+        host.want("rules", ["glow".to_owned()]);
+        let lua = mlua::Lua::new();
+        let value: mlua::Value = lua
+            .load(r#"{ { match = "*", part = "client", slot = "behind", effect = "glow" } }"#)
+            .eval()
+            .expect("the test's Lua");
+        let tree = crate::effect::tree::Tree::from_lua(&value)
+            .expect("readable")
+            .expect("a value");
+        let rule = crate::effect::rules::parse(&tree)
+            .expect("parses")
+            .remove(0);
+        let (mut chains, mut slots) = (Chains::default(), Slots::default());
+        let part = PartBox::around((120, 80).into(), 12, [0.0; 4]);
+        for index in 1..=20_u32 {
+            let key = RuleKey {
+                origin: Origin::User,
+                index,
+                generation: 1,
+            };
+            chains.insert(key, Chains::bind(&mut host, &rule).expect("binds"));
+            let owner = Owner::Pane(
+                crate::pane::PaneId::from_raw(u64::from(index)),
+                PaneSlot::Client,
+            );
+            slots.want(owner.clone(), Slot::Behind, key);
+            slots.set_box(owner, Slot::Behind, part);
+        }
+        let mut store = crate::effect::store::Store::default();
+        let (mut memos, xrays) = (
+            crate::effect::memo::Memos::default(),
+            crate::effect::xray::Xrays::default(),
+        );
+        let mut cx = super::RunCx {
+            store: &mut store,
+            effects: &host,
+            chains: &mut chains,
+            masked: None,
+            now: 0.0,
+            pass: 1,
+            memos: &mut memos,
+            xrays: &xrays,
+            motion: (std::time::Duration::ZERO, 0.0),
+            waited: false,
+        };
+        let mut runner = NoGpu::default();
+        super::run_slots(
+            &mut cx,
+            &mut crate::pool::Pool::new(0),
+            &mut runner,
+            &mut slots,
+            &crate::effect::store::Drawn::default(),
+            super::Nest::Inner,
+        );
+        assert_eq!(
+            (runner.begins, runner.runs, runner.ends),
+            (1, 20, 1),
+            "one region a phase, not one a run"
+        );
+        let _ = std::fs::remove_dir_all(place);
+    }
 
     /// **A window whose warp has no program is not captured**, and goes the
     /// flat way, rounded corners included, rather than being drawn as nothing.
@@ -3024,6 +7548,16 @@ mod tests {
         assert_eq!(route(true, true), Route::Warp);
         assert_eq!(route(true, false), Route::Flat, "no program, no warp");
         assert_eq!(route(false, true), Route::Flat, "nothing to warp");
+    }
+
+    /// **A bare pane gets no style rules**: fullscreen, CSD and `pane =
+    /// "none"` panes have no `Decoration`, so a style's rules never reach them
+    /// (Ruling 15).
+    #[test]
+    fn a_bare_pane_gets_no_style_rules() {
+        let frame = crate::pane::Frame::None;
+        assert!(super::style_rules(&frame).0.is_empty());
+        assert_eq!(super::style_rules(&crate::pane::Frame::Pending).1, 0);
     }
 
     /// **The guard (spec §8.4): a pane neither warped nor styled wants no
@@ -3218,17 +7752,24 @@ mod tests {
         );
     }
 
+    /// The Rust genie's grid at progress 1 from `frame` toward `to`, global:
+    /// what these tests build their grid with since a geometry is a folder
+    /// (its Lua is held to this grid by
+    /// `warp::tests::a_lua_grid_lands_where_the_rust_genie_put_it`).
     fn genie_to(
+        frame: &crate::present::Frame,
         to: smithay::utils::Rectangle<f64, smithay::utils::Logical>,
-    ) -> crate::present::Aimed {
-        crate::present::Aimed {
-            effect: solium_effects::Deform::Genie {
+    ) -> crate::warp::Grid {
+        crate::warp::oracle_grid(
+            frame.rect,
+            to,
+            solium_effects::Deform::Genie {
                 progress: 1.0,
                 spread: 1.4,
                 axis: solium_effects::Axis::Down,
             },
-            to,
-        }
+            crate::warp::UnitRect::WHOLE,
+        )
     }
 
     /// **A genie on the second monitor lands on its target**: at progress 1 the
@@ -3240,11 +7781,14 @@ mod tests {
             (2100, 100).into(),
             (800, 600).into(),
         ));
-        let aimed = genie_to(crate::present::logical((2800.0, 1000.0), (120.0, 24.0)));
+        let grid = genie_to(
+            &frame,
+            crate::present::logical((2800.0, 1000.0), (120.0, 24.0)),
+        );
         let mesh = super::warp_mesh_on(
             screen,
             &frame,
-            Some(aimed),
+            Some(&grid),
             crate::warp::UnitRect::WHOLE,
             1.25,
         )
@@ -3270,21 +7814,54 @@ mod tests {
             (180, 100).into(),
             (800, 600).into(),
         ));
-        let aimed = genie_to(crate::present::logical((880.0, 1000.0), (120.0, 24.0)));
+        let grid = genie_to(
+            &frame,
+            crate::present::logical((880.0, 1000.0), (120.0, 24.0)),
+        );
         let on = super::warp_mesh_on(
             screen,
             &frame,
-            Some(aimed),
+            Some(&grid),
             crate::warp::UnitRect::WHOLE,
             1.25,
         )
         .expect("a mesh");
-        let direct = crate::warp::mesh(frame.rect, frame.matrix, Some(aimed), frame.pivot, 1.25)
-            .expect("a mesh");
+        let direct = crate::warp::mesh_grid(
+            &grid,
+            (0.0, 0.0).into(),
+            frame.rect,
+            frame.matrix,
+            frame.pivot,
+            1.25,
+        )
+        .expect("a mesh");
         let pairs = on.vertices().iter().zip(direct.vertices());
         assert!(
             pairs.clone().count() > 0 && pairs.into_iter().all(|(a, b)| a.x == b.x && a.y == b.y)
         );
+    }
+
+    /// **A refused present follows its `failed`** (`effects.present.failed`,
+    /// or the deform's own): `"flat"` draws the window undeformed, `"hide"`
+    /// draws nothing of it and wants no capture; a mesh that was not refused
+    /// is warped.
+    #[test]
+    fn a_refused_present_follows_its_failed_policy() {
+        use crate::effect::settings::PresentFailed;
+        let geometry = crate::present::Geometry::for_test;
+        assert_eq!(
+            super::present_route(geometry(PresentFailed::Flat), true),
+            super::Route::Flat
+        );
+        assert_eq!(
+            super::present_route(geometry(PresentFailed::Hide), true),
+            super::Route::Hidden
+        );
+        assert_eq!(
+            super::present_route(geometry(PresentFailed::Hide), false),
+            super::Route::Warp
+        );
+        assert_eq!(super::wanted_capture(super::Route::Hidden), None);
     }
 
     /// **#133: what a tiled client's surfaces become on their way to the
@@ -4339,7 +8916,7 @@ mod tests {
 
             let source = include_str!("render.rs");
             let popups = source
-                .find("let (popups, _) = popup_elements(")
+                .find("let (popups, covered) =")
                 .expect("`elements` still draws the popups");
             let sandwich = source[popups..]
                 .find("// **This is the sandwich.**")
@@ -4791,6 +9368,7 @@ mod tests {
             super::pane_pieces(&mut order, |into, piece| match piece {
                 super::Piece::Layers(depth) => into.extend(decoration.layers_at(depth)),
                 super::Piece::Client => into.push("<client>"),
+                super::Piece::Slot(..) => into.push("<slot>"),
             });
 
             assert_eq!(
@@ -4822,6 +9400,425 @@ mod tests {
                  always has"
             );
         });
+    }
+
+    /// The example fixture's `Decoration`, as
+    /// `a_client_is_drawn_between_two_layers_of_its_own_style` builds it. On
+    /// the Qt thread only, with no Wayland client in the test (the #99 rule).
+    fn example() -> crate::decoration::Decoration {
+        let dir = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/panes/example"
+        ));
+        let style = crate::style::load(dir).expect("the example fixture loads");
+        crate::decoration::Decoration::from_style(&style, 300, 200).expect("three scenes")
+    }
+
+    /// The walk over `decoration` with these slots, as names.
+    fn walked(
+        decoration: &crate::decoration::Decoration,
+        has: &dyn Fn(crate::effect::plan::PaneSlot, crate::effect::rules::Slot) -> bool,
+    ) -> Vec<String> {
+        let mut order: Vec<String> = Vec::new();
+        super::pane_walk(&mut order, has, |into, piece| match piece {
+            super::Piece::Layers(depth) => {
+                into.extend(decoration.layers_at(depth).map(ToOwned::to_owned));
+            }
+            super::Piece::Client => into.push("<client>".to_owned()),
+            super::Piece::Slot(part, slot) => into.push(format!("<{part:?} {slot:?}>")),
+        });
+        order
+    }
+
+    /// **With no slots the pane walk is `PANE_ORDER`**, exactly.
+    #[test]
+    fn with_no_slots_the_pane_walk_is_pane_order() {
+        on_the_qt_thread(|| {
+            assert_eq!(
+                walked(&example(), &|_, _| false),
+                ["spikes", "bar", "<client>", "glow"]
+            );
+        });
+    }
+
+    #[test]
+    fn client_slots_bracket_the_client_and_replace_takes_its_place() {
+        use crate::effect::plan::PaneSlot;
+        use crate::effect::rules::Slot;
+        on_the_qt_thread(|| {
+            let decoration = example();
+            assert_eq!(
+                walked(&decoration, &|part, slot| part == PaneSlot::Client
+                    && slot != Slot::Replace),
+                [
+                    "spikes",
+                    "bar",
+                    "<Client Front>",
+                    "<client>",
+                    "<Client Behind>",
+                    "glow"
+                ]
+            );
+            assert_eq!(
+                walked(&decoration, &|part, slot| part == PaneSlot::Client
+                    && slot == Slot::Replace),
+                ["spikes", "bar", "<Client Replace>", "glow"]
+            );
+        });
+    }
+
+    /// **Pane slots are around the sandwich**; the popups are not in the
+    /// walk at all (they go in ahead of it), so a pane's `front` is below them.
+    #[test]
+    fn pane_slots_are_around_the_sandwich_and_below_the_popups() {
+        use crate::effect::plan::PaneSlot;
+        use crate::effect::rules::Slot;
+        on_the_qt_thread(|| {
+            let decoration = example();
+            assert_eq!(
+                walked(&decoration, &|part, slot| part == PaneSlot::Pane
+                    && slot != Slot::Replace),
+                [
+                    "<Pane Front>",
+                    "spikes",
+                    "bar",
+                    "<client>",
+                    "glow",
+                    "<Pane Behind>"
+                ]
+            );
+            assert_eq!(
+                walked(&decoration, &|part, slot| part == PaneSlot::Pane
+                    && slot == Slot::Replace),
+                ["<Pane Replace>"]
+            );
+        });
+    }
+
+    /// **A wanted slot with nothing ready draws what no slot draws**: a
+    /// `replace` with nothing ready draws the part, `behind` and `front`
+    /// nothing, so the walk with every slot wanted and none ready is the walk
+    /// with none wanted. This is the walk's half of \[16\] §5's every-failure
+    /// test; that every real failure leaves its slot not ready is Task 24's.
+    #[test]
+    fn a_wanted_slot_with_nothing_ready_draws_what_no_slot_draws() {
+        use crate::effect::plan::{Owner, PaneSlot, Slots};
+        use crate::effect::rules::{Origin, RuleKey, Slot};
+        on_the_qt_thread(|| {
+            let pane = crate::pane::PaneId::from_raw(1);
+            let key = RuleKey {
+                origin: Origin::User,
+                index: 0,
+                generation: 1,
+            };
+            let mut slots = Slots::default();
+            for part in [
+                PaneSlot::Pane,
+                PaneSlot::Client,
+                PaneSlot::Titlebar,
+                PaneSlot::Popups,
+                PaneSlot::Layer(0),
+                PaneSlot::Layer(1),
+                PaneSlot::Layer(2),
+            ] {
+                for slot in [Slot::Behind, Slot::Front, Slot::Replace] {
+                    slots.want(Owner::Pane(pane, part), slot, key);
+                }
+            }
+            let decoration = example();
+            let ready = super::slot_ready(&slots, pane, None);
+            assert_eq!(
+                walked(&decoration, &ready),
+                walked(&decoration, &|_, _| false),
+                "a wanted slot with nothing ready changed the walk"
+            );
+        });
+    }
+
+    /// **The titlebar's slots bracket the `bar` layer**, wherever its depth:
+    /// in `rounded` the bar is at `behind`.
+    #[test]
+    fn titlebar_slots_bracket_the_bar_layer() {
+        use crate::style::Depth;
+        assert_eq!(
+            super::titlebar_layer(&[(0, Depth::Frame, "border"), (1, Depth::Behind, "bar")]),
+            Some(1)
+        );
+        assert_eq!(
+            super::titlebar_layer(&[(0, Depth::Above, "spikes"), (1, Depth::Frame, "frame")]),
+            Some(1),
+            "no `bar`: the first frame layer"
+        );
+        assert_eq!(super::titlebar_layer(&[(0, Depth::Behind, "shadow")]), None);
+    }
+
+    /// **A part's radii are its mask's, at its scale**: a client's own
+    /// corners, a whole pane's largest at every corner, none unrounded.
+    #[test]
+    fn a_parts_radii_are_its_masks_at_its_scale() {
+        use solium_effects::fragment::Corners;
+        let top = Corners {
+            top_left: 8.0,
+            top_right: 8.0,
+            bottom_left: 2.0,
+            bottom_right: 0.0,
+        };
+        assert_eq!(
+            super::mask_radii(Some(top), false, 2.0),
+            [16.0, 16.0, 4.0, 0.0]
+        );
+        assert_eq!(super::mask_radii(Some(top), true, 2.0), [16.0; 4]);
+        assert_eq!(super::mask_radii(None, true, 2.0), [0.0; 4]);
+    }
+
+    /// **The titlebar's box is its band, padded, with its outer corners**:
+    /// `top`'s 32 pixels across the window, rounded at the top only.
+    #[test]
+    fn the_titlebars_box_is_its_band_padded_with_its_outer_corners() {
+        use solium_effects::fragment::Corners;
+        let regions = crate::effect::mask::FromInsets {
+            insets: crate::decoration::Insets {
+                top: 32,
+                ..crate::decoration::Insets::default()
+            },
+            outer: (400, 300).into(),
+            radii: Corners::all(10.0),
+        };
+        assert_eq!(
+            super::region_box(&regions, "titlebar", 2.0, 4),
+            Some(crate::effect::plan::PartBox::around(
+                (800, 64).into(),
+                4,
+                [20.0, 20.0, 0.0, 0.0]
+            ))
+        );
+        assert_eq!(super::region_box(&regions, "shelf", 2.0, 4), None);
+    }
+
+    /// **A pane drawn at the pad has its client inside it**: its frame's
+    /// drawing at the pad in logical pixels, its client's corner the insets
+    /// further in; at `(0, 0)`, as a warp's capture has always drawn it.
+    #[test]
+    fn a_pane_drawn_at_the_pad_has_its_client_inside_it() {
+        let insets = crate::decoration::Insets {
+            top: 32,
+            left: 2,
+            ..crate::decoration::Insets::default()
+        };
+        let outer: smithay::utils::Size<i32, smithay::utils::Logical> = (400, 300).into();
+        for (at, scale, client) in [
+            ((0, 0), 1.0, (2, 32)),
+            ((6, 6), 1.0, (8, 38)),
+            ((12, 12), 2.0, (16, 76)),
+        ] {
+            let (drawing, origin) =
+                super::pane_drawing_at(outer, insets, at.into(), scale, std::time::Duration::ZERO);
+            let corner = drawing.rect.loc.to_physical(scale);
+            assert_eq!(
+                (corner.x, corner.y),
+                (f64::from(at.0), f64::from(at.1)),
+                "the frame's corner at {scale}"
+            );
+            assert_eq!(drawing.rect.size, outer.to_f64());
+            assert_eq!(origin, client.into(), "the client's corner at {scale}");
+        }
+    }
+
+    /// **A layer's self capture keeps only that layer**: of every layer its
+    /// depth draws, what the hook saw pushed between its own before and
+    /// after; nothing for a layer that pushed nothing or was not drawn.
+    #[test]
+    fn one_layer_keeps_only_the_layer_it_names() {
+        // Three layers drawn, 0, 2 and 3, the last pushing nothing; 1 dormant.
+        fn draw(into: &mut Vec<char>, hook: &mut dyn FnMut(&mut Vec<char>, usize, bool)) {
+            for (index, name) in [(0, Some('s')), (2, Some('b')), (3, None)] {
+                hook(into, index, true);
+                into.extend(name);
+                hook(into, index, false);
+            }
+        }
+        assert_eq!(super::only_layer(2, draw), Some('b'));
+        assert_eq!(super::only_layer(0, draw), Some('s'));
+        assert_eq!(super::only_layer(3, draw), None, "it pushed nothing");
+        assert_eq!(super::only_layer(1, draw), None, "it was not drawn");
+    }
+
+    /// **A layer's capture puts its canvas's corner at the pad**, its bleed
+    /// and all, at a fractional scale too: where `Decoration::layer_elements`
+    /// places the layer drawn with [`super::layer_drawing_at`].
+    #[test]
+    fn a_layers_capture_puts_its_canvas_corner_at_the_pad() {
+        let outer: smithay::utils::Size<i32, smithay::utils::Logical> = (300, 200).into();
+        let bleed = crate::style::Bleed {
+            top: 12,
+            right: 0,
+            bottom: 4,
+            left: 20,
+        };
+        let canvas = crate::decoration::canvas(smithay::utils::Rectangle::from_size(outer), bleed);
+        for (scale, pad) in [(1.0, 6), (2.0, 12), (1.25, 8)] {
+            let drawing = super::layer_drawing_at(
+                canvas,
+                outer,
+                (pad, pad).into(),
+                scale,
+                std::time::Duration::ZERO,
+            );
+            let spread = crate::decoration::spread(drawing, bleed);
+            assert_eq!(spread.canvas, canvas);
+            let corner = spread.drawn.loc.to_physical(scale);
+            assert!(
+                (corner.x - f64::from(pad)).abs() < 1e-9
+                    && (corner.y - f64::from(pad)).abs() < 1e-9,
+                "at {scale} the canvas's corner is at {corner:?}, not at the pad {pad}"
+            );
+            assert_eq!(
+                spread.drawn.size,
+                canvas.size.to_f64(),
+                "drawn at its own size"
+            );
+        }
+    }
+
+    /// **Around a layer its own slots are outermost**, the titlebar's inside
+    /// them on the titlebar's layer: a titlebar is a band of its layer. A
+    /// layer's `replace` goes in its place; the titlebar's, a band, over it.
+    #[test]
+    fn around_a_layer_its_own_slots_are_outermost_and_the_titlebars_inside() {
+        use super::Around::{After, Before, InPlace};
+        use crate::effect::plan::PaneSlot::{Layer, Titlebar};
+        use crate::effect::rules::Slot::{Behind, Front, Replace};
+        assert_eq!(
+            super::around_layer(1, Some(1)).collect::<Vec<_>>(),
+            [
+                (Layer(1), Front, Before),
+                (Titlebar, Front, Before),
+                (Titlebar, Replace, Before),
+                (Layer(1), Replace, InPlace),
+                (Titlebar, Behind, After),
+                (Layer(1), Behind, After),
+            ]
+        );
+        assert_eq!(
+            super::around_layer(0, Some(1)).collect::<Vec<_>>(),
+            [
+                (Layer(0), Front, Before),
+                (Layer(0), Replace, InPlace),
+                (Layer(0), Behind, After),
+            ],
+            "not the titlebar's layer"
+        );
+    }
+
+    /// **A part is bracketed by its `front` and `behind`, and replaced in its
+    /// place**: what a layer surface, a scripted surface and a window's
+    /// popups are walked by.
+    #[test]
+    fn a_part_is_bracketed_by_its_front_and_behind_and_replaced_in_its_place() {
+        use crate::effect::rules::Slot;
+        let walk = |has: &dyn Fn(Slot) -> bool| {
+            let mut order = Vec::new();
+            super::bracket(has, |slot| order.push(slot));
+            order
+        };
+        assert_eq!(walk(&|_| false), [None], "the part alone");
+        assert_eq!(
+            walk(&|slot| slot != Slot::Replace),
+            [Some(Slot::Front), None, Some(Slot::Behind)]
+        );
+        assert_eq!(walk(&|slot| slot == Slot::Replace), [Some(Slot::Replace)]);
+    }
+
+    /// **A layer's `replace` takes its place, and its other slots go around
+    /// it**: `chrome`'s hook, driven as `Decoration::layer_elements` drives
+    /// it, a layer's own elements pushed between the two calls.
+    #[test]
+    fn a_layers_replace_takes_its_place_and_its_other_slots_go_around_it() {
+        use super::Around::{After, Before, InPlace};
+        let drawn = |placed: &mut Vec<(usize, super::Around, Option<&'static str>)>| {
+            let (mut into, mut mark) = (vec!["above"], 0);
+            for (index, name) in [(0, "frame"), (1, "bar")] {
+                super::place_around(placed, &mut mark, &mut into, index, true);
+                into.push(name);
+                super::place_around(placed, &mut mark, &mut into, index, false);
+            }
+            into
+        };
+        assert_eq!(
+            drawn(&mut vec![
+                (1, Before, Some("<front>")),
+                (1, After, Some("<behind>")),
+            ]),
+            ["above", "frame", "<front>", "bar", "<behind>"]
+        );
+        assert_eq!(
+            drawn(&mut vec![
+                (1, Before, Some("<front>")),
+                (1, InPlace, Some("<replace>")),
+                (1, After, Some("<behind>")),
+            ]),
+            ["above", "frame", "<front>", "<replace>", "<behind>"]
+        );
+        assert_eq!(
+            drawn(&mut Vec::new()),
+            ["above", "frame", "bar"],
+            "nothing ready"
+        );
+    }
+
+    /// **The bleed cull counts an effect's reach**: a glow behind a pane
+    /// reaching onto a monitor keeps the pane there.
+    #[test]
+    fn the_bleed_cull_counts_an_effects_reach() {
+        let screen = smithay::utils::Rectangle::<i32, smithay::utils::Logical>::new(
+            (0, 0).into(),
+            (100, 100).into(),
+        );
+        let drawn = smithay::utils::Rectangle::<f64, smithay::utils::Logical>::new(
+            (110.0, 0.0).into(),
+            (50.0, 50.0).into(),
+        );
+        assert!(!super::reaches(drawn, 0, screen));
+        assert!(super::reaches(drawn, 12, screen));
+    }
+
+    /// **A slot is placed over its part grown by its reach, as the part is
+    /// drawn**: the padded box around the part's own rectangle, the mask the
+    /// part inside it; a part drawn at half size has its reach halved too.
+    #[test]
+    fn a_slot_is_placed_over_its_part_grown_by_its_reach_as_the_part_is_drawn() {
+        use smithay::utils::{Physical, Rectangle};
+        use solium_effects::fragment::Corners;
+        let radii = Corners::all(8.0);
+        let at = |x: f64, y: f64, w: f64, h: f64| {
+            Rectangle::<f64, Physical>::new((x, y).into(), (w, h).into())
+        };
+        let (dst, mask) =
+            super::slot_placement(at(100.0, 50.0, 200.0, 100.0), (224, 124).into(), 12, radii);
+        assert_eq!(dst, Rectangle::new((88, 38).into(), (224, 124).into()));
+        assert_eq!(mask, (at(12.0, 12.0, 200.0, 100.0), radii));
+        let (dst, mask) =
+            super::slot_placement(at(100.0, 50.0, 100.0, 50.0), (224, 124).into(), 12, radii);
+        assert_eq!(
+            dst,
+            Rectangle::new((94, 44).into(), (112, 62).into()),
+            "half size"
+        );
+        assert_eq!(mask, (at(6.0, 6.0, 100.0, 50.0), radii));
+    }
+
+    /// **A result is cut by its part's shape unless it owns its edges**: an
+    /// effect that reads `shape` draws its own (a glow outside the part), and
+    /// `mask = "alpha"` is the self capture's, not the shape's (\[16\] §2).
+    #[test]
+    fn a_result_is_cut_by_its_parts_shape_unless_it_owns_its_edges() {
+        use crate::effect::rules::MaskKind;
+        assert!(super::cut_by_shape(MaskKind::Shape, false));
+        assert!(
+            !super::cut_by_shape(MaskKind::Shape, true),
+            "it reads `shape`"
+        );
+        assert!(!super::cut_by_shape(MaskKind::Alpha, false));
     }
 
     #[test]
@@ -4952,5 +9949,480 @@ mod tests {
         let mut order = vec![("a", 0.0_f32), ("nan", f32::NAN), ("b", 0.0)];
         by_depth(&mut order);
         assert_eq!(names(&order), vec!["a", "nan", "b"]);
+    }
+
+    /// **A warped pane's capture walks its slots**: the pieces
+    /// `flat_window_elements` builds from have the client's `replace` in the
+    /// client's place, as the flat path's do. (`flat_window_elements` is
+    /// concrete on `GlesRenderer`, so the order it walks is the testable half.)
+    #[test]
+    fn a_warped_panes_capture_walks_its_client_slot() {
+        use crate::effect::plan::{Owner, PaneSlot, Slots};
+        use crate::effect::rules::Slot;
+        let pane = crate::pane::PaneId::from_raw(1);
+        let mut slots = Slots::default();
+        slots.mark_ready(Owner::Pane(pane, PaneSlot::Client), Slot::Replace);
+        let pieces = super::capture_pieces(&slots, pane);
+        assert!(
+            pieces.contains(&super::Piece::Slot(PaneSlot::Client, Slot::Replace)),
+            "{pieces:?}"
+        );
+        assert!(
+            !pieces.contains(&super::Piece::Client),
+            "the bare client is still in the capture"
+        );
+    }
+
+    /// **A whole pane's self capture walks its inner results, not its own**:
+    /// a `pane` effect reads the client's blur, and never its own last output.
+    #[test]
+    fn a_whole_panes_capture_walks_its_inner_slots_and_not_its_own() {
+        use crate::effect::plan::{Owner, PaneSlot, Slots};
+        use crate::effect::rules::Slot;
+        let pane = crate::pane::PaneId::from_raw(1);
+        let mut slots = Slots::default();
+        slots.mark_ready(Owner::Pane(pane, PaneSlot::Client), Slot::Replace);
+        slots.mark_ready(Owner::Pane(pane, PaneSlot::Pane), Slot::Behind);
+        let pieces = super::inner_pieces(&slots, pane);
+        assert!(
+            pieces.contains(&super::Piece::Slot(PaneSlot::Client, Slot::Replace)),
+            "{pieces:?}"
+        );
+        assert!(
+            !pieces.contains(&super::Piece::Slot(PaneSlot::Pane, Slot::Behind)),
+            "a pane's own slot is in its own capture: {pieces:?}"
+        );
+    }
+
+    /// `prepare`'s phases, recorded: what ran in which order, and what the
+    /// warp's capture walked when its job was built.
+    struct Recorder {
+        pane: crate::pane::PaneId,
+        did: Vec<String>,
+        walked: Vec<super::Piece>,
+    }
+
+    impl super::Phases for Recorder {
+        fn compile(&mut self) {
+            self.did.push("compile".to_owned());
+        }
+        fn resolve(&mut self) -> crate::effect::plan::Slots {
+            use crate::effect::plan::{Owner, PaneSlot, Slots};
+            use crate::effect::rules::{Origin, RuleKey, Slot};
+            self.did.push("resolve".to_owned());
+            let mut slots = Slots::default();
+            slots.want(
+                Owner::Pane(self.pane, PaneSlot::Client),
+                Slot::Replace,
+                RuleKey {
+                    origin: Origin::User,
+                    index: 0,
+                    generation: 1,
+                },
+            );
+            slots
+        }
+        fn scenes(&mut self, _slots: &crate::effect::plan::Slots) {
+            self.did.push("scenes".to_owned());
+        }
+        fn xray(&mut self, _slots: &crate::effect::plan::Slots) {
+            self.did.push("xray".to_owned());
+        }
+        fn captures(&mut self, _slots: &crate::effect::plan::Slots, nest: super::Nest) {
+            self.did.push(format!("captures {nest:?}"));
+        }
+        fn chains(&mut self, slots: &mut crate::effect::plan::Slots, nest: super::Nest) {
+            use crate::effect::plan::{Owner, PaneSlot};
+            use crate::effect::rules::Slot;
+            self.did.push(format!("chains {nest:?}"));
+            // The client's chain ran this pass: its result is ready now.
+            if nest == super::Nest::Inner {
+                slots.mark_ready(Owner::Pane(self.pane, PaneSlot::Client), Slot::Replace);
+            }
+        }
+        fn warps(&mut self, slots: &crate::effect::plan::Slots) {
+            self.did.push("warps".to_owned());
+            self.walked = super::capture_pieces(slots, self.pane);
+        }
+        fn sweep(&mut self) {
+            self.did.push("sweep".to_owned());
+        }
+    }
+
+    /// **`prepare` compiles first, and builds the warp and `over` jobs only
+    /// after the chains have run** (Ruling 17; spec C14 for the first half):
+    /// a warped pane's capture is built from a walk that already holds this
+    /// pass's slot results, so its element list and its keyed `Inputs` carry
+    /// the result's element, and a wanted effect has compiled before any slot
+    /// resolves, so it is never absent from the first frame for want of one.
+    #[test]
+    fn prepare_compiles_first_and_builds_the_warps_after_the_chains() {
+        use crate::effect::plan::PaneSlot;
+        use crate::effect::rules::Slot;
+        let mut recorder = Recorder {
+            pane: crate::pane::PaneId::from_raw(1),
+            did: Vec::new(),
+            walked: Vec::new(),
+        };
+        let _ = super::effect_phases(&mut recorder);
+        assert_eq!(
+            recorder.did,
+            [
+                "compile",
+                "resolve",
+                "scenes",
+                "xray",
+                "captures Inner",
+                "chains Inner",
+                "captures Whole",
+                "chains Whole",
+                "warps",
+                "sweep"
+            ]
+        );
+        assert!(
+            recorder
+                .walked
+                .contains(&super::Piece::Slot(PaneSlot::Client, Slot::Replace)),
+            "the warp's capture was built before the client's chain ran: {:?}",
+            recorder.walked
+        );
+        assert!(
+            !recorder.walked.contains(&super::Piece::Client),
+            "the bare client is in the warp's capture"
+        );
+    }
+
+    /// **The pass is in order** (Ruling F31): scenes and xray after resolve
+    /// and before any capture or chain; the warps after the chains.
+    #[test]
+    fn prepare_renders_scenes_then_xray_before_the_chains() {
+        let mut recorder = Recorder {
+            pane: crate::pane::PaneId::from_raw(1),
+            did: Vec::new(),
+            walked: Vec::new(),
+        };
+        let _ = super::effect_phases(&mut recorder);
+        let at = |phase: &str| recorder.did.iter().position(|did| did == phase);
+        assert!(at("resolve") < at("scenes") && at("scenes") < at("xray"));
+        assert!(at("xray") < at("captures Inner") && at("chains Whole") < at("warps"));
+    }
+
+    fn mkey(upto: u64) -> crate::effect::memo::MemoKey {
+        crate::effect::memo::MemoKey {
+            monitor: "DP-1".to_owned(),
+            cut: crate::effect::xray::Cut::Background,
+            upto,
+        }
+    }
+
+    /// **A memo runs when its xray was redrawn, and not otherwise**; two
+    /// slots wanting one memo run it once.
+    #[test]
+    fn a_memo_runs_when_its_xray_was_redrawn_and_once_for_every_slot() {
+        let (mut memos, mut xrays) = (
+            crate::effect::memo::Memos::default(),
+            crate::effect::xray::Xrays::default(),
+        );
+        xrays.want("DP-1", crate::effect::xray::Cut::Background);
+        memos.want(&mkey(7), 1);
+        let wanted = [mkey(7), mkey(7)];
+        assert!(
+            super::memos_to_run(&memos, &xrays, &wanted).is_empty(),
+            "a memo ran over a cut not drawn yet"
+        );
+        xrays.drawn("DP-1", crate::effect::xray::Cut::Background, true);
+        memos.want(&mkey(7), 1);
+        assert_eq!(super::memos_to_run(&memos, &xrays, &wanted), vec![mkey(7)]);
+        memos.ran(
+            &mkey(7),
+            xrays
+                .generation("DP-1", crate::effect::xray::Cut::Background)
+                .unwrap_or(0),
+        );
+        assert!(
+            super::memos_to_run(&memos, &xrays, &wanted).is_empty(),
+            "re-ran over the same xray"
+        );
+        xrays.drawn("DP-1", crate::effect::xray::Cut::Background, false);
+        assert!(
+            super::memos_to_run(&memos, &xrays, &wanted).is_empty(),
+            "a kept xray re-ran it"
+        );
+        xrays.drawn("DP-1", crate::effect::xray::Cut::Background, true);
+        assert_eq!(super::memos_to_run(&memos, &xrays, &wanted), vec![mkey(7)]);
+    }
+
+    /// **An empty suffix runs no pass: its result is a crop of the memo**;
+    /// a suffix that reads the part runs; a place whose memo was not held
+    /// (over `effects.memo.budget_mib`) runs the whole plan (amended
+    /// 2026-10-08, configurable).
+    #[test]
+    fn an_empty_suffix_is_a_crop_and_a_suffix_runs() {
+        use crate::effect::memo::tests::chain;
+        let plain = solium_effects::stage::Memo {
+            prefix: None,
+            suffix: chain(&[]),
+            exports: vec![solium_effects::stage::Export {
+                step: 5,
+                name: "memo:5".to_owned(),
+                scale: 1.0,
+            }],
+        };
+        assert_eq!(
+            super::t2_work(&plain, true),
+            super::T2Work::Crop(plain.exports[0].clone())
+        );
+        let glass = solium_effects::stage::Memo {
+            prefix: None,
+            suffix: chain(&["tint"]),
+            exports: Vec::new(),
+        };
+        assert_eq!(super::t2_work(&glass, true), super::T2Work::Suffix);
+        assert_eq!(super::t2_work(&plain, false), super::T2Work::Whole);
+        assert_eq!(super::t2_work(&glass, false), super::T2Work::Whole);
+    }
+
+    /// **A crop is the part's box in the memo's own pixels.**
+    #[test]
+    fn a_crop_is_the_parts_box_in_the_memos_pixels() {
+        let map = crate::effect::run::BoxMap {
+            offset: [0.25, 0.5],
+            scale: [0.125, 0.25],
+        };
+        assert_eq!(
+            super::crop_of(map, (2560, 1440)),
+            smithay::utils::Rectangle::new((640.0, 720.0).into(), (320.0, 360.0).into())
+        );
+    }
+
+    /// A T2 place on `DP-1`, its box in the monitor's pixels at `x`.
+    fn t2_place(x: i32) -> crate::effect::plan::T2Place {
+        crate::effect::plan::T2Place {
+            monitor: "DP-1".to_owned(),
+            cut: crate::effect::xray::Cut::Background,
+            padded: smithay::utils::Rectangle::new((50, 25).into(), (100, 50).into()),
+            screen: smithay::utils::Rectangle::new((x, 50).into(), (200, 100).into()),
+            map: crate::effect::run::BoxMap {
+                offset: [0.05, 0.05],
+                scale: [0.1, 0.1],
+            },
+            own: (200, 100).into(),
+            part: crate::effect::plan::PartBox::around((100, 60).into(), 0, [0.0; 4]),
+        }
+    }
+
+    /// **A T2 key moves with a drag finer than an xray pixel** (Ruling F37):
+    /// it holds the padded box in the monitor's own pixels, not in the
+    /// xray's, so at `effects.xray.scale` 0.5 (or the half rung) a window
+    /// moved by one monitor pixel re-runs its suffix even where its box in
+    /// the xray did not move.
+    #[test]
+    fn a_t2_key_moves_with_a_drag_finer_than_an_xray_pixel() {
+        use crate::effect::memo::tests::chain;
+        let (memos, xrays) = (
+            crate::effect::memo::Memos::default(),
+            crate::effect::xray::Xrays::default(),
+        );
+        let blur = crate::effect::plan::BoundChain::t2_for_test(chain(&["down", "up"]), 7);
+        let work = super::T2Work::Suffix;
+        let key = |place: &crate::effect::plan::T2Place| {
+            super::t2_key(
+                &memos, &xrays, place, &blur, &work, [0.0; 4], [0.0; 4], None,
+            )
+        };
+        let (here, there) = (t2_place(100), t2_place(101));
+        assert_eq!(here.padded, there.padded, "the premise: one xray pixel");
+        assert_ne!(key(&here), key(&there), "a one-pixel drag kept the key");
+    }
+
+    /// **A T2 key reads each memo by its prefix and its generation**: two
+    /// chains whose memos have the same generation (each ran once) but are
+    /// other memos key apart, so a place that reads another memo re-runs.
+    #[test]
+    fn a_t2_key_reads_each_memo_by_its_prefix_and_generation() {
+        use crate::effect::memo::tests::chain;
+        let (mut memos, mut xrays) = (
+            crate::effect::memo::Memos::default(),
+            crate::effect::xray::Xrays::default(),
+        );
+        xrays.drawn("DP-1", crate::effect::xray::Cut::Background, true);
+        let soft = crate::effect::plan::BoundChain::t2_for_test(chain(&["down", "up"]), 7);
+        let softer = crate::effect::plan::BoundChain::t2_for_test(chain(&["down2", "up2"]), 7);
+        for chain in [&soft, &softer] {
+            assert_eq!(chain.memo_keys().len(), 1, "the premise: one memo each");
+            memos.want(&mkey(chain.memo_keys()[0]), 1);
+            memos.ran(&mkey(chain.memo_keys()[0]), 1);
+        }
+        assert_ne!(
+            soft.memo_keys(),
+            softer.memo_keys(),
+            "the premise: two memos"
+        );
+        let place = t2_place(100);
+        let work = super::t2_work(soft.memo().expect("split"), true);
+        let key = |chain: &crate::effect::plan::BoundChain| {
+            super::t2_key(
+                &memos, &xrays, &place, chain, &work, [0.0; 4], [0.0; 4], None,
+            )
+        };
+        assert_ne!(
+            key(&soft).memo,
+            key(&softer).memo,
+            "two memos of one generation read alike"
+        );
+    }
+
+    /// **A run phase with no chain of its own binds no carrier** (Ruling
+    /// 17): a client's self chain runs in the inner phase, so the whole-pane
+    /// phase has nothing to run and binds nothing, and with no slot neither
+    /// does.
+    #[test]
+    fn a_run_phase_with_no_chain_of_its_own_binds_nothing() {
+        use crate::effect::plan::{Chains, Owner, PaneSlot, Slots};
+        use crate::effect::rules::{Origin, RuleKey, Slot};
+        let place = crate::effect::host::tests::scratch("render-phase-binds");
+        crate::effect::host::tests::folder(
+            &place,
+            "tint",
+            "return { api = 1, inputs = { 'self' }, frag = 'effect.frag' }",
+            &[(
+                "effect.frag",
+                "vec4 sol_effect(vec2 uv) { return sol_tex(uv); }\n",
+            )],
+        );
+        let mut host = crate::effect::host::Host::new(crate::effect::host::Library::with(
+            Some(place.clone()),
+            place.join("none"),
+        ));
+        host.want("rules", ["tint".to_owned()]);
+        let lua = mlua::Lua::new();
+        let value: mlua::Value = lua
+            .load(r#"{ { match = "*", part = "client", slot = "replace", effect = "tint" } }"#)
+            .eval()
+            .expect("the test's Lua");
+        let tree = crate::effect::tree::Tree::from_lua(&value)
+            .expect("readable")
+            .expect("a value");
+        let rule = crate::effect::rules::parse(&tree)
+            .expect("parses")
+            .remove(0);
+        let key = RuleKey {
+            origin: Origin::User,
+            index: 0,
+            generation: 1,
+        };
+        let mut chains = Chains::default();
+        chains.insert(key, Chains::bind(&mut host, &rule).expect("binds"));
+        let mut slots = Slots::default();
+        assert!(!super::runs_in(&slots, &chains, super::Nest::Inner));
+        assert!(!super::runs_in(&slots, &chains, super::Nest::Whole));
+        slots.want(
+            Owner::Pane(crate::pane::PaneId::from_raw(1), PaneSlot::Client),
+            Slot::Replace,
+            key,
+        );
+        assert!(super::runs_in(&slots, &chains, super::Nest::Inner));
+        assert!(
+            !super::runs_in(&slots, &chains, super::Nest::Whole),
+            "the whole-pane phase binds a carrier to run nothing"
+        );
+        let _ = std::fs::remove_dir_all(place);
+    }
+
+    /// **A glided part's box is where it is drawn**: its place in the pane
+    /// carried by the frame's rectangle, not the layout's (Ruling F37,
+    /// amended 2026-10-14, live under motion and warps).
+    #[test]
+    fn a_glided_parts_box_is_where_it_is_drawn() {
+        use smithay::utils::{Logical, Rectangle};
+        let outer = Rectangle::<i32, Logical>::new((1000, 100).into(), (400, 300).into());
+        let titlebar = Rectangle::<i32, Logical>::new((1000, 100).into(), (400, 28).into());
+        // Half way through a glide from (200, 100) to the layout's (1000, 100).
+        let gliding = Rectangle::<f64, Logical>::new((600.0, 100.0).into(), (400.0, 300.0).into());
+        assert_eq!(
+            super::within(titlebar, outer, gliding),
+            Rectangle::new((600.0, 100.0).into(), (400.0, 28.0).into())
+        );
+        // An open at half size about the pane's centre: the band halved with it.
+        let opening = Rectangle::<f64, Logical>::new((1100.0, 175.0).into(), (200.0, 150.0).into());
+        assert_eq!(
+            super::within(titlebar, outer, opening),
+            Rectangle::new((1100.0, 175.0).into(), (200.0, 14.0).into())
+        );
+        // At rest, the part itself.
+        assert_eq!(
+            super::within(titlebar, outer, outer.to_f64()),
+            titlebar.to_f64()
+        );
+    }
+
+    /// **A tilted part's beneath bounds are its own band**: under a matrix
+    /// alone (one cell, the pane's corners) a titlebar's bounds are its
+    /// band turned with the pane, not the whole pane's box, which a tint
+    /// would cover and a `glass-rect` bezel bend through (amended
+    /// 2026-10-14, live under motion and warps). Turned 0.17 rad about its
+    /// centre, a 400×300 pane is 400·sin + 300·cos ≈ 363.3 tall, its 28 px
+    /// titlebar 400·sin + 28·cos ≈ 95.3, both from the same top corner.
+    #[test]
+    fn a_tilted_parts_beneath_bounds_are_its_own_band() {
+        let mut frame = crate::present::Frame::real(smithay::utils::Rectangle::new(
+            (0, 0).into(),
+            (400, 300).into(),
+        ));
+        frame.matrix = crate::mat4::Mat4::rotate_z(0.17);
+        let titlebar = crate::warp::UnitRect {
+            u0: 0.0,
+            v0: 0.0,
+            u1: 1.0,
+            v1: 28.0 / 300.0,
+        };
+        let band = super::beneath_bounds(&frame, None, titlebar).expect("bounds");
+        let whole =
+            super::beneath_bounds(&frame, None, crate::warp::UnitRect::WHOLE).expect("bounds");
+        assert!(
+            (whole.size.h - 363.3).abs() < 1.0,
+            "the pane's bounds are {} tall",
+            whole.size.h
+        );
+        assert!(
+            (band.size.h - 95.3).abs() < 1.0,
+            "the titlebar's bounds are {} tall, not its band",
+            band.size.h
+        );
+        assert!(
+            (band.loc.y - whole.loc.y).abs() < 1.0,
+            "the band does not start at the pane's top corner"
+        );
+    }
+
+    /// **Inside a capture a beneath slot is a hole; on screen it never is**
+    /// (amended 2026-10-14): a hole on screen would erase the frame's own
+    /// pixels and draw black where the backdrop is. Both captures of a pane
+    /// are inside (the warp's and a whole pane's self or mask capture), and
+    /// with a place lacking its texture the slot is skipped, not holed.
+    #[test]
+    fn a_beneath_slot_is_a_hole_only_inside_a_capture() {
+        use super::{SlotDraw, Within, slot_draw};
+        assert_eq!(slot_draw(Within::Capture, true, true), SlotDraw::Hole);
+        assert_eq!(slot_draw(Within::Capture, false, true), SlotDraw::Result);
+        assert_eq!(slot_draw(Within::Screen, true, true), SlotDraw::Result);
+        assert_eq!(slot_draw(Within::Screen, false, true), SlotDraw::Result);
+        // A monitor with no texture beneath: no hole, which would show the
+        // screen below there (amended 2026-10-14).
+        assert_eq!(slot_draw(Within::Capture, true, false), SlotDraw::Skip);
+    }
+
+    /// **The walk draws at the pass's instant**, the one its T2 places were
+    /// measured at, however late `elements` runs; outside a pass, at the
+    /// clock (amended 2026-10-14, live under motion and warps).
+    #[test]
+    fn the_walk_draws_at_the_passs_instant() {
+        let (pass, later) = (
+            std::time::Duration::from_millis(1000),
+            std::time::Duration::from_millis(1004),
+        );
+        assert_eq!(super::walk_instant(Some(pass), later), pass);
+        assert_eq!(super::walk_instant(None, later), later);
     }
 }

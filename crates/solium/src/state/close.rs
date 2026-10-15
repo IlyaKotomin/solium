@@ -808,6 +808,7 @@ impl Solium {
         };
         let title = self.pane_title(id);
         let focused = self.looks_focused(id);
+        let app_id = self.pane_app_id(id);
         // Where it stood, for `config.focus.after_close`, if it had the
         // keyboard: `settle_focus` hands it on once the frame's `sync_panes`
         // finds the window gone.
@@ -930,6 +931,7 @@ impl Solium {
             over,
             title,
             focused,
+            app_id,
             remains,
             fill: smithay::backend::renderer::element::Id::new(),
         });

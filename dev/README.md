@@ -254,7 +254,9 @@ reads one that file does not list.
 | `SOLIUM_TERMINAL=<command line>` | The terminal `super+return` opens, split on spaces. | |
 | `SOLIUM_PANE=<name or path>` | The frame style for this run. | |
 | `SOLIUM_FENCE_WAIT=off` | A window capture drops its fence instead of waiting for it on the CPU. The default waits, and each session's log says which it ran with. | |
-| `SOLIUM_RECAPTURE=always` | Draw every window capture (a warp's, a rounded client's) on every pass, as before captures were kept until what they show changes. For an A/B on one build, and the control of `dev/pacing-nested.sh`'s capture count. | |
+| `SOLIUM_RECAPTURE=always` | Draw every window capture (a warp's, a rounded client's, a self effect's part) on every pass, as before captures were kept until what they show changes, so every self effect's chain runs every pass too. For an A/B on one build, and the control of `dev/pacing-nested.sh`'s capture count. | |
+| `SOLIUM_XRAY_REBUILD=always` | Draw every wanted xray cut (the sharp picture of the layers behind the windows that T2 effects read) on every pass, and run every memo over it again, as if what is behind the windows changed each time. The control of the `xray_builds` and `memo_runs` counts. | |
+| `SOLIUM_WARM_INJECT=<passes>` | Hold the first desktop frame (`startup.first_frame`) for this many passes as if what it waits for were not ready, at most its `max_ms`: the frames drawn meanwhile are only the clear colour. Nested every pass is ready at once, so this is the control that shows the gate hold and let go (`dev/effects-check.sh xray`). | |
 | `SOLIUM_PACING` | Say where a pass's time went, on passes that overran the tightest monitor's frame; with it, GPU time, clocks and late flips. Misses are counted without it. | |
 | `SOLIUM_TRACE=<path>` | One JSON line per pass and per flip, and `SOLIUM_PACING` on. See *Measuring frame pacing on a TTY*. | |
 | `SOLIUM_QML=<mode>` | `auto`, `gpu` or `software`; see *QML on the GPU*. | |
@@ -416,6 +418,7 @@ that should not be.
 | `dev/present-check.sh` | a `pivot` is the point the matrix leaves alone, a raised window is drawn in front, clicks follow the rect a window is drawn at without following the `z` it is drawn above, a genie on a second monitor lands on its target, and a tilted window's menu is drawn whole and in front of it |
 | `dev/fence-check.sh` | skipping a capture's CPU fence wait (`SOLIUM_FENCE_WAIT=off`) changes no pixel |
 | `dev/pulse-control.sh [env…]` | the renderer is not frozen: a focused window in the `pulse` style moves in 150 ms |
+| `dev/effects-check.sh [section]…` | effects on screen, nested, one compositor per section, each judged beside `dev/pulse-control.sh`; `overlay` breaks the configuration and reloads it, and the problems overlay appears in the top-right corner while nothing else changes; `t0` draws a generated ring behind a window; `blur` blurs a video player's own pixels through a rule; `none` shows nothing captured and nothing run with no rules; `fail` shows every part drawn when every effect fails; `tilt` shows a blurred player still blurred while it tilts and while it genies; `genie` shows the `genie` folder drawing what the Rust genie draws, on one debug build; `xray` shows a terminal with the wallpaper blurred behind it, the xray built once at rest, and a plate's backdrop blurred in the first frame drawn |
 | `dev/install-check.sh [--no-build]` | `dev/install.sh` installs into a `DESTDIR` under `/tmp`: every file (the systemd units and the portal configuration included), the absolute `Exec`, the printed `sudo` lines, `--check` from the installed copy using its own `share/solium`, refusing while it runs (a session started during the build included), refusing to delete through a link, refusing `/` and a `DESTDIR` with a space, saying so when the check fails after the files are in place, keeping a unit or portal configuration of the user's own through an install and an uninstall, `solium-session` cleaning up after a stand-in Solium that crashed (and only then, and only once it has gone, and unsetting the variables after one that crashed before starting its target while no other desktop holds `graphical-session.target`) and refusing a second session while one runs, a reinstall saying when the login screen's session file is stale, and an uninstall that leaves nothing. `--no-check` skipping the installed binary's check. A system prefix (`--prefix /usr` and `/usr/local`): everything under the prefix and nothing in `XDG_CONFIG_HOME`, no `config.sha256` and no `sudo` line, `--session-dir` refused, and `--check` passing from the staged `/usr/share/solium` with a broken user configuration. The Fedora package: `dev/rpm/solium.spec`'s `%files` against that install both ways; its `License` naming every installed `.license`; each `Requires` and `Recommends` naming the package that has the file (the Qt QML modules the shipped QML imports with the Qt version clause, Xwayland, flock, xdg-desktop-portal and the backends `lilium-portals.conf` names, and foot); and the spec refusing to parse without `commit` and `commitdate`. See *Installing it* and *A Fedora package* |
 | `dev/rpm.sh [--jobs N] [--image IMAGE]` | the package built from the commit checked out, unpacked without installing, passes `solium --check` with an empty configuration and takes its QML and Lua from its own `usr/share/solium`. See *A Fedora package* |
 
@@ -502,6 +505,114 @@ fails unless two captures 150 ms apart differ: the known-animating control a
 nested capture is judged beside. Its arguments are extra environment for the
 compositor; `dev/pulse-control.sh SOLIUM_PANE=none` is its own fail-first, since
 nothing on screen moves then.
+
+`dev/effects-check.sh` proves effects on screen, nested: each section starts a
+compositor of its own with `dev/effects-check/<section>.lua` as its whole
+configuration and a configuration directory of its own for effect folders,
+captures, and judges the captures with `dev/effects-check/judge.py`. The pulse
+control runs first, and a failure there fails the whole check, because a frozen
+renderer makes every capture prove nothing. Run it under `timeout`, from a
+nested-capable session:
+
+    timeout -s TERM 300 dbus-run-session -- dev/effects-check.sh overlay
+    SOLIUM_CHECK_DIR=/tmp/effects ./dev/effects-check.sh   # every section, keep the frames
+
+`overlay` captures the desktop, appends a line that is not Lua to the
+configuration, reloads it, and captures again: the top-right corner must have
+changed (the problems overlay, listing `…/init.lua:6: …`) and the bottom half
+must not. Leaving `require("problems")` out of `dev/effects-check/overlay.lua`
+is its fail-first.
+
+`t0` places one window at a known rectangle twice, once plain and once with a
+rule putting the `ring` fixture (`crates/solium/tests/fixtures/effects/ring/`,
+which reads only `shape`) behind its client: the 12 px band left of the window
+must change and the window itself must not, and the trace
+(`SOLIUM_TRACE`, read by `judge.py trace` and `judge.py quiet`) must show the
+ring run once or twice and never in the last 2 s before the capture. A
+`judge.py` region number ending in `px` is pixels, not a fraction of the frame.
+A build whose `render::run_slots` skips a generated chain is its fail-first:
+nothing is drawn around the window, and the ring runs 0 times.
+
+`blur` opens a still terminal on the left and a video player on the right
+(ffplay's `testsrc2` at 60 fps, or a kitty printing the time when ffplay is
+missing), four times: with no rule, with the shipped `blur` blurring the
+player through `{ "blur", source = "self" }` matched by its title, with it
+blurring the still terminal, and that again with `SOLIUM_RECAPTURE=always`.
+The player's edge energy (`judge.py edges`) must fall to under half while the
+terminal stays byte-equal, and the player's chain must run. The still
+terminal's chain must run only on passes that captured it (`judge.py only`:
+its own few commits as kitty starts and loses the focus) and on none of the
+last 3 s, while the player keeps the passes coming (`judge.py since`); with
+`SOLIUM_RECAPTURE=always` it runs on every pass, the control that shows the
+count means something. Its fail-firsts: the rule's title misspelled in
+`blur.lua` (the player is not blurred, its chain never runs), and a build
+whose `SlotState::needs_run` always answers yes (the still window's chain
+runs on every pass, most of them capturing nothing).
+
+`none` opens the same two windows with no rule: the trace must show no pass
+that captured and no chain run (spec §8.4); adding a rule to `none.lua` is
+its fail-first. `fail` opens one window in the `top` style twice, once plain
+and once with a rule naming the `fail-compile` fixture (lint-clean, refused
+by every GPU) in every slot of every part of it: a problem naming it must be
+logged, and the frame must be the plain one within 1. Its fail-first is a
+`fail-compile` frag that compiles and draws red, with the check that
+something failed set aside: the frames differ.
+
+`tilt` opens `blur`'s two windows twice, once plain and once with the player
+blurred through `{ "blur", source = "self" }`, and warps the player: held at
+6 degrees from 4.5 s (`super+t` in `dev/effects-check/tilt.lua`), then pulled
+into the bottom of the screen over 3 s from 6.5 s (`super+m`, the shipped
+genie's deform). A warped window is drawn from its pane's capture, so this is
+the capture walking its slots. Frames at 4 s (flat), 6 s (tilted) and 8 s
+(half way through the genie) are each judged against the plain run's by
+their gradient energy inside the player (`judge.py sharpness`, the sum of
+squared neighbour differences; `edges` sums a widened step to its height, so
+it barely moves where the genie squeezes the colour bars together): under
+half in all three. Its fail-first is a build whose `render::effect_phases`
+builds the warps before the chains run: the flat frame passes and the tilted
+and genied frames are as sharp as with no rule.
+
+`genie` opens one window at a known rect twice and holds it half way through
+the shipped genie (`super+g` at 4.5 s in `dev/effects-check/genie.lua`,
+pulled down into a strip below the monitor): once drawn through the `genie`
+folder's grid, and once with `SOLIUM_GEOMETRY_ORACLE=genie`, a debug build's
+knob that builds the grid from the Rust genie the folder is held to. The
+6 s frames must agree within 1 on every channel, after a check that the
+window moved at all (below its rest, the 6 s frame differs from the 4 s
+one). It needs the `target/debug` binary: a release build has no oracle.
+Its fail-first is `GENIE_FAIL=1`, which gives the folder's run alone a
+spread of 1.5 against the oracle's 1.4: the frames differ.
+
+`xray` is FX3's first section, and its scene is the one later FX3 sections
+start from: `dev/effects-check/checker.qml`, a 64 px black and white checker
+declared on `background` (copied, with `veil.qml`, into the scene's
+configuration directory through `SECTION_QML`, where `sol.surface` finds a
+scene by its file name), a translucent kitty at (80, 80) 560x360 and the
+player beside it. With `BLUR` set, `xray.lua` puts the shipped blur behind
+the terminal (`slot = "behind"`, a T2 slot reading the wallpaper through the
+memo). The terminal's gradient energy below its line of text must fall to
+under half of the plain run's, the checker outside it must stay byte-equal,
+and the trace must show the xray built once and its memo run once while the
+player keeps the passes coming, and on every pass with
+`SOLIUM_XRAY_REBUILD=always`, the control. With `SOLIUM_CHECKER_PHASE=1` the
+checker moves 8 px a second, and the wallpaper must render once a pass on
+nine passes in ten of the last 3 s and never twice (`judge.py most`), with
+the rule as without it: the `scenes` phase renders it at the size `elements`
+asks for. `XRAY_SCALE=0.5` sets `effects.xray.scale`: there too a moving
+wallpaper renders once a pass and a still one is built once, since a cut
+draws a scene from the picture the frame draws, scaled down. Last, a dark
+plate on `top` (`VEIL=1`) from the start, every frame captured from the
+first, one a pass (`SOLIUM_CAPTURE_INTERVAL=0`): with no rule the first
+frame is the desktop, and with the blur behind the plate and
+`SOLIUM_WARM_INJECT=3`, the gate's control (nested, every pass is ready at
+once), the first three frames are only the clear colour and the fourth, the
+first drawn (`judge.py first_lit`), already has the plate's backdrop
+blurred, as nothing may pop in after it. Its fail-firsts: the plain run
+judged against itself (nothing blurred); a build whose xray asked a scene
+for the cut's own size, which renders a moving wallpaper up to three times
+a pass and builds a still one's cut on every pass; and a build whose
+`elements` ignores `Prepared.held`, or whose `prepare` never sets it, whose
+first frame under the control is drawn at once.
 
 `clipboard-check.sh` runs its X11 half in a container, so the host needs no
 `xclip`. **Run it more than once.** The bug it was
@@ -1203,12 +1314,18 @@ could not read its buffer age and would redraw everything.
 
 A pass record carries `pass`, `t_ns` (CLOCK_MONOTONIC at its start),
 `total_us`, `deadline_us`, `monitor`, `missed`, each phase as `<phase>_us`,
-`captures`, `panes`, `drew`, `scenes`, `animating`, `rendered`, `built`,
-`rebound`, `qml` (Qt's microseconds per scene), `clocks`, `gpu_mhz`,
-`mem_mhz`, `pstate`, `gpu` (`ok`, `unsupported`, `late` or `disjoint`),
-`gpu_us`, `gpu_prep_us` and `gpu_out_us`. A flip record carries `flip` (the
-pass), `monitor`, `seq`, `at_ns`, `queued_ns` and `late`, the vblanks it
-missed. `dev/pacing-summary.py` reads them.
+`captures`, `effect_runs` (chains of effects run this pass; a self effect
+runs only when its part commits), `xray_builds` (xray cuts drawn this pass:
+one only when what is behind the windows changed) and `memo_runs` (memo
+prefixes run over a cut drawn anew; both every pass with
+`SOLIUM_XRAY_REBUILD=always`, and both on the PACING line as `xray=` and
+`memo=`), `panes`, `drew`, `scenes`, `animating`,
+`rendered`, `built`, `rebound`, `qml` (Qt's microseconds per scene),
+`clocks`, `gpu_mhz`, `mem_mhz`, `pstate`, `gpu` (`ok`, `unsupported`, `late`
+or `disjoint`), `gpu_us`, `gpu_prep_us` (the captures), `gpu_effects_us` (the
+effect chains, timed as one region a run phase) and `gpu_out_us`. A flip
+record carries `flip` (the pass), `monitor`, `seq`, `at_ns`, `queued_ns` and
+`late`, the vblanks it missed. `dev/pacing-summary.py` reads them.
 
 ## Installing it
 
@@ -1225,13 +1342,13 @@ dev/install.sh --uninstall     # remove it again; prints `sudo rm -f …` for th
 
 | | |
 |---|---|
-| `--prefix DIR` | where to install, default `~/.local`: `DIR/bin/solium`, `DIR/bin/solium-session` (what the session file starts: `solium --tty --session`, and the clean-up after a Solium that crashed), `DIR/share/solium/{qml,lua}`, and the generated `DIR/share/solium/solium.desktop`. `/usr` and `/usr/local` are system prefixes, below |
+| `--prefix DIR` | where to install, default `~/.local`: `DIR/bin/solium`, `DIR/bin/solium-session` (what the session file starts: `solium --tty --session`, and the clean-up after a Solium that crashed), `DIR/share/solium/{qml,lua,effects}`, and the generated `DIR/share/solium/solium.desktop`. `/usr` and `/usr/local` are system prefixes, below |
 | `XDG_CONFIG_HOME=` | where the session's other files go, default `~/.config`: `systemd/user/solium-session.target`, `systemd/user/solium-autostart.target` and `xdg-desktop-portal/lilium-portals.conf`, copied from `dev/session/` |
 | `--session-dir DIR` | where the display manager reads sessions, default `/usr/local/share/wayland-sessions`. Only the printed `sudo` line writes there. Refused with a system prefix |
 | `--no-build` | install the release binary already in `target/install` |
 | `--no-check` | skip the installed binary's `--check`: for a package built from source, whose binary still finds its build tree during `%install` and would fail the asset check |
 | `--jobs N`, `--image IMAGE` | the build's cargo jobs (2) and container (`localhost/solium-build:fc44`) |
-| `--uninstall` | remove `bin/solium`, `bin/solium-session`, `share/solium/{qml,lua}` and the generated `solium.desktop` under the same `--prefix`, whatever put them there, and the three files in `XDG_CONFIG_HOME` only while they are what install wrote |
+| `--uninstall` | remove `bin/solium`, `bin/solium-session`, `share/solium/{qml,lua,effects}` and the generated `solium.desktop` under the same `--prefix`, whatever put them there, and the three files in `XDG_CONFIG_HOME` only while they are what install wrote |
 | `DESTDIR=` | stage the prefix and `XDG_CONFIG_HOME` under this directory instead; the session file's `Exec` still names the real prefix. `--session-dir` is used as given, so a test can point it at `/tmp`. It may contain a `~`, as rpmbuild's buildroot does |
 | `SOLIUM_BUILD_LOCK=`, `SOLIUM_BUILD_MEMORY=` | the lock the build takes (`$XDG_CACHE_HOME/solium-build.lock`, or `~/.cache/solium-build.lock` when `XDG_CACHE_HOME` is unset) and the container's memory cap (`6g`). `dev/build-release.sh` reads both, so they apply to `dev/rpm.sh` too |
 
@@ -1304,7 +1421,7 @@ replace (found through `/proc/<pid>/exe`, as `fuser` does; it refuses and
 stops nothing), checked again once the build is over, since a session can
 start from the old install while it runs; that the build image exists; and
 that nothing it would delete is reached through a link. Install replaces
-`share/solium/{qml,lua}` and uninstall removes them with `rm -rf`, so a
+`share/solium/{qml,lua,effects}` and uninstall removes them with `rm -rf`, so a
 `share/solium` left linked to a checkout would lose the checkout's QML and
 Lua: both refuse while `share/solium` is a link, or while it resolves into
 the checkout. A prefix or a `share` that is itself a link (moved to another
@@ -1415,7 +1532,7 @@ another release needs its own build, and COPR is where that will happen.
 `dev/rpm/solium.spec` drives `%install` through
 `dev/install.sh --no-build --prefix /usr`, the system layout, so the package
 holds exactly what that installs: `/usr/bin/{solium,solium-session}`,
-`/usr/share/solium/{qml,lua}`, `/usr/share/wayland-sessions/solium.desktop`
+`/usr/share/solium/{qml,lua,effects}`, `/usr/share/wayland-sessions/solium.desktop`
 with `Exec=/usr/bin/solium-session`, the two units in `/usr/lib/systemd/user`
 and `lilium-portals.conf` in `/usr/share/xdg-desktop-portal`, plus the licences
 and two documents. rpmbuild fails on a file one has and the other does not, and

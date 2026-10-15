@@ -77,7 +77,7 @@ suite.
   fullscreen window covering the bars ([#141], [#142]) and getting its place
   back after ([#92]). X11 clients work through XWayland, and menus and
   tooltips are placed, grabbed and kept on screen.
-- **Chrome.** Eleven pane styles and per-corner rounding, QML on the GPU by
+- **Chrome.** Twelve pane styles and per-corner rounding, QML on the GPU by
   default with a software fallback ([#147]), and cursor themes and the shapes
   clients ask for ([#81], [#24]).
 - **Shells.** `shell = { scene = … }` hosts one in the compositor's own QML

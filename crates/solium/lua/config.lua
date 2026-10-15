@@ -955,7 +955,15 @@ local defaults = {
     -- ~/.config/solium/qml/panes, which shadows a shipped one of the same
     -- name. A path is anywhere.
     --
-    --   "top"        a titlebar above the window (the default)
+    --   "glass"      the default: the window and its bar one rounded piece of
+    --                dark liquid glass, the bar along the bottom with the
+    --                buttons at its left, the title after them and the
+    --                application's icon at its right; a thin dark shade just
+    --                inside the window's rounded edge while it does not have
+    --                the keyboard
+    --   "top"        a titlebar above the window, opaque and square: the
+    --                default until glass, and `pane = "top"` in user.lua
+    --                goes back to it
     --   "left"       a titlebar down the left side
     --   "bottom"     a titlebar underneath
     --   "border"     no bar, just a frame
@@ -974,9 +982,15 @@ local defaults = {
     --                or a tiling layout whose own bar makes a titlebar
     --                redundant.
     --
-    -- "rounded" and "flush" cut the client's corners as it is drawn, at no
-    -- extra cost: no pass and no copy of the window. The panes README,
-    -- `qml/panes/README.md`, has what each style is made of and costs.
+    -- "glass", "rounded" and "flush" cut the client's corners as it is
+    -- drawn, at no extra cost: no pass and no copy of the window. The panes
+    -- README, `qml/panes/README.md`, has what each style is made of and
+    -- costs. A style folder may also give its windows effect rules, in an
+    -- `effects.lua` beside its Pane.qml; yours in `effects.rules` win over
+    -- them. "glass" is the one that ships with a rule: the `glass` effect
+    -- behind every window it frames, except a fullscreen one, which keeps
+    -- direct scanout. Its blur is run once per monitor and shared, and each
+    -- window refracts its own share; the other styles cost no effect at all.
     -- SOLIUM_PANE overrides this, for one run.
     --
     -- A single QML file still works and is still called a decoration: drop one
@@ -985,7 +999,7 @@ local defaults = {
     --
     -- This setting was called `decoration` when a style was one file. The old
     -- name is still read -- see the bottom of this file.
-    pane = "top",
+    pane = "glass",
 
     -- What a window does between being asked for and its application
     -- arriving. A window's life starts when you ask for it, not when the
@@ -1556,6 +1570,98 @@ local defaults = {
         -- How small it starts, as a share of the size it ends up. `outBack`
         -- overshoots, so it grows a little past that and settles back.
         scale = 0.88,
+    },
+
+    -- Effects: folders of Lua and GLSL in ~/.config/solium/effects/ (yours)
+    -- or shipped with Solium, put in a slot of a part of a window by a rule.
+    -- See crates/solium/effects/README.md for the folders and docs/ricing.md
+    -- for rules. With no rules nothing changes, and costs nothing. The
+    -- default pane style, "glass" (`pane` above), brings two rules of its
+    -- own: the `glass` effect behind every window it frames, and the `shade`
+    -- in front of one without the keyboard, fading with the focus. A rule of
+    -- yours for `{ style = "glass" }`, the `pane` part and its `behind` or
+    -- `front` slot wins over the style's; `effect = false` there takes it
+    -- away.
+    effects = {
+        -- { match = { app_id = "mpv" }, part = "client", slot = "replace",
+        --   effect = { "blur", source = "self" } },
+        -- { match = { app_id = "kitty" }, part = "client", slot = "behind",
+        --   effect = "blur", memo = true, cut = "below" },
+        -- { match = { focused = false }, part = "pane", slot = "front",
+        --   effect = "shade", fade = { duration = 240, easing = "outCubic" } },
+        --
+        -- The first blurs a window's own pixels. The second, with no
+        -- `source`, blurs what lies behind a translucent window: the layers
+        -- below it (`cut = "background"`: the wallpaper alone, even where
+        -- `xray.layers` holds "bottom"), blurred once per monitor and shared
+        -- between windows (`memo = false`: each window blurs it alone). The
+        -- third darkens the edge of every window without the keyboard, and
+        -- its `fade` eases it in as the window loses the keyboard and out as
+        -- it gets it back, over 240 ms on `outCubic` (0 to 60000 ms; linear,
+        -- outCubic, outBack, inOutQuad, inOutCubic or spring): the
+        -- compositor blends the slot's result at another opacity on each
+        -- frame and runs nothing for it.
+        --
+        -- A list, so yours replaces this one whole. A set with a broken rule
+        -- is refused whole, named on the overlay, and the rules that ran stay.
+        -- A pane style's own rules, in its effects.lua, come first: yours win.
+        rules = {},
+        -- What an effect's own Lua may spend as it loads: `load_ms` of time
+        -- for each call (10 to 5000), shared by the checks a geometry
+        -- effect's `mesh` is put through, and `memory_mib` of memory (1 to
+        -- 512). A folder past either is named on the overlay and not loaded.
+        sandbox = { load_ms = 100, memory_mib = 16 },
+        -- How many numbers an effect's params may be when a geometry or a
+        -- pixels effect packs them (1 to 64); one with more is named on the
+        -- overlay, never cut.
+        limits = { params = 8 },
+        -- What a `sol.present` deform draws when its mesh is refused or its
+        -- folder is missing (`failed`: "flat", the window undeformed, or
+        -- "hide"), and when a reload finds its folder changed mid-flight
+        -- (`on_reload`: "flat", or "keep", the version it began with); a
+        -- reload that leaves the folder as it was changes nothing, even one
+        -- that changes `sandbox`. A deform may say either for itself.
+        present = { failed = "flat", on_reload = "flat" },
+        -- What T2 effects read as the backdrop: a sharp picture of these
+        -- layers, per monitor, rebuilt only when it changes. It always holds
+        -- "background"; "bottom" beside it adds desktop widgets, at the cost
+        -- of a rebuild each time one repaints.
+        -- `scale = 0.5` builds it at half resolution for good (0.25 to 1). A
+        -- picture nothing reads is kept `keep_ms` (0 to 60000) before it is
+        -- given back. A window across two monitors reads each monitor's
+        -- picture (`straddle = "each"`, a seam at the edge) or its own
+        -- monitor's ("own"). A tilted or genied window shows the backdrop
+        -- where each of its pixels is drawn (`warped = "drawn"`), or,
+        -- cheaper, the backdrop where it rests, bent with it ("rest"). A
+        -- window that glides or is dragged always reads it where it is drawn.
+        xray = { layers = { "background" }, scale = 1, keep_ms = 2000, straddle = "each", warped = "drawn" },
+        -- The part of an effect that reads only the backdrop (a blur) runs
+        -- once per monitor and is shared: `split = "resize"` shares it up to
+        -- its last pass that changes size (a tint after it stays per
+        -- window), "longest" shares the tint too, "off" shares nothing.
+        -- A shared result nobody reads is kept `keep_passes` passes (0 to
+        -- 3600); `budget_mib` caps what they hold (0 is no cap; 0 to 4096),
+        -- past which a window runs its whole effect itself, and a held one
+        -- past a lowered cap is given back.
+        memo = { split = "resize", keep_passes = 0, budget_mib = 0 },
+        -- While a window glides, is dragged or changes size, an effect's own
+        -- steps for it run again at most `motion_hz` times a second: the
+        -- glass's refraction as it moves, the shade as it changes size (10
+        -- to 1000; 0 on every pass). Between, its last result is drawn where
+        -- the window is, stretched to its size, so what shows through the
+        -- glass trails the window by at most that long's worth of its motion,
+        -- and everything is exact again within it once the window stops. A
+        -- backdrop that changes, or new params, run it at once.
+        motion_hz = 60,
+    },
+
+    -- Starting up. The first desktop frame waits until what it shows is
+    -- ready (the wallpaper's blur, the shell's materials), so nothing pops
+    -- in after it: at most `max_ms` (0 to 10000; 0 never waits), not at all
+    -- with `hold = false`, and after every reload too with `on_reload = true`.
+    -- With no effects there is nothing to wait for, and nothing waits.
+    startup = {
+        first_frame = { hold = true, max_ms = 2000, on_reload = false },
     },
 
     -- How much of a window trails behind it in the genie, for the Developer

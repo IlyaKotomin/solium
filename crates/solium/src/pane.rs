@@ -63,6 +63,14 @@ impl PaneId {
     pub(crate) const fn get(self) -> u64 {
         self.0
     }
+
+    /// For tests in other modules that need an id with no pane behind it, as
+    /// `SurfaceId::from_raw` is; nothing else invents one.
+    /// `effect::plan::tests::a_slot_is_wanted_by_its_owner_and_slot_and_ready_apart`.
+    #[cfg(test)]
+    pub(crate) const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
 }
 
 /// What is inside a pane.
@@ -204,6 +212,10 @@ pub(crate) struct Left {
     /// read back in `a_window_that_left_is_nobodys_to_find`.
     pub(crate) title: String,
     pub(crate) focused: bool,
+    /// Its application id, which its frame was told as `appId`, so a bar
+    /// showing the application's icon fades out with it
+    /// (`a_window_that_left_keeps_its_app_id_for_its_frame`).
+    pub(crate) app_id: String,
     /// What it is drawn from.
     pub(crate) remains: Remains,
     /// The fill's identity for the damage tracker, for [`Remains::Lost`].
@@ -522,6 +534,12 @@ pub(crate) struct Pane {
     /// pane is not captured on
     /// (`keyed::tests::a_pane_that_stops_warping_gives_the_texture_back`).
     captures: crate::keyed::Captures,
+    /// The grids a `sol.present` geometry last drew this pane through, by
+    /// key, built once a pass in `render::prepare` and kept while nothing
+    /// they depend on moves, and the version a present pinned. Left with the
+    /// pane, as its captures are.
+    /// `effect::geometry::tests::a_mesh_is_not_rebuilt_when_neither_progress_nor_an_anchor_changed`.
+    meshes: crate::effect::geometry::Meshes,
     /// The size limits of this pane's client that the layouts were last told
     /// about (#115). Not what the snapshot reads -- that asks the client, so it
     /// is never behind -- but what `Solium::notice_limits` compares with, so
@@ -612,6 +630,7 @@ impl Pane {
             drawn: crate::present::Slot::default(),
             managed: true,
             captures: crate::keyed::Captures::default(),
+            meshes: crate::effect::geometry::Meshes::default(),
             limits: crate::state::Limits::default(),
             cramped: false,
             shrinking: None,
@@ -645,6 +664,7 @@ impl Pane {
             drawn: crate::present::Slot::default(),
             managed: true,
             captures: crate::keyed::Captures::default(),
+            meshes: crate::effect::geometry::Meshes::default(),
             limits: crate::state::Limits::default(),
             cramped: false,
             shrinking: None,
@@ -907,6 +927,16 @@ impl Pane {
     /// to them. There is nothing to read.
     pub(crate) const fn captures_mut(&mut self) -> &mut crate::keyed::Captures {
         &mut self.captures
+    }
+
+    /// This pane's grids, and the version a present pinned. See the field.
+    pub(crate) fn meshes(&self) -> &crate::effect::geometry::Meshes {
+        &self.meshes
+    }
+
+    /// The same, to build a grid into or pin a version on.
+    pub(crate) fn meshes_mut(&mut self) -> &mut crate::effect::geometry::Meshes {
+        &mut self.meshes
     }
 
     /// Say what is drawn around this pane's client.
@@ -1567,6 +1597,7 @@ mod tests {
             over: Vec::new(),
             title: String::new(),
             focused: false,
+            app_id: String::new(),
             remains: Remains::Lost,
             fill: smithay::backend::renderer::element::Id::new(),
         }

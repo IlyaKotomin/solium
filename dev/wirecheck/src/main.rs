@@ -27,9 +27,7 @@ use smithay::backend::egl::fence::EGLFence;
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::element::{Element as _, Id, Kind, RenderElement};
-use smithay::backend::renderer::gles::{
-    GlesRenderer, GlesTexProgram, GlesTexture, Uniform, UniformName, UniformType,
-};
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTexProgram, GlesTexture, Uniform};
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{
     Bind as _, Color32F, ExportMem as _, Frame as _, ImportDma as _, ImportMem as _,
@@ -48,7 +46,16 @@ use std::os::fd::{FromRawFd as _, OwnedFd};
 )]
 mod target;
 
+// The compositor's smithay registrations, read from each shader's own source
+// (#95) and included by path, so cases 11 and 11h register exactly what
+// `pass::Programs::clip` does
+// (`pass::tests::the_registered_uniforms_are_the_declared_ones_but_smithays`).
+#[path = "../../../crates/solium/src/pass/uniforms.rs"]
+mod uniforms;
+
 mod fx0;
+mod fx2;
+mod fx3;
 
 unsafe extern "C" {
     fn solium_qml_start_gpu(import_path: *const c_char) -> c_int;
@@ -1514,16 +1521,31 @@ fn main() -> Result<()> {
         if late { "after" } else { "before" },
         if separate { "its own" } else { "the buffers'" }
     );
-    // `WIRECHECK_ONLY=fx0`: the FX0 cases alone, with no Qt, so they can be
-    // run on a machine that has only this binary (the Surface Pro 7).
-    if std::env::var("WIRECHECK_ONLY").as_deref() == Ok("fx0") {
-        let mut renderer = make_renderer(&gbm)?;
-        fx0::all(&mut renderer)?;
-        if std::env::var_os("WIRECHECK_FX0_CROSS").is_some() {
-            fx0::cross_control(&mut renderer, &gbm, &node)?;
+    // `WIRECHECK_ONLY=fx0`, `fx2` or `fx3`: those cases alone, with no Qt, so
+    // they can be run on a machine that has only this binary (the Surface Pro 7).
+    match std::env::var("WIRECHECK_ONLY").as_deref() {
+        Ok("fx0") => {
+            let mut renderer = make_renderer(&gbm)?;
+            fx0::all(&mut renderer)?;
+            if std::env::var_os("WIRECHECK_FX0_CROSS").is_some() {
+                fx0::cross_control(&mut renderer, &gbm, &node)?;
+            }
+            println!("\nFX0 cases passed");
+            return Ok(());
         }
-        println!("\nFX0 cases passed");
-        return Ok(());
+        Ok("fx2") => {
+            let mut renderer = make_renderer(&gbm)?;
+            fx2::all(&mut renderer)?;
+            println!("\nFX2 cases passed");
+            return Ok(());
+        }
+        Ok("fx3") => {
+            let mut renderer = make_renderer(&gbm)?;
+            fx3::all(&mut renderer)?;
+            println!("\nFX3 cases passed");
+            return Ok(());
+        }
+        _ => {}
     }
     let mut renderer = if late {
         // Qt first, exactly as the compositor orders it.
@@ -2810,11 +2832,7 @@ fn main() -> Result<()> {
     // them would draw an XRGB window invisible and a video surface black.
     match renderer.compile_custom_texture_shader(
         solium_effects::fragment::ROUNDED_CORNERS,
-        &[
-            UniformName::new(solium_effects::fragment::RADIUS_UNIFORM, UniformType::_4f),
-            // Ours, because smithay gives a *texture* program no `size`.
-            UniformName::new(solium_effects::fragment::SIZE_UNIFORM, UniformType::_2f),
-        ],
+        &uniforms::registration(solium_effects::fragment::ROUNDED_CORNERS),
     ) {
         Ok(program) => {
             println!("  rounded-corner shader: compiled");
@@ -2831,6 +2849,10 @@ fn main() -> Result<()> {
 
     // Case 11b onwards: Phase 0 of the shader work, in `fx0.rs`.
     fx0::all(&mut renderer)?;
+    // Cases 12a and 12b: FX2's effect programs, in `fx2.rs`.
+    fx2::all(&mut renderer)?;
+    // Cases 13a onwards: FX3's memo and its crop, in `fx3.rs`.
+    fx3::all(&mut renderer)?;
 
     // ------------------------------------------------------------------
     // The first rebind, on a scene that has never rendered.

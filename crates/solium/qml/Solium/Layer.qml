@@ -67,4 +67,26 @@ Item {
     // `property bool dormant` on its own file's root instead, as it declares
     // `onButton`.
     property bool dormant: false
+
+    // How opaque the compositor draws this layer's picture, from 0 to 1:
+    // applied as it composites the picture, over the window's own opacity,
+    // so animating it draws no new picture -- a fade by it costs a blend at
+    // another alpha per frame, and nothing of Qt's. 1 unless bound. A
+    // delegated layer declares `property real layerOpacity` on its own root
+    // instead, as it declares `dormant`.
+    // `decoration::tests::a_layer_fading_by_its_opacity_draws_no_new_picture`.
+    property real layerOpacity: 1
+
+    // How often, at most, the compositor draws this layer again for a new
+    // size while its window's size keeps changing (a drag on its edge, a
+    // layout's sweep), in times a second, from 5 to 1000: between, the
+    // picture it has is drawn stretched to the window, as the application's
+    // own is until it has drawn one at the new size, and the last size is
+    // drawn within a `1 / resizeHz` second of the window stopping. Something
+    // new to draw (a title, a focus change, an animation) is drawn at once.
+    // 0, the default, draws it at every size. A delegated layer declares
+    // `property real resizeHz` on its own root instead, as it declares
+    // `dormant`.
+    // `decoration::tests::a_layer_is_drawn_again_for_a_new_size_at_most_resize_hz_times_a_second`.
+    property real resizeHz: 0
 }

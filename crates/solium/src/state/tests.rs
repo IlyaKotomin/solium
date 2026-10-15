@@ -70,6 +70,1098 @@ fn a_pane_is_on_a_monitor_only_if_some_monitor_covers_part_of_it() {
     assert!(!anywhere_on(at(100, 100, 800, 600), []));
 }
 
+/// **A reload reads the effect folders again**: the configuration's
+/// `reload_from` leaves a changed effect pending for the next `prepare`.
+#[test]
+fn a_reload_reads_the_effect_folders_again() {
+    let directory = crate::effect::host::tests::scratch("state-reload");
+    let entry = directory.join("init.lua");
+    std::fs::write(&entry, "sol.pane('none')\n").expect("writing the test script");
+    let effects = directory.join("effects");
+    let frag = "vec4 sol_effect(vec2 uv) { return sol_tex(uv); }\n";
+    let dir = crate::effect::host::tests::folder(
+        &effects,
+        "a",
+        "return { api = 1, frag = 'effect.frag' }",
+        &[("effect.frag", frag)],
+    );
+    let display = smithay::reexports::wayland_server::Display::<Solium>::new()
+        .expect("creating a test wayland display");
+    let mut state = Solium::new(display.handle());
+    state.effects = crate::effect::host::Host::new(crate::effect::host::Library::with(
+        Some(effects.clone()),
+        effects.join("none"),
+    ));
+    state.effects.want("rules", ["a".to_owned()]);
+    let v1 = state
+        .effects
+        .pending_hash("a")
+        .expect("the premise: a cold load is pending until prepare");
+    std::fs::write(
+        dir.join("effect.frag"),
+        "vec4 sol_effect(vec2 uv) { return vec4(1.0); }\n",
+    )
+    .expect("v2");
+    state.reload_from(&entry);
+    assert_ne!(
+        state.effects.pending_hash("a"),
+        Some(v1),
+        "the reload did not read the folder again"
+    );
+    assert!(state.effects.pending_hash("a").is_some());
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+/// `sol.effects(<lua>)` through the compositor's `Command::Effects` arm, as
+/// the shipped `init.lua` hands `config.effects` over.
+fn apply_effects_lua(state: &mut Solium, lua: &str) {
+    let options = tree(lua);
+    let rules = options
+        .field("rules")
+        .map_or_else(|| Ok(Vec::new()), crate::effect::rules::parse);
+    let settings = crate::effect::settings::parse(&options);
+    state.apply_effects_set(rules, settings);
+}
+
+/// **`effects.sandbox` reaches the host and the styles' reader**: the caps
+/// one `sol.effects` gives are what every effect's Lua and every style's
+/// `effects.lua` are made with, and what it gives is kept for its readers.
+#[test]
+fn effects_sandbox_reaches_the_host_and_the_styles_reader() {
+    let display = smithay::reexports::wayland_server::Display::<Solium>::new()
+        .expect("creating a test wayland display");
+    let mut state = Solium::new(display.handle());
+    apply_effects_lua(
+        &mut state,
+        "{ sandbox = { load_ms = 300, memory_mib = 32 }, limits = { params = 12 } }",
+    );
+    let caps = crate::effect::settings::Caps {
+        load: std::time::Duration::from_millis(300),
+        memory: 32 << 20,
+    };
+    assert_eq!(state.effects.caps(), caps);
+    let styles = crate::style::caps();
+    assert_eq!(state.effect_settings.limits.params, 12);
+    // Back to the defaults, which every other test reads styles under.
+    apply_effects_lua(&mut state, "{}");
+    assert_eq!(styles, caps, "the styles' reader kept its own caps");
+    assert_eq!(
+        crate::style::caps(),
+        crate::effect::settings::Caps::default()
+    );
+}
+
+/// **A refused setting keeps everything as it was**: a key out of its bounds
+/// is a problem under `settings`, and neither the caps nor the rules of the
+/// same `sol.effects` are taken; a set that parses clears it.
+#[test]
+fn a_refused_effects_setting_keeps_everything_as_it_was() {
+    let place = crate::effect::host::tests::scratch("state-refused-setting");
+    crate::effect::host::tests::folder(&place, "tint", TINT, &[("effect.frag", TINT_FRAG)]);
+    let (_display, mut state) = state_with_effects_in(&place);
+    let rule = "{ { match = '*', part = 'client', slot = 'behind', effect = 'tint' } }";
+    apply_effects_lua(
+        &mut state,
+        &format!("{{ rules = {rule}, sandbox = {{ load_ms = 1 }} }}"),
+    );
+    assert!(
+        state.rules.is_empty(),
+        "the rules of a refused set were taken"
+    );
+    assert_eq!(
+        state.effects.caps(),
+        crate::effect::settings::Caps::default()
+    );
+    let said = |state: &Solium| {
+        state
+            .effects
+            .problems()
+            .iter()
+            .filter(|problem| problem.effect == "settings")
+            .map(|problem| problem.message.clone())
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        said(&state)
+            .iter()
+            .any(|message| message.contains("effects.sandbox.load_ms")),
+        "{:?}",
+        state.effects.problems()
+    );
+    apply_effects_lua(&mut state, &format!("{{ rules = {rule} }}"));
+    assert!(!state.rules.is_empty(), "{:?}", state.effects.problems());
+    assert!(said(&state).is_empty(), "{:?}", said(&state));
+    let _ = std::fs::remove_dir_all(place);
+}
+
+/// **A reload that no longer calls `sol.effects` drops a refused set's
+/// problem**: the configuration that refused it is gone, so what it said
+/// goes with it, as the new configuration says it again or not.
+#[test]
+fn a_reload_drops_a_refused_settings_problem() {
+    let directory = crate::effect::host::tests::scratch("state-settings-reload");
+    let entry = directory.join("init.lua");
+    std::fs::write(&entry, "sol.pane('none')\n").expect("writing the test script");
+    let display = smithay::reexports::wayland_server::Display::<Solium>::new()
+        .expect("creating a test wayland display");
+    let mut state = Solium::new(display.handle());
+    let settings = |state: &Solium| {
+        state
+            .effects
+            .problems()
+            .iter()
+            .filter(|problem| problem.effect == "settings")
+            .count()
+    };
+    apply_effects_lua(&mut state, "{ sandbox = { load_ms = 1 } }");
+    assert_eq!(settings(&state), 1, "the premise: the set was refused");
+    state.reload_from(&entry);
+    let _ = std::fs::remove_dir_all(directory);
+    assert_eq!(
+        settings(&state),
+        0,
+        "a configuration that no longer calls sol.effects kept its problem: {:?}",
+        state.effects.problems()
+    );
+}
+
+/// **`sol.startup` configures the first frame's gate, and a refusal
+/// keeps what ran**: `max_ms = 500` lets the frame through at 500 ms; a
+/// reload saying `max_ms = -1` is a problem under `startup`, naming the
+/// key, and the gate keeps 500; a reload that mends it drops the problem.
+#[test]
+fn sol_startup_configures_the_gate_and_a_refusal_keeps_what_ran() {
+    use std::time::Duration;
+    let directory = crate::effect::host::tests::scratch("state-startup");
+    let entry = directory.join("init.lua");
+    let display = smithay::reexports::wayland_server::Display::<Solium>::new()
+        .expect("creating a test wayland display");
+    let mut state = Solium::new(display.handle());
+    let ms = Duration::from_millis;
+    let said = |state: &Solium| {
+        state
+            .effects
+            .problems()
+            .iter()
+            .filter(|problem| problem.effect == "startup")
+            .map(|problem| problem.message.clone())
+            .collect::<Vec<_>>()
+    };
+    let write = |lua: &str| std::fs::write(&entry, lua).expect("writing the test script");
+    write("sol.pane('none')\nsol.startup({ first_frame = { max_ms = 500, on_reload = true } })\n");
+    state.reload_from(&entry);
+    assert!(said(&state).is_empty(), "{:?}", said(&state));
+    assert!(state.warm.holding(ms(1000), false));
+    assert!(state.warm.holding(ms(1499), false));
+    assert!(
+        !state.warm.holding(ms(1500), false),
+        "max_ms = 500 not obeyed"
+    );
+    write("sol.pane('none')\nsol.startup({ first_frame = { max_ms = -1 } })\n");
+    state.reload_from(&entry);
+    let refused = said(&state);
+    assert!(
+        refused.len() == 1 && refused[0].contains("max_ms"),
+        "{refused:?}"
+    );
+    assert!(
+        state.warm.holding(ms(2000), false),
+        "the refusal dropped on_reload"
+    );
+    assert!(
+        !state.warm.holding(ms(2500), false),
+        "the refusal dropped max_ms = 500"
+    );
+    write("sol.pane('none')\nsol.startup({ first_frame = { max_ms = 500 } })\n");
+    state.reload_from(&entry);
+    let _ = std::fs::remove_dir_all(directory);
+    assert!(said(&state).is_empty(), "{:?}", said(&state));
+}
+
+/// **An injected wait holds the first frame for its passes**
+/// (`SOLIUM_WARM_INJECT`, the control of `dev/effects-check.sh xray`'s
+/// first frames): with nothing pending the effects are ready, yet the first
+/// frame is not for the first passes injected, each held by
+/// `render::hold_first_frame` as `prepare` asks it, and is ready from then
+/// on, released as ready, not at the cap. With none injected, the first
+/// pass draws (spec §8.4).
+#[test]
+fn an_injected_wait_holds_the_first_frame_for_its_passes() {
+    let display = smithay::reexports::wayland_server::Display::<Solium>::new()
+        .expect("creating a test wayland display");
+    let mut state = Solium::new(display.handle());
+    assert!(state.effects_ready(), "the premise: nothing pending");
+    state.warm.inject(2);
+    for pass in 0..2 {
+        assert!(
+            !state.first_frame_ready(),
+            "pass {pass}: ready while injected"
+        );
+        assert!(
+            crate::render::hold_first_frame(&mut state),
+            "pass {pass}: not held"
+        );
+    }
+    assert!(state.first_frame_ready(), "not ready after its passes");
+    assert!(
+        !crate::render::hold_first_frame(&mut state),
+        "held past its injected passes"
+    );
+    assert!(!state.warm.capped(), "released at the cap, not as ready");
+    let mut plain = Solium::new(display.handle());
+    assert!(
+        !crate::render::hold_first_frame(&mut plain),
+        "held with nothing injected and nothing pending"
+    );
+}
+
+/// **A reload arms the first frame's gate again only with `on_reload`**:
+/// released at its first ready pass, a reload with `on_reload = false`
+/// draws at once, and one with `on_reload = true` holds until ready, the
+/// new configuration's `on_reload` the one obeyed.
+#[test]
+fn a_reload_arms_the_first_frames_gate_only_with_on_reload() {
+    use std::time::Duration;
+    let directory = crate::effect::host::tests::scratch("state-startup-reload");
+    let entry = directory.join("init.lua");
+    let display = smithay::reexports::wayland_server::Display::<Solium>::new()
+        .expect("creating a test wayland display");
+    let mut state = Solium::new(display.handle());
+    let ms = Duration::from_millis;
+    let write = |on: bool| {
+        std::fs::write(
+            &entry,
+            format!("sol.pane('none')\nsol.startup({{ first_frame = {{ on_reload = {on} }} }})\n"),
+        )
+        .expect("writing the test script")
+    };
+    write(false);
+    state.reload_from(&entry);
+    assert!(!state.warm.holding(ms(0), true), "the premise: released");
+    state.reload_from(&entry);
+    assert!(
+        !state.warm.holding(ms(100), false),
+        "on_reload = false held after a reload"
+    );
+    write(true);
+    state.reload_from(&entry);
+    let _ = std::fs::remove_dir_all(directory);
+    assert!(
+        state.warm.holding(ms(200), false),
+        "a reload with on_reload = true did not arm the gate"
+    );
+}
+
+/// **A refused set with broken rules says both**: its settings' error and
+/// every rule's, as each alone would.
+#[test]
+fn a_refused_set_with_broken_rules_says_both() {
+    let display = smithay::reexports::wayland_server::Display::<Solium>::new()
+        .expect("creating a test wayland display");
+    let mut state = Solium::new(display.handle());
+    apply_effects_lua(
+        &mut state,
+        "{ rules = { { match = '*', part = 'regoin:titlebar', slot = 'behind', effect = false } }, sandbox = { load_ms = 1 } }",
+    );
+    let said = |effect: &str| {
+        state
+            .effects
+            .problems()
+            .iter()
+            .any(|problem| problem.effect == effect)
+    };
+    assert!(said("settings"), "{:?}", state.effects.problems());
+    assert!(
+        said("rules"),
+        "the rules' errors were dropped: {:?}",
+        state.effects.problems()
+    );
+}
+
+/// **A broken configuration reload is a problem**, so the overlay of the
+/// configuration still running lists it, a second failure replaces it rather
+/// than adding to it, and a reload that works clears it.
+#[test]
+fn a_failed_reload_is_a_problem_until_one_succeeds() {
+    let directory = crate::effect::host::tests::scratch("state-config-problem");
+    let entry = directory.join("init.lua");
+    std::fs::write(&entry, "sol.pane('none')\n").expect("writing");
+    let display = smithay::reexports::wayland_server::Display::<Solium>::new()
+        .expect("creating a test wayland display");
+    let mut state = Solium::new(display.handle());
+    let config = |state: &Solium| -> Vec<crate::effect::host::Problem> {
+        state
+            .effects
+            .problems()
+            .iter()
+            .filter(|each| each.effect == "config")
+            .cloned()
+            .collect()
+    };
+    std::fs::write(&entry, "sol.pane('none')\nthis is not lua\n").expect("breaking it");
+    state.reload_from(&entry);
+    let problems = config(&state);
+    let [problem] = problems.as_slice() else {
+        panic!("one config problem: {problems:?}");
+    };
+    assert_eq!(problem.line, Some(2), "{problem:?}");
+    assert_eq!(problem.file, entry, "{problem:?}");
+    std::fs::write(&entry, "sol.pane('none')\n\nthis is not lua either\n").expect("again");
+    state.reload_from(&entry);
+    let lines: Vec<Option<u32>> = config(&state).iter().map(|each| each.line).collect();
+    assert_eq!(lines, [Some(3)], "the second failure replaces the first");
+    std::fs::write(&entry, "sol.pane('none')\n").expect("mending it");
+    state.reload_from(&entry);
+    assert!(
+        state
+            .effects
+            .problems()
+            .iter()
+            .all(|each| each.effect != "config")
+    );
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+/// **The scripts hear of changed problems once, after the frame**: `settle`
+/// fires `problems` when they changed since it last told them, and not again
+/// until they change.
+#[test]
+fn settle_tells_the_scripts_once_per_change_of_the_problems() {
+    let directory = crate::effect::host::tests::scratch("state-problems-told");
+    let entry = directory.join("init.lua");
+    std::fs::write(
+        &entry,
+        "local n = 0\nsol.on('problems', function() n = n + 1; sol.status(tostring(n)) end)\n",
+    )
+    .expect("writing");
+    let display = smithay::reexports::wayland_server::Display::<Solium>::new()
+        .expect("creating a test wayland display");
+    let mut state = Solium::new(display.handle());
+    state.start_scripts(Some(
+        crate::script::Scripts::load(&entry).expect("loading the test script"),
+    ));
+    let mut told = Vec::new();
+    state.settle(state.clock.now());
+    told.push(state.status.clone());
+    state
+        .effects
+        .push_problem(crate::effect::host::config_problem("no line"));
+    state.settle(state.clock.now());
+    told.push(state.status.clone());
+    state.settle(state.clock.now());
+    told.push(state.status.clone());
+    state.effects.clear_problems_of("config");
+    state.settle(state.clock.now());
+    told.push(state.status.clone());
+    let _ = std::fs::remove_dir_all(directory);
+    assert_eq!(told, ["", "1", "1", "2"]);
+}
+
+/// **A framed pane's `style` is the configured style's name, the default's
+/// when none is named, and a bare pane's is `"none"`** (Ruling 15): a rule on
+/// `style = "top"` reaches a window framed by the default style as it does
+/// one framed by `pane = "top"`, and never a fullscreen one.
+#[test]
+fn a_framed_panes_style_is_the_configured_one_or_the_default_and_a_bare_ones_is_none() {
+    assert_eq!(style_fact(true, Some("frosted")), "frosted");
+    assert_eq!(style_fact(true, None), "top");
+    assert_eq!(style_fact(false, Some("top")), "none");
+    assert_eq!(style_fact(false, None), "none");
+}
+
+/// Rules from Lua source, read the way `sol.effects` reads them (as
+/// `effect::rules::tests::rules` does).
+fn tree(lua: &str) -> crate::effect::tree::Tree {
+    let state = mlua::Lua::new();
+    let value: mlua::Value = state.load(lua).eval().expect("the test's Lua");
+    crate::effect::tree::Tree::from_lua(&value)
+        .expect("readable")
+        .expect("a value")
+}
+
+type TestDisplay = smithay::reexports::wayland_server::Display<Solium>;
+
+/// A display, and a state whose effects are looked for in `place` alone.
+fn state_with_effects_in(place: &std::path::Path) -> (TestDisplay, Solium) {
+    let display = TestDisplay::new().expect("creating a test wayland display");
+    let mut state = Solium::new(display.handle());
+    state.effects = crate::effect::host::Host::new(crate::effect::host::Library::with(
+        Some(place.to_path_buf()),
+        place.join("none"),
+    ));
+    (display, state)
+}
+
+const TINT: &str =
+    "return { api = 1, inputs = { 'self' }, params = { amount = { 0.1 } }, frag = 'effect.frag' }";
+const TINT_FRAG: &str = "vec4 sol_effect(vec2 uv) { return sol_tex(uv) * p_amount; }\n";
+
+/// The user's newest bound plan's first step, as a test reads it.
+fn first_step(state: &Solium) -> Option<&solium_effects::stage::Step> {
+    state
+        .chains
+        .first_plan_for_test(crate::effect::rules::Origin::User)
+        .and_then(|plan| plan.steps.first())
+}
+
+/// **A broken rule keeps the rules that ran**, and the error is a problem;
+/// **a rule naming an effect nobody ships is refused** the same way.
+#[test]
+fn a_broken_rule_keeps_the_rules_that_ran() {
+    let place = crate::effect::host::tests::scratch("state-rules");
+    crate::effect::host::tests::folder(&place, "tint", TINT, &[("effect.frag", TINT_FRAG)]);
+    let (_display, mut state) = state_with_effects_in(&place);
+    let good = crate::effect::rules::parse(&tree(
+        r#"{ { match = "*", part = "client", slot = "replace", effect = { "tint", amount = 0.2 } } }"#,
+    ))
+    .expect("parses");
+    state.apply_effects(Ok(good));
+    assert!(!state.rules.is_empty());
+    let nobody = crate::effect::rules::parse(&tree(
+        r#"{ { match = "*", part = "client", slot = "replace", effect = "nobody" } }"#,
+    ))
+    .expect("parses");
+    state.apply_effects(Ok(nobody));
+    assert_eq!(
+        state.rules.effects(),
+        vec!["tint".to_owned()],
+        "the rules that ran were replaced by a broken set"
+    );
+    assert!(
+        state
+            .effects
+            .problems()
+            .iter()
+            .any(|each| each.effect == "rules" && each.message.contains("nobody")),
+        "{:?}",
+        state.effects.problems()
+    );
+    let _ = std::fs::remove_dir_all(place);
+}
+
+/// **A rule whose effect fails its checks is named at the effect's own file
+/// and line**, once, and **a set that mends it leaves nothing on the
+/// overlay**: the problem of an effect no longer wanted goes with it.
+#[test]
+fn a_rule_whose_effect_is_broken_is_named_at_the_frags_line_until_mended() {
+    let place = crate::effect::host::tests::scratch("state-rules-typo");
+    crate::effect::host::tests::folder(&place, "tint", TINT, &[("effect.frag", TINT_FRAG)]);
+    crate::effect::host::tests::folder(
+        &place,
+        "typo",
+        "return { api = 1, inputs = { 'self' }, params = { offset = { 1 } }, frag = 'down.frag' }",
+        &[(
+            "down.frag",
+            "vec4 sol_effect(vec2 uv) {\n    return sol_tex(uv) * p_ofset;\n}\n",
+        )],
+    );
+    let (_display, mut state) = state_with_effects_in(&place);
+    state.apply_effects(Ok(crate::effect::rules::parse(&tree(
+        r#"{ { match = "*", part = "client", slot = "behind", effect = "typo" } }"#,
+    ))
+    .expect("parses")));
+    assert!(state.rules.is_empty());
+    let problems = state.effects.problems().to_vec();
+    let [problem] = problems.as_slice() else {
+        panic!("one problem: {problems:?}");
+    };
+    assert_eq!(
+        (problem.effect.as_str(), problem.file.clone(), problem.line),
+        ("rules", place.join("typo/down.frag"), Some(2)),
+        "{problem:?}"
+    );
+    assert!(problem.message.contains("rule 1"), "{problem:?}");
+    state.apply_effects(Ok(crate::effect::rules::parse(&tree(
+        r#"{ { match = "*", part = "client", slot = "behind", effect = "tint" } }"#,
+    ))
+    .expect("parses")));
+    assert!(!state.rules.is_empty());
+    assert_eq!(
+        state.effects.problems(),
+        &[],
+        "a mended set left a problem behind"
+    );
+    let _ = std::fs::remove_dir_all(place);
+}
+
+/// **A rule reading the backdrop binds from X2.1 on** (T2, Task 44), and one
+/// reading the live backdrop is refused at load, naming X4.1.
+#[test]
+fn a_blur_rule_without_source_binds_and_live_is_refused() {
+    let place = crate::effect::host::tests::scratch("state-xray");
+    crate::effect::host::tests::folder(
+        &place,
+        "soft",
+        "return { api = 1, inputs = { 'backdrop' }, frag = 'effect.frag' }",
+        &[(
+            "effect.frag",
+            "vec4 sol_effect(vec2 uv) { return sol_tex(uv); }\n",
+        )],
+    );
+    let (_display, mut state) = state_with_effects_in(&place);
+    state.apply_effects(Ok(crate::effect::rules::parse(&tree(
+        r#"{ { match = "*", part = "client", slot = "behind", effect = { "soft", source = "live" } } }"#,
+    ))
+    .expect("parses")));
+    assert!(state.rules.is_empty());
+    assert!(
+        state
+            .effects
+            .problems()
+            .iter()
+            .any(|each| each.message.contains("X4.1")),
+        "{:?}",
+        state.effects.problems()
+    );
+    state.apply_effects(Ok(crate::effect::rules::parse(&tree(
+        r#"{ { match = "*", part = "client", slot = "behind", effect = "soft" } }"#,
+    ))
+    .expect("parses")));
+    assert!(!state.rules.is_empty(), "{:?}", state.effects.problems());
+    let _ = std::fs::remove_dir_all(place);
+}
+
+/// **The probe's first answer rebinds the rules after the frame** (Ruling
+/// 11): a rule bound at config load, before any probe, keeps its `rgba16f`
+/// rung; the probe says no; the next settle rebinds, and the rung is gone.
+#[test]
+fn the_formats_probe_rebinds_the_rules_after_the_frame() {
+    let place = crate::effect::host::tests::scratch("state-formats");
+    let frag = "vec4 sol_effect(vec2 uv) { return sol_tex(uv); }\n";
+    crate::effect::host::tests::folder(
+        &place,
+        "fine",
+        "return { api = 1, inputs = { 'self' }, params = { field = { 1, int = true } }, fallback = { { field = 0 } },
+        stages = function(p) if p.field == 1 then return { { 'pass', 'a.frag', format = 'rgba16f' } } end return { { 'pass', 'a.frag' } } end }",
+        &[("a.frag", frag)],
+    );
+    let (_display, mut state) = state_with_effects_in(&place);
+    state.apply_effects(Ok(crate::effect::rules::parse(&tree(
+        r#"{ { match = "*", part = "client", slot = "replace", effect = { "fine", source = "self" } } }"#,
+    ))
+    .expect("parses")));
+    let format = |state: &Solium| first_step(state).map(|step| step.format);
+    assert_eq!(
+        format(&state),
+        Some(solium_effects::stage::Format::Rgba16f),
+        "the premise: unknown formats keep the configured rung"
+    );
+    crate::render::note_formats(&mut state, crate::pool::Formats { rgba16f: false });
+    assert!(state.rebind);
+    let _ = state.settle(state.clock.now());
+    assert_eq!(
+        format(&state),
+        Some(solium_effects::stage::Format::Rgba8),
+        "the rule was not rebound after the probe"
+    );
+    assert!(!state.rebind);
+    let _ = std::fs::remove_dir_all(place);
+}
+
+/// **`settle` rebuilds an effect its budget stopped, after the frame**
+/// (Ruling 4), so the next pane's `mesh` call runs on a fresh state.
+#[test]
+fn settle_rebuilds_an_effect_its_budget_stopped() {
+    let place = crate::effect::host::tests::scratch("state-revive");
+    crate::effect::host::tests::folder(&place, "spin", crate::effect::geometry::tests::SPIN, &[]);
+    let (_display, mut state) = state_with_effects_in(&place);
+    state.effects.want("present", ["spin".to_owned()]);
+    let stopped = state.effects.effect("spin").expect("current");
+    stopped
+        .sandbox()
+        .lua()
+        .globals()
+        .set("spin", true)
+        .expect("set");
+    let ask = crate::effect::geometry::tests::ask();
+    assert!(crate::effect::geometry::mesh(stopped.sandbox(), &ask, 1, 1).is_err());
+    let _ = state.settle(state.clock.now());
+    let fresh = state.effects.effect("spin").expect("still current");
+    assert!(
+        !fresh.sandbox().poisoned(),
+        "settle did not rebuild the stopped effect"
+    );
+    let _ = std::fs::remove_dir_all(place);
+}
+
+/// **A reload binds the rules against the folders it read**, so an effect
+/// changed on disk is the version its rule runs: here a param's default.
+#[test]
+fn a_reload_binds_the_rules_against_the_folders_it_read() {
+    let directory = crate::effect::host::tests::scratch("state-reload-rules");
+    let entry = directory.join("init.lua");
+    std::fs::write(
+        &entry,
+        "sol.pane('none')\nsol.effects({ rules = { { match = '*', part = 'client', slot = 'replace', effect = 'tint' } } })\n",
+    )
+    .expect("writing the test script");
+    let effects = directory.join("effects");
+    let dir =
+        crate::effect::host::tests::folder(&effects, "tint", TINT, &[("effect.frag", TINT_FRAG)]);
+    let (_display, mut state) = state_with_effects_in(&effects);
+    let uniforms = |state: &Solium| first_step(state).map(|step| step.uniforms.clone());
+    state.reload_from(&entry);
+    let before = uniforms(&state).expect("the premise: the rule is bound");
+    std::fs::write(dir.join("effect.lua"), TINT.replace("0.1", "0.3")).expect("v2");
+    state.reload_from(&entry);
+    assert_ne!(
+        uniforms(&state),
+        Some(before),
+        "the rule was bound against the folder as it was before the reload"
+    );
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+/// **A rule set holds the programs it runs, and a set replacing it gives
+/// them back**: what one set bound is not held for the rest of the session.
+#[test]
+fn a_replaced_rule_set_holds_only_its_own_programs() {
+    let place = crate::effect::host::tests::scratch("state-rules-held");
+    crate::effect::host::tests::folder(&place, "tint", TINT, &[("effect.frag", TINT_FRAG)]);
+    crate::effect::host::tests::folder(
+        &place,
+        "plain",
+        "return { api = 1, inputs = { 'self' }, frag = 'effect.frag' }",
+        &[(
+            "effect.frag",
+            "vec4 sol_effect(vec2 uv) { return sol_tex(uv); }\n",
+        )],
+    );
+    let (_display, mut state) = state_with_effects_in(&place);
+    let key = |state: &Solium| first_step(state).map(|step| step.key).expect("bound");
+    state.apply_effects(Ok(crate::effect::rules::parse(&tree(
+        r#"{ { match = "*", part = "client", slot = "replace", effect = "tint" } }"#,
+    ))
+    .expect("parses")));
+    let tint = key(&state);
+    assert!(state.effects.held_for_test().contains(&tint));
+    state.apply_effects(Ok(crate::effect::rules::parse(&tree(
+        r#"{ { match = "*", part = "client", slot = "replace", effect = "plain" } }"#,
+    ))
+    .expect("parses")));
+    let plain = key(&state);
+    assert_ne!(tint, plain);
+    assert_eq!(
+        state
+            .effects
+            .held_for_test()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![plain],
+        "the replaced set's program is still held"
+    );
+    let _ = std::fs::remove_dir_all(place);
+}
+
+/// **A refused rule set leaves no compile asked for**: neither the program a
+/// rule of it bound that nothing had asked for (a param picking another
+/// `.frag`) nor the one an effect only it named would be compiled, so
+/// nothing reaches the GPU for a set that never ran.
+#[test]
+fn a_refused_rule_set_leaves_no_compile_asked_for() {
+    let place = crate::effect::host::tests::scratch("state-rules-refused-asks");
+    crate::effect::host::tests::folder(
+        &place,
+        "pick",
+        "return { api = 1, inputs = { 'self' }, params = { which = { 0, int = true } },
+            stages = function(p) if p.which == 1 then return { { 'pass', 'b.frag' } } end return { { 'pass', 'a.frag' } } end }",
+        &[
+            ("a.frag", "vec4 sol_effect(vec2 uv) { return sol_tex(uv); }\n"),
+            ("b.frag", "vec4 sol_effect(vec2 uv) { return sol_tex(uv) * 0.5; }\n"),
+        ],
+    );
+    crate::effect::host::tests::folder(&place, "tint", TINT, &[("effect.frag", TINT_FRAG)]);
+    let (_display, mut state) = state_with_effects_in(&place);
+    state.apply_effects(Ok(crate::effect::rules::parse(&tree(
+        r#"{ { match = "*", part = "client", slot = "replace", effect = "pick" } }"#,
+    ))
+    .expect("parses")));
+    let held = state.effects.held_for_test().clone();
+    let asked = state.effects.asked_for_test();
+    assert_eq!(asked.len(), 1, "the premise: a.frag is asked for");
+    state.apply_effects(Ok(crate::effect::rules::parse(&tree(
+        r#"{
+            { match = "*", part = "client", slot = "replace", effect = { "pick", which = 1 } },
+            { match = "*", part = "client", slot = "behind", effect = "tint" },
+            { match = "*", part = "client", slot = "front", effect = "nobody" },
+        }"#,
+    ))
+    .expect("parses")));
+    assert_eq!(
+        state.rules.effects(),
+        vec!["pick".to_owned()],
+        "the premise: the set was refused"
+    );
+    assert_eq!(state.effects.held_for_test(), &held);
+    assert_eq!(
+        state.effects.asked_for_test(),
+        asked,
+        "a refused set left a compile asked for"
+    );
+    let _ = std::fs::remove_dir_all(place);
+}
+
+/// Whether this run's environment has chosen the pane style already, so a
+/// test that names one stands down rather than asserting about another.
+fn the_environment_names_a_style() -> bool {
+    ["SOLIUM_PANE", "SOLIUM_DECORATION", "SOLIUM_QML_TITLEBAR"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+}
+
+/// A pane style folder `frosted` in `place`, with `effects.lua` as given and
+/// a manifest nothing here builds.
+fn style_with_rules(place: &std::path::Path, effects_lua: &str) -> std::path::PathBuf {
+    let style = place.join("frosted");
+    std::fs::create_dir_all(&style).expect("a style folder");
+    std::fs::write(
+        style.join("Pane.qml"),
+        "import Solium\nPaneStyle { Layer { depth: \"frame\"; name: \"bar\" } }\n",
+    )
+    .expect("writing the manifest");
+    std::fs::write(style.join("effects.lua"), effects_lua).expect("writing effects.lua");
+    style
+}
+
+/// The style's newest bound plan's first step's program, as a test reads it.
+fn style_step(state: &Solium) -> Option<u64> {
+    state
+        .chains
+        .first_plan_for_test(crate::effect::rules::Origin::Style)
+        .and_then(|plan| plan.steps.first())
+        .map(|step| step.key)
+}
+
+/// **A style's rules are bound when it is applied, and a broken
+/// `effects.lua` is on the overlay** (Ruling 15): its effects are wanted and
+/// its rules bound at config load, not when a frame first resolves one; a
+/// broken edit lists its line, and the rules that ran stay bound. Applied
+/// again unchanged it tells the overlay nothing, and mended it leaves
+/// nothing there.
+#[test]
+fn a_styles_rules_are_bound_when_it_is_applied_and_its_problems_are_on_the_overlay() {
+    let place = crate::effect::host::tests::scratch("state-style-rules");
+    crate::effect::host::tests::folder(&place, "tint", TINT, &[("effect.frag", TINT_FRAG)]);
+    let style = style_with_rules(
+        &place,
+        "return { { match = '*', part = 'client', slot = 'front', effect = { 'tint', source = 'self' } } }",
+    );
+    let (_display, mut state) = state_with_effects_in(&place);
+    state.apply_style_rules_from(Some(&style));
+    assert!(
+        state.effects.has_pending("tint"),
+        "the style's effect is not wanted when the style is applied"
+    );
+    assert!(
+        state
+            .chains
+            .first_plan_for_test(crate::effect::rules::Origin::Style)
+            .is_some(),
+        "the style's rule is not bound when the style is applied"
+    );
+    std::fs::write(
+        style.join("effects.lua"),
+        "return {\n  {\n    part = = 'client' } }",
+    )
+    .expect("breaking it");
+    state.apply_style_rules_from(Some(&style));
+    assert!(
+        state
+            .effects
+            .problems()
+            .iter()
+            .any(|each| each.effect.starts_with("style:") && each.line == Some(3)),
+        "{:?}",
+        state.effects.problems()
+    );
+    assert!(
+        state
+            .chains
+            .first_plan_for_test(crate::effect::rules::Origin::Style)
+            .is_some(),
+        "the rules that ran went with the broken edit"
+    );
+    let told = state.effects.problems_generation();
+    state.apply_style_rules_from(Some(&style));
+    assert_eq!(
+        state.effects.problems_generation(),
+        told,
+        "applied again unchanged, the overlay was told of a change"
+    );
+    std::fs::write(style.join("effects.lua"), "return {}").expect("mending it");
+    state.apply_style_rules_from(Some(&style));
+    assert!(
+        !state
+            .effects
+            .problems()
+            .iter()
+            .any(|each| each.effect.starts_with("style:")),
+        "{:?}",
+        state.effects.problems()
+    );
+    assert!(
+        state
+            .chains
+            .first_plan_for_test(crate::effect::rules::Origin::Style)
+            .is_none(),
+        "a rule the mended file no longer has is still bound"
+    );
+    let _ = std::fs::remove_dir_all(place);
+}
+
+/// **The shipped glass style binds liquid glass behind the pane and the
+/// shade in front of it**: its `effects.lua` has two rules, the `glass`
+/// effect behind every pane but a fullscreen one (T2, reading the backdrop),
+/// and the `shade` in front of every such pane without the keyboard (T0,
+/// reading only the pane's shape), fading in and out over 240 ms on
+/// `outCubic`; both bind, and the style's effects are wanted.
+#[test]
+fn the_shipped_glass_style_binds_liquid_glass_behind_the_pane() {
+    use crate::effect::rules::{Fade, Fill, Part, Slot, Tier};
+    let style = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/qml/panes/glass"));
+    let read = crate::style::rules_of(style);
+    assert!(read.problems.is_empty(), "{:?}", read.problems);
+    let [glass, shade] = &read.rules[..] else {
+        panic!("two rules: {:?}", read.rules)
+    };
+    assert_eq!((&glass.part, glass.slot), (&Part::Pane, Slot::Behind));
+    assert_eq!(glass.matches.fullscreen, Some(false), "{:?}", glass.matches);
+    assert!(
+        matches!(&glass.fill, Fill::Chain(links) if links.len() == 1 && links[0].effect == "glass"),
+        "{:?}",
+        glass.fill
+    );
+    assert_eq!(glass.fade, None);
+    assert_eq!((&shade.part, shade.slot), (&Part::Pane, Slot::Front));
+    assert_eq!(
+        (shade.matches.fullscreen, shade.matches.focused),
+        (Some(false), Some(false)),
+        "{:?}",
+        shade.matches
+    );
+    assert!(
+        matches!(&shade.fill, Fill::Chain(links) if links.len() == 1 && links[0].effect == "shade"),
+        "{:?}",
+        shade.fill
+    );
+    assert_eq!(
+        shade.fade,
+        Some(Fade {
+            duration: std::time::Duration::from_millis(240),
+            curve: solium_animation::Curve::OutCubic,
+        })
+    );
+
+    let display = TestDisplay::new().expect("creating a test wayland display");
+    let mut state = Solium::new(display.handle());
+    state.effects = crate::effect::host::Host::new(crate::effect::host::Library::with(
+        None,
+        std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/effects")).to_path_buf(),
+    ));
+    state.apply_style_rules_from(Some(style));
+    for effect in ["glass", "shade"] {
+        assert!(
+            state.effects.has_pending(effect),
+            "the style's {effect} is not wanted"
+        );
+    }
+    assert!(
+        !state
+            .effects
+            .problems()
+            .iter()
+            .any(|each| each.effect.starts_with("style:")),
+        "{:?}",
+        state.effects.problems()
+    );
+    let tiers: Vec<(u32, Tier)> = state
+        .chains
+        .all_for_test(crate::effect::rules::Origin::Style)
+        .into_iter()
+        .map(|(key, chain)| (key.index, chain.tier))
+        .collect();
+    assert_eq!(tiers, [(0, Tier::Xray), (1, Tier::Generated)], "{tiers:?}");
+}
+
+/// **A style's rule that cannot bind is a problem at its `effects.lua`, and
+/// the others run** (Ruling 15): where your own set is taken whole, a
+/// style's rules are bound one by one, so one naming an effect nobody ships
+/// costs only its own slot.
+#[test]
+fn a_style_rule_that_cannot_bind_is_a_problem_and_the_others_run() {
+    let place = crate::effect::host::tests::scratch("state-style-rule-unbound");
+    crate::effect::host::tests::folder(&place, "tint", TINT, &[("effect.frag", TINT_FRAG)]);
+    let style = style_with_rules(
+        &place,
+        "return {
+            { match = '*', part = 'client', slot = 'front', effect = { 'tint', source = 'self' } },
+            { match = '*', part = 'client', slot = 'behind', effect = 'nobody' },
+        }",
+    );
+    let (_display, mut state) = state_with_effects_in(&place);
+    state.apply_style_rules_from(Some(&style));
+    assert!(
+        style_step(&state).is_some(),
+        "the style's rule that binds did not run beside the one that does not"
+    );
+    assert!(
+        state
+            .effects
+            .problems()
+            .iter()
+            .any(|each| each.effect == "style:frosted"
+                && each.message.contains("rule 2")
+                && each.file == style.join("effects.lua")),
+        "{:?}",
+        state.effects.problems()
+    );
+    let _ = std::fs::remove_dir_all(place);
+}
+
+/// **A style's rules hold the programs they run, and a style replacing them
+/// gives them back**, as your own set's do: what one style bound is not held
+/// for the rest of the session.
+#[test]
+fn a_replaced_style_holds_only_its_own_programs() {
+    let place = crate::effect::host::tests::scratch("state-style-held");
+    crate::effect::host::tests::folder(&place, "tint", TINT, &[("effect.frag", TINT_FRAG)]);
+    crate::effect::host::tests::folder(
+        &place,
+        "plain",
+        "return { api = 1, inputs = { 'self' }, frag = 'effect.frag' }",
+        &[(
+            "effect.frag",
+            "vec4 sol_effect(vec2 uv) { return sol_tex(uv); }\n",
+        )],
+    );
+    let style = style_with_rules(
+        &place,
+        "return { { match = '*', part = 'client', slot = 'front', effect = { 'tint', source = 'self' } } }",
+    );
+    let (_display, mut state) = state_with_effects_in(&place);
+    state.apply_style_rules_from(Some(&style));
+    let tint = style_step(&state).expect("bound");
+    assert!(
+        state.effects.held_for_test().contains(&tint),
+        "the style's program is not held"
+    );
+    std::fs::write(
+        style.join("effects.lua"),
+        "return { { match = '*', part = 'client', slot = 'front', effect = { 'plain', source = 'self' } } }",
+    )
+    .expect("editing it");
+    state.apply_style_rules_from(Some(&style));
+    let plain = style_step(&state).expect("bound");
+    assert_eq!(
+        state
+            .effects
+            .held_for_test()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![plain],
+        "the replaced style's program is still held"
+    );
+    let _ = std::fs::remove_dir_all(place);
+}
+
+/// **`sol.pane` binds its style's rules, and a reload binds them again**
+/// (Ruling 15): naming a style applies its `effects.lua` there and then, and
+/// a reload reads the file again even when the configuration does not name
+/// the style again.
+#[test]
+fn sol_pane_binds_the_styles_rules_and_a_reload_binds_them_again() {
+    if the_environment_names_a_style() {
+        return;
+    }
+    let directory = crate::effect::host::tests::scratch("state-style-reload");
+    let effects = directory.join("effects");
+    crate::effect::host::tests::folder(&effects, "tint", TINT, &[("effect.frag", TINT_FRAG)]);
+    crate::effect::host::tests::folder(
+        &effects,
+        "plain",
+        "return { api = 1, inputs = { 'self' }, frag = 'effect.frag' }",
+        &[(
+            "effect.frag",
+            "vec4 sol_effect(vec2 uv) { return sol_tex(uv); }\n",
+        )],
+    );
+    let style = style_with_rules(
+        &directory,
+        "return { { match = '*', part = 'client', slot = 'front', effect = { 'tint', source = 'self' } } }",
+    );
+    let entry = directory.join("init.lua");
+    std::fs::write(&entry, format!("sol.pane('{}')\n", style.display()))
+        .expect("writing the test script");
+    let (_display, mut state) = state_with_effects_in(&effects);
+    state.reload_from(&entry);
+    let tint = style_step(&state).expect("sol.pane did not bind its style's rules");
+    std::fs::write(
+        style.join("effects.lua"),
+        "return { { match = '*', part = 'client', slot = 'front', effect = { 'plain', source = 'self' } } }",
+    )
+    .expect("editing it");
+    std::fs::write(&entry, "-- the style stays as it was\n").expect("writing the test script");
+    state.reload_from(&entry);
+    let plain = style_step(&state).expect("bound");
+    assert_ne!(
+        plain, tint,
+        "the reload did not bind the style's rules again"
+    );
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+/// **The probe's first answer rebinds the style's rules too, and one this
+/// GPU cannot run leaves its slot empty** (Rulings 11, 15): a style rule
+/// bound before the probe keeps an effect that only draws into `rgba16f`;
+/// the probe says no; after the frame its chain is gone, and said.
+#[test]
+fn the_formats_probe_rebinds_the_styles_rules_too() {
+    if the_environment_names_a_style() {
+        return;
+    }
+    let place = crate::effect::host::tests::scratch("state-style-formats");
+    crate::effect::host::tests::folder(
+        &place,
+        "wide",
+        "return { api = 1, inputs = { 'self' }, stages = { { 'pass', 'a.frag', format = 'rgba16f' } } }",
+        &[(
+            "a.frag",
+            "vec4 sol_effect(vec2 uv) { return sol_tex(uv); }\n",
+        )],
+    );
+    let style = style_with_rules(
+        &place,
+        "return { { match = '*', part = 'client', slot = 'replace', effect = { 'wide', source = 'self' } } }",
+    );
+    let (_display, mut state) = state_with_effects_in(&place);
+    state
+        .decorations
+        .set_style(&mut state.panes, Some(style.display().to_string()));
+    state.apply_style_rules();
+    assert!(
+        style_step(&state).is_some(),
+        "the premise: unknown formats keep the rgba16f plan"
+    );
+    crate::render::note_formats(&mut state, crate::pool::Formats { rgba16f: false });
+    let _ = state.settle(state.clock.now());
+    assert!(
+        style_step(&state).is_none(),
+        "a style rule this GPU cannot run is still bound after the probe"
+    );
+    assert!(
+        state
+            .effects
+            .problems()
+            .iter()
+            .any(|each| each.effect == "style:frosted"),
+        "{:?}",
+        state.effects.problems()
+    );
+    let _ = std::fs::remove_dir_all(place);
+}
+
 /// **A deform at rest is aimed at nothing**, so a window brought back from a
 /// genie with `sol.present(id, {})` is not captured and warped on every frame
 /// for good (#140).
@@ -88,10 +1180,9 @@ fn a_deform_at_rest_is_aimed_at_nothing() {
         state.clock.now(),
     ));
     let genie = |progress| crate::present::Deform {
-        effect: solium_effects::Deform::Genie {
+        effect: crate::present::Geometry {
             progress,
-            spread: 1.4,
-            axis: solium_effects::Axis::Down,
+            ..crate::present::Geometry::for_test(crate::effect::settings::PresentFailed::Flat)
         },
         anchor: crate::present::Anchor::Rect(crate::present::logical((10.0, 10.0), (120.0, 24.0))),
     };
@@ -475,7 +1566,7 @@ fn the_focus_half_counts_a_frame_by_its_rectangle_where_the_renderer_counts_its_
         tokens(include_str!("../render.rs")).contains(&tokens(
             "if frame.matrix.is_identity()
                      && frame.deform.is_none()
-                     && !reach.overlaps(screen.to_f64())"
+                     && !reaches(bled, prepared.slots.reach(pane), screen)"
         )),
         "`render::elements` no longer culls by the bleed, or now culls a transformed frame: \
          the note beside `render::drawn_on` is out of date"
@@ -9449,11 +10540,9 @@ end)"#,
         let pane = state.panes.id_of(&window).expect("a pane for the window");
         let dock = state.surfaces.named("dock").expect("the dock is declared");
         let deform = crate::present::Deform {
-            effect: solium_effects::Deform::Genie {
-                progress: 0.5,
-                spread: 1.4,
-                axis: solium_effects::Axis::Down,
-            },
+            effect: crate::present::Geometry::for_test(
+                crate::effect::settings::PresentFailed::Flat,
+            ),
             anchor: crate::present::Anchor::Surface(dock),
         };
         let to = state
@@ -9600,6 +10689,2962 @@ end)"#,
         assert!(
             capture.stale(&key(&mut renderer)),
             "the menu committed and its capture did not notice"
+        );
+    }
+
+    /// FX2's real-client fixture: [`tiled_fixture!`]'s parts in one place,
+    /// one monitor for them to be on, and every window opened through it with
+    /// its client's objects, so a test can commit to it or ask for fullscreen
+    /// as the client. The style is `none`, for `tiled_fixture!`'s reason (the
+    /// #99 rule). Its scratch folder, named by `label`, goes with it.
+    struct Fixture {
+        display: Display<Solium>,
+        state: Solium,
+        conn: Connection,
+        queue: wayland_client::EventQueue<Client>,
+        client: Client,
+        qh: QueueHandle<Client>,
+        label: &'static str,
+        opened: Vec<(Window, xdg_toplevel::XdgToplevel, wl_surface::WlSurface)>,
+        scratch: Option<std::path::PathBuf>,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            if let Some(scratch) = self.scratch.take() {
+                let _ = std::fs::remove_dir_all(scratch);
+            }
+        }
+    }
+
+    /// `let mut fixture = Fixture { .. }`, made the way [`tiled_fixture!`]
+    /// makes its parts, with one 1920×1080 monitor at the origin named
+    /// `fx2-<label>` and one round trip, so the client starts having heard
+    /// everything.
+    macro_rules! fx2_fixture {
+        ($fixture:ident, $label:literal) => {
+            tiled_fixture!(display, state, conn, queue, client, qh);
+            let _ = a_screen(&mut state, concat!("fx2-", $label), (0, 0));
+            pump(
+                &mut display,
+                &mut state,
+                &conn,
+                &qh,
+                &mut queue,
+                &mut client,
+            );
+            let mut $fixture = Fixture {
+                display,
+                state,
+                conn,
+                queue,
+                client,
+                qh,
+                label: $label,
+                opened: Vec::new(),
+                scratch: None,
+            };
+        };
+    }
+
+    /// [`pump`], with the fixture's parts.
+    fn pump_all(fixture: &mut Fixture) {
+        pump(
+            &mut fixture.display,
+            &mut fixture.state,
+            &fixture.conn,
+            &fixture.qh,
+            &mut fixture.queue,
+            &mut fixture.client,
+        );
+    }
+
+    /// A window opened through the real protocol, kept with its client's
+    /// objects.
+    fn open_kept(fixture: &mut Fixture) -> Window {
+        let (window, toplevel, surface, _xdg) = open_xdg(
+            &mut fixture.display,
+            &mut fixture.state,
+            &fixture.conn,
+            &fixture.client,
+            &fixture.qh,
+        );
+        fixture.opened.push((window.clone(), toplevel, surface));
+        window
+    }
+
+    /// One window, tiled as [`tiled_alone`] tiles it.
+    fn one_window(fixture: &mut Fixture) -> (crate::pane::PaneId, Window) {
+        let window = open_kept(fixture);
+        let (pane, _tile) = tiled_alone(&mut fixture.state, &window);
+        (pane, window)
+    }
+
+    /// Two windows tiled beside each other on the fixture's one monitor
+    /// (not [`side_by_side`], which is two monitors).
+    fn side_by_side_windows(fixture: &mut Fixture) -> (crate::pane::PaneId, crate::pane::PaneId) {
+        use solium_layout::tree::Tiling;
+        let (left, right) = (open_kept(fixture), open_kept(fixture));
+        fixture.state.sync_panes();
+        let (left_id, right_id) = (
+            fixture.state.window_id(&left),
+            fixture.state.window_id(&right),
+        );
+        let (area, settings) = (tiled_area(), tiled_settings());
+        let mut tiling = Tiling::new();
+        tiling.insert(left_id, None, None, area, settings);
+        tiling.insert(right_id, Some(left_id), None, area, settings);
+        sweep(&mut fixture.state, &tiling);
+        fixture.state.settle(fixture.state.clock.now());
+        let pane = |window: &Window| {
+            fixture
+                .state
+                .panes
+                .id_of(window)
+                .expect("a client in the space has a pane")
+        };
+        (pane(&left), pane(&right))
+    }
+
+    /// The client's objects for a window this fixture opened.
+    fn kept(
+        fixture: &Fixture,
+        window: &Window,
+    ) -> (xdg_toplevel::XdgToplevel, wl_surface::WlSurface) {
+        fixture
+            .opened
+            .iter()
+            .find(|(each, ..)| each == window)
+            .map(|(_, toplevel, surface)| (toplevel.clone(), surface.clone()))
+            .expect("a window this fixture opened")
+    }
+
+    /// A fresh buffer at the window's size, committed by its client.
+    fn commit_again(fixture: &mut Fixture, window: &Window) {
+        let size = window.geometry().size;
+        let (_, surface) = kept(fixture, window);
+        commit_buffer(&fixture.client, &fixture.qh, &surface, size.w, size.h);
+        pump_all(fixture);
+    }
+
+    /// The window's client asks for fullscreen and the request is handled:
+    /// what the compositor answers is the configure it then sends.
+    fn ask_fullscreen(fixture: &mut Fixture, window: &Window) {
+        let (toplevel, _) = kept(fixture, window);
+        toplevel.set_fullscreen(None);
+        pump_all(fixture);
+    }
+
+    /// Give a pane's window the keyboard.
+    fn focus(fixture: &mut Fixture, pane: crate::pane::PaneId) {
+        let window = fixture
+            .state
+            .panes
+            .get(pane)
+            .and_then(Pane::client)
+            .cloned()
+            .expect("a pane with a client");
+        fixture.state.focus_window(
+            &window,
+            SERIAL_COUNTER.next_serial(),
+            crate::script::FocusSource::Script,
+        );
+    }
+
+    /// The fixture's effects looked for in its scratch folder alone, which
+    /// holds Task 14's `tint`.
+    fn with_tint_folder(fixture: &mut Fixture) {
+        let place = crate::effect::host::tests::scratch(&format!("fx2-{}", fixture.label));
+        crate::effect::host::tests::folder(&place, "tint", TINT, &[("effect.frag", TINT_FRAG)]);
+        fixture.state.effects = crate::effect::host::Host::new(crate::effect::host::Library::with(
+            Some(place.clone()),
+            place.join("none"),
+        ));
+        fixture.scratch = Some(place);
+    }
+
+    /// `sol.effects` given these rules, taken.
+    fn apply_rules(fixture: &mut Fixture, lua: &str) {
+        let rules = crate::effect::rules::parse(&tree(lua)).expect("parses");
+        fixture.state.apply_effects(Ok(rules));
+        assert!(
+            !fixture.state.rules.is_empty(),
+            "the rules were refused: {:?}",
+            fixture.state.effects.problems()
+        );
+    }
+
+    /// The fixture's effects looked for in the test folders
+    /// (`tests/fixtures/effects/`) and then the shipped ones.
+    fn fixture_effects(state: &mut Solium) {
+        let fixtures = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/effects"
+        ));
+        state.effects = crate::effect::host::Host::new(crate::effect::host::Library::with(
+            Some(fixtures),
+            crate::assets::effects(),
+        ));
+    }
+
+    /// A copy of the shipped `effects/genie/` in a scratch folder the
+    /// fixture's effects read first: its folder.
+    fn scratch_genie(fixture: &mut Fixture) -> std::path::PathBuf {
+        let place = crate::effect::host::tests::scratch(&format!("fx2-{}", fixture.label));
+        let genie = crate::assets::effects().join("genie");
+        let copy = place.join("genie");
+        std::fs::create_dir_all(&copy).expect("a scratch folder");
+        for entry in std::fs::read_dir(&genie).expect("the shipped genie") {
+            let entry = entry.expect("an entry");
+            std::fs::copy(entry.path(), copy.join(entry.file_name())).expect("copied");
+        }
+        fixture.state.effects = crate::effect::host::Host::new(crate::effect::host::Library::with(
+            Some(place.clone()),
+            crate::assets::effects(),
+        ));
+        fixture.scratch = Some(place);
+        copy
+    }
+
+    /// `sol.present(<pane>, ...)` through `Solium::apply`, at once, as after
+    /// `sol.animate({ duration = 0 })`: a deform, a rect, or both.
+    fn present_now(
+        fixture: &mut Fixture,
+        pane: crate::pane::PaneId,
+        deform: Option<&str>,
+        rect: Option<(f64, f64, f64, f64)>,
+    ) {
+        let command = crate::script::Command::Present {
+            id: pane.get(),
+            rect: rect.map(|(x, y, w, h)| crate::script::Rect { x, y, w, h }),
+            opacity: None,
+            matrix: None,
+            deform: deform.map(crate::script::deform_for_test),
+            z: 0.0,
+            pivot: (0.5, 0.5),
+            animation: crate::script::AnimationSpec {
+                duration: std::time::Duration::ZERO,
+                easing: crate::present::Curve::OutCubic,
+            },
+        };
+        fixture.state.apply(crate::script::Outcome {
+            commands: vec![command],
+            ..Default::default()
+        });
+    }
+
+    /// `sol.present(<pane>, { deform = <lua> })`, at once.
+    fn present_deform(fixture: &mut Fixture, pane: crate::pane::PaneId, lua: &str) {
+        present_now(fixture, pane, Some(lua), None);
+    }
+
+    /// The geometry a pane's present asked for.
+    fn geometry_of(
+        fixture: &Fixture,
+        pane: crate::pane::PaneId,
+    ) -> Option<crate::present::Geometry> {
+        fixture
+            .state
+            .panes
+            .get(pane)
+            .and_then(crate::present::target_of)
+            .and_then(|frame| frame.deform)
+            .map(|deform| deform.effect)
+    }
+
+    /// What `prepare` would do with a pane this pass.
+    fn planned(fixture: &mut Fixture, pane: crate::pane::PaneId) -> crate::render::Planned {
+        let outer = fixture.state.pane_outer_of(pane).expect("a pane on screen");
+        let now = fixture.state.clock.now();
+        crate::render::plan_warp(&mut fixture.state, pane, outer, 1.0, now)
+    }
+
+    /// `{ x = .., y = .., w = 64, h = 32 }` well below a pane's middle, as
+    /// Lua.
+    fn below(fixture: &Fixture, pane: crate::pane::PaneId) -> String {
+        let outer = fixture.state.pane_outer_of(pane).expect("a pane on screen");
+        format!(
+            "{{ x = {}, y = {}, w = 64, h = 32 }}",
+            outer.loc.x + outer.size.w / 2 - 32,
+            outer.loc.y + outer.size.h + 200
+        )
+    }
+
+    /// **A `sol.present` deform names an effect folder**: `genie` with
+    /// `axis = "auto"` toward a rect below the window is the folder's id,
+    /// pulled down, and `prepare` warps it through the folder's grid, 8 by
+    /// 48; a folder nobody has is a problem, carries no effect, and the
+    /// window is drawn undeformed (`effects.present.failed`'s default).
+    #[test]
+    fn a_present_deform_is_a_file() {
+        fx2_fixture!(fixture, "present-file");
+        let (pane, _) = one_window(&mut fixture);
+        fixture_effects(&mut fixture.state);
+        let to = below(&fixture, pane);
+        present_deform(
+            &mut fixture,
+            pane,
+            &format!("{{ effect = 'genie', axis = 'auto', progress = 0.5, to = {to} }}"),
+        );
+        let geometry = geometry_of(&fixture, pane).expect("a geometry");
+        assert_eq!(geometry.axis, solium_effects::Axis::Down);
+        assert_eq!(Some(geometry.effect), fixture.state.effects.id("genie"));
+        match planned(&mut fixture, pane) {
+            crate::render::Planned::Warp {
+                grid: Some(grid), ..
+            } => assert_eq!((grid.cols, grid.rows), (8, 48)),
+            other => panic!("not warped through the folder's grid: {other:?}"),
+        }
+        present_deform(
+            &mut fixture,
+            pane,
+            &format!("{{ effect = 'nothing-here', progress = 0.5, to = {to} }}"),
+        );
+        assert_eq!(
+            geometry_of(&fixture, pane).map(|geometry| geometry.effect),
+            Some(crate::effect::host::EffectId::NONE)
+        );
+        assert!(
+            fixture
+                .state
+                .effects
+                .problems()
+                .iter()
+                .any(|problem| problem.effect == "nothing-here"),
+            "{:?}",
+            fixture.state.effects.problems()
+        );
+        assert!(
+            matches!(planned(&mut fixture, pane), crate::render::Planned::Flat),
+            "an unknown folder was not drawn undeformed"
+        );
+    }
+
+    /// **`auto` is kept for the whole flight**: aimed at a window drawn to
+    /// its right, the genie is pulled right, and stays so once that window
+    /// is drawn below it, while the anchor itself follows it.
+    #[test]
+    fn auto_is_kept_for_the_whole_flight() {
+        fx2_fixture!(fixture, "auto-kept");
+        let (pane, target) = side_by_side_windows(&mut fixture);
+        fixture_effects(&mut fixture.state);
+        let outer = fixture.state.pane_outer_of(pane).expect("on screen");
+        let (x, y, w, h) = (
+            f64::from(outer.loc.x),
+            f64::from(outer.loc.y),
+            f64::from(outer.size.w),
+            f64::from(outer.size.h),
+        );
+        present_now(
+            &mut fixture,
+            target,
+            None,
+            Some((x + w + 400.0, y + h / 2.0, 100.0, 50.0)),
+        );
+        present_deform(
+            &mut fixture,
+            pane,
+            &format!(
+                "{{ effect = 'genie', axis = 'auto', progress = 0.5, to = {{ window = {} }} }}",
+                target.get()
+            ),
+        );
+        assert_eq!(
+            geometry_of(&fixture, pane).map(|geometry| geometry.axis),
+            Some(solium_effects::Axis::Right)
+        );
+        present_now(
+            &mut fixture,
+            target,
+            None,
+            Some((x + w / 2.0 - 50.0, y + h + 100.0, 100.0, 50.0)),
+        );
+        let deform = fixture
+            .state
+            .panes
+            .get(pane)
+            .and_then(crate::present::target_of)
+            .and_then(|frame| frame.deform);
+        let aimed = fixture
+            .state
+            .aimed_at_for(pane, deform)
+            .expect("the window is aimed at");
+        assert!(
+            aimed.to.loc.y > y + h,
+            "the anchor did not follow its window: {:?}",
+            aimed.to
+        );
+        assert_eq!(
+            aimed.effect.axis,
+            solium_effects::Axis::Right,
+            "auto was picked again"
+        );
+    }
+
+    /// **`effects.limits.params` is how many numbers a present may pack**: a
+    /// geometry with twelve params is refused at the default 8, with a
+    /// problem naming the key, and presents under `limits = { params = 16 }`
+    /// with all twelve, none cut.
+    #[test]
+    fn a_geometry_effect_with_twelve_params_presents_under_a_raised_limit() {
+        fx2_fixture!(fixture, "twelve-params");
+        let (pane, _) = one_window(&mut fixture);
+        fixture_effects(&mut fixture.state);
+        let deform = format!(
+            "{{ effect = 'twelve', progress = 0.5, to = {} }}",
+            below(&fixture, pane)
+        );
+        present_deform(&mut fixture, pane, &deform);
+        assert!(
+            geometry_of(&fixture, pane).is_none(),
+            "twelve params packed under a limit of 8"
+        );
+        assert!(
+            fixture
+                .state
+                .effects
+                .problems()
+                .iter()
+                .any(|problem| problem.message.contains("effects.limits.params")),
+            "{:?}",
+            fixture.state.effects.problems()
+        );
+        apply_effects_lua(&mut fixture.state, "{ limits = { params = 16 } }");
+        present_deform(&mut fixture, pane, &deform);
+        assert_eq!(
+            geometry_of(&fixture, pane).map(|geometry| geometry.params.as_slice().len()),
+            Some(12),
+            "the params were cut"
+        );
+        assert!(
+            fixture
+                .state
+                .effects
+                .problems()
+                .iter()
+                .all(|problem| !problem.message.contains("effects.limits.params")),
+            "the present that packed did not mend the problem"
+        );
+    }
+
+    /// **`effects.present` reaches a present, and a deform overrides it**:
+    /// with `present = { failed = "hide" }` a deform that says nothing
+    /// carries `Hide`, and its refused mesh draws nothing of the window; one
+    /// that says `failed = "flat"` carries `Flat`, and is drawn undeformed.
+    #[test]
+    fn effects_present_is_the_default_a_deform_overrides() {
+        use crate::effect::settings::PresentFailed;
+        fx2_fixture!(fixture, "present-policy");
+        let (pane, _) = one_window(&mut fixture);
+        fixture_effects(&mut fixture.state);
+        let to = below(&fixture, pane);
+        apply_effects_lua(&mut fixture.state, "{ present = { failed = 'hide' } }");
+        present_deform(
+            &mut fixture,
+            pane,
+            &format!("{{ effect = 'fail-mesh', progress = 0.5, to = {to} }}"),
+        );
+        assert_eq!(
+            geometry_of(&fixture, pane).map(|geometry| geometry.failed),
+            Some(PresentFailed::Hide)
+        );
+        assert!(
+            matches!(planned(&mut fixture, pane), crate::render::Planned::Hidden),
+            "a refused mesh under hide was drawn"
+        );
+        present_deform(
+            &mut fixture,
+            pane,
+            &format!("{{ effect = 'fail-mesh', progress = 0.5, failed = 'flat', to = {to} }}"),
+        );
+        assert_eq!(
+            geometry_of(&fixture, pane).map(|geometry| geometry.failed),
+            Some(PresentFailed::Flat)
+        );
+        assert!(
+            matches!(planned(&mut fixture, pane), crate::render::Planned::Flat),
+            "a refused mesh under flat was not drawn undeformed"
+        );
+    }
+
+    /// The reload `super+shift+r` makes (`Solium::reload_from`), of a
+    /// configuration that names no effect, written beside the fixture's
+    /// scratch effects.
+    fn reload(fixture: &mut Fixture) {
+        reload_with(fixture, "sol.pane('none')\n");
+    }
+
+    /// [`reload`], of a configuration that reads `init`.
+    fn reload_with(fixture: &mut Fixture, init: &str) {
+        let place = fixture.scratch.clone().expect("a scratch folder");
+        let entry = place.join("init.lua");
+        std::fs::write(&entry, init).expect("an init.lua");
+        fixture.state.reload_from(&entry);
+    }
+
+    /// **A reload that leaves a present's folder unchanged keeps it**
+    /// (Ruling 7: an unrelated reload rebuilds nothing): a genie under way
+    /// under `on_reload = "flat"` still draws from its folder, through its
+    /// grid and under the same id, after a reload that did not edit it, so
+    /// only an edit makes it follow `on_reload`
+    /// (`a_reload_mid_present_follows_on_reload`).
+    #[test]
+    fn a_reload_that_leaves_a_presents_folder_unchanged_keeps_it() {
+        fx2_fixture!(fixture, "present-unchanged");
+        let (pane, _) = one_window(&mut fixture);
+        let _ = scratch_genie(&mut fixture);
+        let to = below(&fixture, pane);
+        present_deform(
+            &mut fixture,
+            pane,
+            &format!("{{ effect = 'genie', progress = 0.5, on_reload = 'flat', to = {to} }}"),
+        );
+        let id = geometry_of(&fixture, pane).map(|geometry| geometry.effect);
+        assert_eq!(id, fixture.state.effects.id("genie"), "the premise");
+        reload(&mut fixture);
+        assert!(
+            crate::render::present_source(&fixture.state, pane).is_some(),
+            "a reload that did not change the folder ended the present"
+        );
+        assert_eq!(
+            fixture.state.effects.id("genie"),
+            id,
+            "the unchanged folder lost its id"
+        );
+        assert!(
+            matches!(
+                planned(&mut fixture, pane),
+                crate::render::Planned::Warp { grid: Some(_), .. }
+            ),
+            "not drawn through its grid after the reload"
+        );
+    }
+
+    /// **A reload that changes only `effects.sandbox` keeps a present**: the
+    /// new caps load the genie's unchanged folder again, under them, and
+    /// it keeps its id, so a window held at progress 0.5 under the default
+    /// `on_reload = "flat"` is still drawn through its grid; only an edit
+    /// makes it follow `on_reload` (`a_reload_mid_present_follows_on_reload`).
+    #[test]
+    fn a_reload_that_changes_only_the_sandbox_keeps_a_present() {
+        fx2_fixture!(fixture, "present-caps");
+        let (pane, _) = one_window(&mut fixture);
+        let _ = scratch_genie(&mut fixture);
+        let to = below(&fixture, pane);
+        present_deform(
+            &mut fixture,
+            pane,
+            &format!("{{ effect = 'genie', progress = 0.5, on_reload = 'flat', to = {to} }}"),
+        );
+        let id = geometry_of(&fixture, pane).map(|geometry| geometry.effect);
+        assert_eq!(id, fixture.state.effects.id("genie"), "the premise");
+        let before = fixture.state.effects.caps();
+        reload_with(
+            &mut fixture,
+            "sol.effects({ rules = {}, sandbox = { memory_mib = 32 } })\n",
+        );
+        assert!(
+            fixture.state.effects.problems().is_empty(),
+            "{:?}",
+            fixture.state.effects.problems()
+        );
+        assert!(
+            fixture.state.effects.caps() != before
+                && fixture.state.effects.caps().memory == 32 << 20,
+            "the premise: the reload changed the caps"
+        );
+        assert_eq!(
+            fixture
+                .state
+                .effects
+                .effect("genie")
+                .map(|loaded| loaded.sandbox().caps()),
+            Some(fixture.state.effects.caps()),
+            "the genie that runs is not the one loaded under the new caps"
+        );
+        assert!(
+            crate::render::present_source(&fixture.state, pane).is_some(),
+            "a reload that changed only the caps ended the present"
+        );
+        assert_eq!(
+            fixture.state.effects.id("genie"),
+            id,
+            "the unchanged folder lost its id to new caps"
+        );
+        assert!(
+            matches!(
+                planned(&mut fixture, pane),
+                crate::render::Planned::Warp { grid: Some(_), .. }
+            ),
+            "not drawn through its grid after the reload"
+        );
+    }
+
+    /// **A reload mid-present follows `on_reload`**: with the default
+    /// `"flat"` a present whose folder changed has no source for its grid,
+    /// and is drawn flat; with `"keep"` its grid comes from the version it
+    /// began with.
+    #[test]
+    fn a_reload_mid_present_follows_on_reload() {
+        for (on_reload, kept) in [("flat", false), ("keep", true)] {
+            fx2_fixture!(fixture, "present-reload");
+            let (pane, _) = one_window(&mut fixture);
+            let folder = scratch_genie(&mut fixture);
+            let to = below(&fixture, pane);
+            present_deform(
+                &mut fixture,
+                pane,
+                &format!(
+                    "{{ effect = 'genie', progress = 0.5, on_reload = '{on_reload}', to = {to} }}"
+                ),
+            );
+            assert!(
+                crate::render::present_source(&fixture.state, pane).is_some(),
+                "the premise: the present draws from its folder"
+            );
+            let file = folder.join("effect.lua");
+            let edited = std::fs::read_to_string(&file).expect("read") + "-- edited\n";
+            std::fs::write(&file, edited).expect("edited");
+            reload(&mut fixture);
+            assert_eq!(
+                crate::render::present_source(&fixture.state, pane).is_some(),
+                kept,
+                "{on_reload}"
+            );
+            assert_eq!(
+                matches!(
+                    planned(&mut fixture, pane),
+                    crate::render::Planned::Warp { grid: Some(_), .. }
+                ),
+                kept,
+                "{on_reload}"
+            );
+        }
+    }
+
+    /// The pane's pinned version, if any.
+    fn pinned(fixture: &Fixture, pane: crate::pane::PaneId) -> bool {
+        fixture
+            .state
+            .panes
+            .get(pane)
+            .is_some_and(|held| held.meshes().pinned.is_some())
+    }
+
+    /// **A pinned version is let go when its present lands**: a present
+    /// under `on_reload = "keep"` pins the version it began with, kept while
+    /// the window is held at its progress, and a present with no deform
+    /// that lands lets it go, so no pane holds a stale Lua state to the end
+    /// of its life.
+    #[test]
+    fn a_pinned_version_is_let_go_when_its_present_lands() {
+        fx2_fixture!(fixture, "present-unpinned");
+        let (pane, _) = one_window(&mut fixture);
+        fixture_effects(&mut fixture.state);
+        let to = below(&fixture, pane);
+        present_deform(
+            &mut fixture,
+            pane,
+            &format!("{{ effect = 'genie', progress = 0.5, on_reload = 'keep', to = {to} }}"),
+        );
+        let now = fixture.state.clock.now();
+        let _ = fixture.state.settle(now);
+        assert!(
+            pinned(&fixture, pane),
+            "the version a held present began with was let go"
+        );
+        present_now(&mut fixture, pane, None, None);
+        let now = fixture.state.clock.now();
+        let _ = fixture.state.settle(now);
+        assert!(
+            !crate::present::transformed(fixture.state.panes.get(pane).expect("the pane")),
+            "the premise: the present landed and was released"
+        );
+        assert!(
+            !pinned(&fixture, pane),
+            "a landed present still pins its version"
+        );
+    }
+
+    /// **A geometry with a frag presents before it compiled**: its version
+    /// waits for the next `prepare`'s compile, and a present made before
+    /// then carries the id that version runs under, not none, so once it
+    /// compiled the window is drawn through its grid.
+    #[test]
+    fn a_geometry_with_a_frag_presents_before_it_compiled() {
+        fx2_fixture!(fixture, "present-pending");
+        let (pane, _) = one_window(&mut fixture);
+        fixture_effects(&mut fixture.state);
+        let to = below(&fixture, pane);
+        present_deform(
+            &mut fixture,
+            pane,
+            &format!("{{ effect = 'mesh-frag', progress = 0.5, to = {to} }}"),
+        );
+        assert!(
+            fixture.state.effects.has_pending("mesh-frag")
+                && fixture.state.effects.effect("mesh-frag").is_none(),
+            "the premise: its frag waits for a compile: {:?}",
+            fixture.state.effects.problems()
+        );
+        let geometry = geometry_of(&fixture, pane).expect("a geometry");
+        assert_ne!(
+            geometry.effect,
+            crate::effect::host::EffectId::NONE,
+            "a version still compiling was presented as no effect"
+        );
+        fixture
+            .state
+            .effects
+            .compile_pending(&mut crate::effect::host::tests::Refusing);
+        assert_eq!(Some(geometry.effect), fixture.state.effects.id("mesh-frag"));
+        assert!(
+            matches!(
+                planned(&mut fixture, pane),
+                crate::render::Planned::Warp { grid: Some(_), .. }
+            ),
+            "not drawn through its grid once it compiled"
+        );
+    }
+
+    /// **A present refused for its popups alone is said once, and its
+    /// popups follow `failed`**: a mesh finite over the window and NaN past
+    /// its bottom edge warps the pane and is refused for a menu below it.
+    /// Over two passes the refusal is warned of once, though the pane's own
+    /// grid builds in each, and the popups are drawn undeformed (the
+    /// identity grid of their part) under `"flat"`, and not at all under
+    /// `"hide"`.
+    #[test]
+    fn a_present_refused_for_its_popups_alone_is_said_once() {
+        use crate::warp::UnitRect;
+        fx2_fixture!(fixture, "present-popups");
+        let (pane, _) = one_window(&mut fixture);
+        fixture_effects(&mut fixture.state);
+        let to = below(&fixture, pane);
+        let below_the_window = UnitRect {
+            u0: 0.25,
+            v0: 0.75,
+            u1: 0.75,
+            v1: 1.5,
+        };
+        for (failed, drawn) in [("flat", Some(None)), ("hide", None)] {
+            present_deform(
+                &mut fixture,
+                pane,
+                &format!(
+                    "{{ effect = 'nan-past', progress = 0.5, failed = '{failed}', to = {to} }}"
+                ),
+            );
+            let outer = fixture.state.pane_outer_of(pane).expect("on screen");
+            let warned = |fixture: &Fixture| {
+                fixture
+                    .state
+                    .panes
+                    .get(pane)
+                    .map(|held| held.meshes().warned)
+            };
+            let before = warned(&fixture);
+            for pass in 0..2 {
+                assert!(
+                    matches!(
+                        planned(&mut fixture, pane),
+                        crate::render::Planned::Warp { grid: Some(_), .. }
+                    ),
+                    "{failed}, pass {pass}: the pane's own grid was refused"
+                );
+                let (frame, aimed) =
+                    crate::render::warp_of(&fixture.state, pane, outer, fixture.state.clock.now())
+                        .expect("warped");
+                let aimed = aimed.expect("aimed");
+                let over = crate::render::over_grid(
+                    &mut fixture.state,
+                    pane,
+                    &frame,
+                    aimed,
+                    below_the_window,
+                    1.0,
+                );
+                assert_eq!(over, drawn, "{failed}, pass {pass}: the popups");
+            }
+            assert_eq!(
+                warned(&fixture).zip(before).map(|(now, then)| now - then),
+                Some(1),
+                "{failed}: the popups' refusal was not said once"
+            );
+        }
+    }
+
+    /// **A rule on `focused` follows the keyboard**: two windows, the rule's
+    /// slot moves with the focus.
+    #[test]
+    fn a_rule_on_focused_follows_the_keyboard() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Slot;
+        fx2_fixture!(fixture, "rule-focused");
+        let (first, second) = side_by_side_windows(&mut fixture);
+        with_tint_folder(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = { focused = true }, part = "client", slot = "front", effect = false },
+                 { match = { focused = true }, part = "client", slot = "behind", effect = "tint" } }"#,
+        );
+        focus(&mut fixture, first);
+        let slots = crate::render::build_slots(&mut fixture.state);
+        assert!(slots.wanted(&Owner::Pane(first, PaneSlot::Client), Slot::Behind));
+        assert!(!slots.wanted(&Owner::Pane(second, PaneSlot::Client), Slot::Behind));
+        assert!(
+            !slots.wanted(&Owner::Pane(first, PaneSlot::Client), Slot::Front),
+            "`effect = false` wants no slot"
+        );
+        focus(&mut fixture, second);
+        let slots = crate::render::build_slots(&mut fixture.state);
+        assert!(slots.wanted(&Owner::Pane(second, PaneSlot::Client), Slot::Behind));
+        assert!(!slots.wanted(&Owner::Pane(first, PaneSlot::Client), Slot::Behind));
+    }
+
+    /// **A rule with a fade eases its slot in and out with the focus**: on
+    /// the window without the keyboard the slot is wanted from opacity 0 and
+    /// reaches 1 over the rule's 200 ms; once that window has the keyboard
+    /// its slot is still wanted, fading from 1, and wanted no more 200 ms on,
+    /// while the other window's comes in. A frame is asked for on every pass
+    /// a fade has yet to arrive, and on none once both have.
+    #[test]
+    fn a_rule_with_a_fade_eases_its_slot_in_and_out_with_the_focus() {
+        use crate::effect::plan::{Owner, PaneSlot, Slots};
+        use crate::effect::rules::Slot;
+        use std::time::Duration;
+        fx2_fixture!(fixture, "rule-fade");
+        let (first, second) = side_by_side_windows(&mut fixture);
+        with_tint_folder(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = { focused = false }, part = "pane", slot = "front", effect = "tint",
+                   fade = { duration = 200, easing = "linear" } } }"#,
+        );
+        // How opaque each window's front slot is drawn, `None` when it is not
+        // wanted, a pass at a time, 100 ms apart.
+        let pass = |fixture: &mut Fixture, after: u64| {
+            fixture.state.clock.advance(Duration::from_millis(after));
+            fixture.state.redraw = false;
+            let slots: Slots = crate::render::build_slots(&mut fixture.state);
+            let on = |pane| {
+                let owner = Owner::Pane(pane, PaneSlot::Pane);
+                slots
+                    .wanted(&owner, Slot::Front)
+                    .then(|| slots.opacity(&owner, Slot::Front))
+            };
+            (on(first), on(second), fixture.state.redraw)
+        };
+        // Within 0.1: the clock goes on running between the passes.
+        let near = |seen: Option<f32>, wanted: Option<f32>| match (seen, wanted) {
+            (Some(seen), Some(wanted)) => (seen - wanted).abs() < 0.1,
+            (seen, wanted) => seen.is_none() && wanted.is_none(),
+        };
+        focus(&mut fixture, first);
+        for (after, wanted) in [
+            (0, (None, Some(0.0), true)),
+            (100, (None, Some(0.5), true)),
+            (100, (None, Some(1.0), false)),
+            (100, (None, Some(1.0), false)),
+        ] {
+            let seen = pass(&mut fixture, after);
+            assert!(
+                near(seen.0, wanted.0) && near(seen.1, wanted.1) && seen.2 == wanted.2,
+                "{after} ms on, fading in: {seen:?}, wanted {wanted:?}"
+            );
+        }
+        focus(&mut fixture, second);
+        for (after, wanted) in [
+            (0, (Some(0.0), Some(1.0), true)),
+            (100, (Some(0.5), Some(0.5), true)),
+            (100, (Some(1.0), None, false)),
+            (100, (Some(1.0), None, false)),
+        ] {
+            let seen = pass(&mut fixture, after);
+            assert!(
+                near(seen.0, wanted.0) && near(seen.1, wanted.1) && seen.2 == wanted.2,
+                "{after} ms on, the focus moved: {seen:?}, wanted {wanted:?}"
+            );
+        }
+    }
+
+    /// **A rule on `fullscreen` applies from the configure that sets it**,
+    /// the state the compositor last told the client.
+    #[test]
+    fn a_rule_on_fullscreen_applies_from_the_configure_that_sets_it() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Slot;
+        fx2_fixture!(fixture, "rule-fullscreen");
+        let (pane, window) = one_window(&mut fixture);
+        with_tint_folder(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = { fullscreen = true }, part = "client", slot = "behind", effect = "tint" } }"#,
+        );
+        assert!(
+            !crate::render::build_slots(&mut fixture.state)
+                .wanted(&Owner::Pane(pane, PaneSlot::Client), Slot::Behind)
+        );
+        ask_fullscreen(&mut fixture, &window);
+        assert!(
+            crate::render::build_slots(&mut fixture.state)
+                .wanted(&Owner::Pane(pane, PaneSlot::Client), Slot::Behind)
+        );
+    }
+
+    /// **A rule for another app leaves a window with an empty plan**, its
+    /// facts asked and matching nothing.
+    #[test]
+    fn a_rule_for_another_app_leaves_a_window_with_an_empty_plan() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Slot;
+        fx2_fixture!(fixture, "rule-other-app");
+        let (pane, _) = one_window(&mut fixture);
+        with_tint_folder(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = { app_id = "mpv" }, part = "client", slot = "behind", effect = "tint" } }"#,
+        );
+        let slots = crate::render::build_slots(&mut fixture.state);
+        assert!(!slots.wanted(&Owner::Pane(pane, PaneSlot::Client), Slot::Behind));
+        assert!(slots.is_empty());
+        assert_eq!(
+            slots.facts_gathered(),
+            1,
+            "the window's facts were not asked"
+        );
+    }
+
+    /// **`sol.windows()` carries every window match key**: `fullscreen` and
+    /// `style` beside `app_id`, `title`, `focused` and `monitor`.
+    #[test]
+    fn sol_windows_carries_every_window_match_key() {
+        fx2_fixture!(fixture, "windows-keys");
+        let (_, window) = one_window(&mut fixture);
+        let snapshot = fixture.state.snapshot();
+        let row = snapshot.windows.first().expect("one window");
+        assert!(!row.fullscreen);
+        assert_eq!(
+            row.style,
+            fixture.state.decorations.style().unwrap_or("none")
+        );
+        ask_fullscreen(&mut fixture, &window);
+        let snapshot = fixture.state.snapshot();
+        assert!(snapshot.windows.first().expect("one window").fullscreen);
+    }
+
+    /// **With no rules no slot is wanted and no fact is gathered** (spec
+    /// §8.4), though a window is on screen: the plan is empty and its counter
+    /// of facts gathered is 0.
+    #[test]
+    fn with_no_rules_no_slot_is_wanted_and_no_fact_is_gathered() {
+        fx2_fixture!(fixture, "no-rules-no-facts");
+        let _ = one_window(&mut fixture);
+        let slots = crate::render::build_slots(&mut fixture.state);
+        assert!(slots.is_empty());
+        assert_eq!(
+            slots.facts_gathered(),
+            0,
+            "facts were gathered for a pane no rule can match"
+        );
+    }
+
+    /// **A fullscreen window with no rule takes today's path**: no slot is
+    /// wanted, it is not warped, it wants no capture, and with no slot ready
+    /// its walk is `PANE_ORDER` (`with_no_slots_the_pane_walk_is_pane_order`),
+    /// so `panes` builds the surface elements it builds today, which is what
+    /// smithay's DRM compositor assigns planes from (Ruling 24).
+    #[test]
+    fn a_fullscreen_window_with_no_rule_takes_todays_path() {
+        use crate::effect::plan::PaneSlot;
+        use crate::effect::rules::Slot;
+        fx2_fixture!(fixture, "fullscreen-no-rule");
+        let (pane, window) = one_window(&mut fixture);
+        ask_fullscreen(&mut fixture, &window);
+        let (_, surface) = kept(&fixture, &window);
+        commit_buffer(&fixture.client, &fixture.qh, &surface, 1920, 1080);
+        pump_all(&mut fixture);
+        fixture.state.clock.advance(Duration::from_secs(1));
+        let now = fixture.state.clock.now();
+        fixture.state.settle(now);
+        pump_all(&mut fixture);
+        assert_eq!(
+            fixture.state.real_geometry(&window),
+            Some(Rectangle::new((0, 0).into(), (1920, 1080).into())),
+            "the premise: the window is fullscreen on the monitor"
+        );
+        let slots = crate::render::build_slots(&mut fixture.state);
+        assert!(slots.is_empty());
+        assert!(
+            !crate::render::wants_warp(&fixture.state, pane),
+            "a fullscreen window with no rule is warped"
+        );
+        assert_eq!(
+            crate::render::wanted_capture(crate::render::Route::Flat),
+            None
+        );
+        let ready = crate::render::slot_ready(&slots, pane, None);
+        for part in [PaneSlot::Pane, PaneSlot::Client, PaneSlot::Popups] {
+            for slot in [Slot::Behind, Slot::Front, Slot::Replace] {
+                assert!(!ready(part, slot));
+            }
+        }
+    }
+
+    /// One window, tiled as [`one_window`] tiles it, with a 120×80 menu
+    /// drawn on it, so the window has a `popup` part.
+    fn one_window_with_a_menu(
+        fixture: &mut Fixture,
+    ) -> (crate::pane::PaneId, Window, wl_surface::WlSurface) {
+        let (window, toplevel, surface, xdg) = open_xdg(
+            &mut fixture.display,
+            &mut fixture.state,
+            &fixture.conn,
+            &fixture.client,
+            &fixture.qh,
+        );
+        fixture.opened.push((window.clone(), toplevel, surface));
+        let (pane, _tile) = tiled_alone(&mut fixture.state, &window);
+        let menu = drawn_popup(
+            &mut fixture.display,
+            &mut fixture.state,
+            &fixture.conn,
+            &fixture.qh,
+            &mut fixture.queue,
+            &mut fixture.client,
+            &xdg,
+            (20, 20),
+            (120, 80),
+        );
+        (pane, window, menu)
+    }
+
+    /// **Every way an effect can fail leaves every part drawn** ([16] §5,
+    /// spec §8.4). Rules cover every part a window has here and every slot,
+    /// each set naming one effect that fails its own way: a Lua error and a
+    /// `p_` typo are refused at load, the set with them; a program that will
+    /// not compile, a GPU on which every run fails, and a self effect whose
+    /// capture was never drawn are wanted and never ready. In each, no slot is
+    /// ready, and the pane's walk is the walk with no rule at all.
+    #[test]
+    fn every_failure_leaves_the_part_drawn() {
+        use crate::effect::plan::{Owner, PaneSlot, Slots};
+        use crate::effect::rules::Slot;
+        fx2_fixture!(fixture, "every-failure");
+        let (pane, _window, _menu) = one_window_with_a_menu(&mut fixture);
+        let fixtures = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/effects"
+        ));
+        fixture.state.effects = crate::effect::host::Host::new(crate::effect::host::Library::with(
+            Some(fixtures.to_owned()),
+            fixtures.join("none"),
+        ));
+        let walk = |slots: &Slots| {
+            let mut pieces = Vec::new();
+            crate::render::pane_walk(
+                &mut pieces,
+                &crate::render::slot_ready(slots, pane, None),
+                |into, piece| into.push(piece),
+            );
+            pieces
+        };
+        let plain = walk(&Slots::default());
+        let every = |effect: &str, parts: &[&str]| {
+            let mut lua = String::from("{");
+            for part in parts {
+                for slot in ["behind", "front", "replace"] {
+                    lua.push_str(&format!(
+                        " {{ match = \"*\", part = \"{part}\", slot = \"{slot}\", effect = {effect} }},"
+                    ));
+                }
+            }
+            lua.push('}');
+            crate::effect::rules::parse(&tree(&lua)).expect("parses")
+        };
+        let all = [
+            "pane",
+            "client",
+            "popup",
+            "region:titlebar",
+            "layer_shell:*",
+        ];
+        // A titlebar rule reading `self` is refused when it binds, until P15
+        // (`effect::plan::tests::a_region_self_rule_is_refused_until_p15`),
+        // which would keep the self effect's whole set out here.
+        let unbanded = ["pane", "client", "popup", "layer_shell:*"];
+        // Whether its chains get as far as a run: a program that would not
+        // compile and a GPU that fails every run are each tried and fail; a
+        // self effect with no capture is never run.
+        for (effect, parts, refused, run) in [
+            (r#""fail-lua""#, &all[..], true, false),
+            (r#""fail-lint""#, &all[..], true, false),
+            (r#""fail-compile""#, &all[..], false, true),
+            (r#""ring""#, &all[..], false, true),
+            (
+                r#"{ "tint", source = "self" }"#,
+                &unbanded[..],
+                false,
+                false,
+            ),
+        ] {
+            let before = fixture.state.rules_generation;
+            fixture.state.apply_effects(Ok(every(effect, parts)));
+            assert_eq!(
+                fixture.state.rules_generation == before,
+                refused,
+                "{effect}: refused at load or not ({:?})",
+                fixture.state.effects.problems()
+            );
+            fixture
+                .state
+                .effects
+                .compile_pending(&mut crate::effect::host::tests::Refusing);
+            let mut slots = crate::render::build_slots(&mut fixture.state);
+            for part in [PaneSlot::Pane, PaneSlot::Client, PaneSlot::Popups] {
+                assert_eq!(
+                    slots.wanted(&Owner::Pane(pane, part), Slot::Replace),
+                    !refused,
+                    "{effect}: the premise, the {part:?}'s slot wanted or not"
+                );
+            }
+            crate::render::record_boxes(&fixture.state, &mut slots);
+            let Solium {
+                store,
+                effects,
+                chains,
+                memos,
+                xrays,
+                ..
+            } = &mut fixture.state;
+            let mut cx = crate::render::RunCx {
+                store,
+                effects: &*effects,
+                chains,
+                masked: None,
+                now: 0.0,
+                pass: 1,
+                memos,
+                xrays: &*xrays,
+                motion: (std::time::Duration::ZERO, 0.0),
+                waited: false,
+            };
+            let mut runner = crate::render::tests::NoGpu::default();
+            for nest in [crate::render::Nest::Inner, crate::render::Nest::Whole] {
+                crate::render::run_slots(
+                    &mut cx,
+                    &mut crate::pool::Pool::new(0),
+                    &mut runner,
+                    &mut slots,
+                    &crate::effect::store::Drawn::default(),
+                    nest,
+                );
+            }
+            assert_eq!(
+                runner.runs > 0,
+                run,
+                "{effect}: the premise, its chains were run or not"
+            );
+            assert_eq!(
+                slots.ready_count(),
+                0,
+                "{effect}: a failing effect made a slot ready"
+            );
+            assert_eq!(
+                walk(&slots),
+                plain,
+                "{effect}: the pane's walk is not the walk with no rule"
+            );
+        }
+    }
+
+    /// **A scripted surface has a slot on each monitor it is on, and a
+    /// client layer surface one of its own**, each matched by its name: one
+    /// owner per instance per output, and one per layer surface whose
+    /// namespace the rule's glob takes.
+    #[test]
+    fn a_surface_has_a_slot_per_monitor_and_a_layer_surface_one_of_its_own() {
+        use crate::effect::plan::Owner;
+        use crate::effect::rules::Slot;
+        use smithay::reexports::wayland_server::Resource as _;
+        fx2_fixture!(fixture, "rule-surfaces");
+        let _ = a_screen(&mut fixture.state, "fx2-rule-surfaces-right", (1920, 0));
+        with_tint_folder(&mut fixture);
+        for (name, layer) in [
+            ("dock", crate::scripted::Layer::Top),
+            ("wallpaper", crate::scripted::Layer::Background),
+        ] {
+            let _ = fixture
+                .state
+                .surfaces
+                .declare(crate::scripted::Declaration::for_test(
+                    name,
+                    std::path::PathBuf::from(format!("{name}.qml")),
+                    layer,
+                    crate::scripted::On::EveryMonitor,
+                ));
+        }
+        let _bar = bar(
+            &mut fixture.display,
+            &mut fixture.state,
+            &fixture.conn,
+            &fixture.client,
+            &fixture.qh,
+            30,
+        );
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "surface:dock", slot = "behind", effect = "tint" },
+                 { match = "*", part = "layer_shell:restore-*", slot = "front", effect = "tint" } }"#,
+        );
+        let slots = crate::render::build_slots(&mut fixture.state);
+        let dock = fixture.state.surfaces.named("dock").expect("declared");
+        let wallpaper = fixture.state.surfaces.named("wallpaper").expect("declared");
+        for monitor in ["fx2-rule-surfaces", "fx2-rule-surfaces-right"] {
+            assert!(
+                slots.wanted(&Owner::Surface(dock, monitor.to_owned()), Slot::Behind),
+                "the dock on {monitor} has no slot"
+            );
+            assert!(!slots.wanted(&Owner::Surface(wallpaper, monitor.to_owned()), Slot::Behind));
+        }
+        let layered: Vec<_> = fixture
+            .state
+            .space
+            .outputs()
+            .flat_map(|output| {
+                smithay::desktop::layer_map_for_output(output)
+                    .layers()
+                    .map(|layer| layer.wl_surface().id())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(layered.len(), 1, "the premise: one layer surface, the bar");
+        assert!(slots.wanted(&Owner::LayerShell(layered[0].clone()), Slot::Front));
+        assert_eq!(
+            slots.wants().count(),
+            3,
+            "two docks and a bar, and nothing else"
+        );
+    }
+
+    /// **A resolved rule whose chain is not bound wants no slot**: every
+    /// chain is bound at config load or when its style is applied, never in
+    /// a frame (Ruling 15), so a rule that could not bind (a style's, its
+    /// problem already on the overlay) leaves its slot empty.
+    #[test]
+    fn a_rule_whose_chain_is_not_bound_wants_no_slot() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::{Origin, RuleKey, Slot};
+        fx2_fixture!(fixture, "rule-unbound");
+        let (pane, _) = one_window(&mut fixture);
+        with_tint_folder(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "tint" } }"#,
+        );
+        let client = Owner::Pane(pane, PaneSlot::Client);
+        assert!(crate::render::build_slots(&mut fixture.state).wanted(&client, Slot::Behind));
+        fixture.state.chains.remove(RuleKey {
+            origin: Origin::User,
+            index: 0,
+            generation: fixture.state.rules_generation,
+        });
+        assert!(!crate::render::build_slots(&mut fixture.state).wanted(&client, Slot::Behind));
+    }
+
+    /// The self input's key for a client, as `prepare` builds it.
+    fn self_key(fixture: &mut Fixture, window: &Window, pad: i32) -> crate::keyed::Inputs {
+        use smithay::backend::renderer::test::DummyRenderer;
+        let source = crate::offscreen::PartSource::Client(window);
+        let size = crate::offscreen::part_size(&fixture.state, &source, 1.0, pad).expect("a size");
+        let elements = crate::offscreen::part_elements(&mut DummyRenderer, &source, pad, 1.0);
+        crate::keyed::Inputs::of(crate::keyed::Kind::Pane, size, 1.0, &elements)
+    }
+
+    /// A desynchronised subsurface of `window`'s surface with a `w` x `h`
+    /// buffer of its own, placed by a commit of its parent, as [fx0] Task
+    /// 17's subsurface steps make one.
+    fn subsurface_of(
+        fixture: &mut Fixture,
+        window: &Window,
+        w: i32,
+        h: i32,
+    ) -> wl_surface::WlSurface {
+        let (_, surface) = kept(fixture, window);
+        let compositor = fixture
+            .client
+            .compositor
+            .clone()
+            .expect("wl_compositor bound");
+        let subcompositor = fixture
+            .client
+            .subcompositor
+            .clone()
+            .expect("wl_subcompositor bound");
+        let child = compositor.create_surface(&fixture.qh, ());
+        let subsurface = subcompositor.get_subsurface(&child, &surface, &fixture.qh, ());
+        subsurface.set_desync();
+        commit_buffer(&fixture.client, &fixture.qh, &child, w, h);
+        commit_again(fixture, window);
+        child
+    }
+
+    /// A fresh `w` x `h` buffer on a subsurface, committed by its client.
+    fn commit_child(fixture: &mut Fixture, child: &wl_surface::WlSurface, w: i32, h: i32) {
+        commit_buffer(&fixture.client, &fixture.qh, child, w, h);
+    }
+
+    /// **A self rule captures the client once until it commits.**
+    #[test]
+    fn a_self_rule_captures_the_client_once_until_it_commits() {
+        fx2_fixture!(fixture, "self-once");
+        let (_pane, window) = one_window(&mut fixture);
+        let mut capture = crate::keyed::Capture::<u32>::default();
+        capture.drawn(1, self_key(&mut fixture, &window, 6));
+        assert!(
+            !capture.stale(&self_key(&mut fixture, &window, 6)),
+            "recaptured with nothing committed"
+        );
+        commit_again(&mut fixture, &window);
+        pump_all(&mut fixture);
+        assert!(
+            capture.stale(&self_key(&mut fixture, &window, 6)),
+            "not recaptured after a commit"
+        );
+    }
+
+    /// **A subsurface's commit recaptures its client**: the capture is keyed
+    /// on every surface of the tree ([fx0] Ruling 9).
+    #[test]
+    fn a_subsurface_commit_recaptures_its_client() {
+        fx2_fixture!(fixture, "self-subsurface");
+        let (_pane, window) = one_window(&mut fixture);
+        let child = subsurface_of(&mut fixture, &window, 40, 30);
+        let mut capture = crate::keyed::Capture::<u32>::default();
+        capture.drawn(1, self_key(&mut fixture, &window, 6));
+        commit_child(&mut fixture, &child, 40, 30);
+        pump_all(&mut fixture);
+        assert!(
+            capture.stale(&self_key(&mut fixture, &window, 6)),
+            "a subsurface's commit did not recapture the client"
+        );
+    }
+
+    /// A client's layer surface on `layer`, its namespace `namespace`, across
+    /// the top of the fixture's monitor and 30 px tall, with a buffer: a part
+    /// `layer_shell:<namespace>` names. Its layer object comes with it.
+    fn layer_surface(
+        fixture: &mut Fixture,
+        namespace: &str,
+        layer: zwlr_layer_shell_v1::Layer,
+    ) -> (
+        wl_surface::WlSurface,
+        zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+    ) {
+        use zwlr_layer_surface_v1::Anchor;
+        let compositor = fixture
+            .client
+            .compositor
+            .clone()
+            .expect("wl_compositor bound");
+        let shell = fixture
+            .client
+            .layer_shell
+            .clone()
+            .expect("zwlr_layer_shell_v1 bound");
+        let surface = compositor.create_surface(&fixture.qh, ());
+        let layered =
+            shell.get_layer_surface(&surface, None, layer, namespace.to_owned(), &fixture.qh, ());
+        layered.set_anchor(Anchor::Top | Anchor::Left | Anchor::Right);
+        layered.set_size(0, 30);
+        surface.commit();
+        pump_all(fixture);
+        commit_layer_again(fixture, &surface);
+        (surface, layered)
+    }
+
+    /// A fresh 1920 x 30 buffer on a layer surface [`layer_surface`] made,
+    /// committed by its client.
+    fn commit_layer_again(fixture: &mut Fixture, surface: &wl_surface::WlSurface) {
+        commit_buffer(&fixture.client, &fixture.qh, surface, 1920, 30);
+        pump_all(fixture);
+    }
+
+    /// The key of an xray cut on the fixture's monitor, built as
+    /// `offscreen::xray_job` builds it, on smithay's `DummyRenderer`:
+    /// `SessionLayers`' entries, a layer surface's tree at its place as
+    /// `render::stacked_elements` draws it, and a pane's client tree should
+    /// one be listed, which `xray_holds_the_cuts_bands_and_nothing_else`
+    /// says none is.
+    fn xray_key(fixture: &mut Fixture, cut: crate::effect::xray::Cut) -> crate::keyed::Inputs {
+        use crate::effect::xray::XraySource as _;
+        use crate::render::Stacked;
+        use smithay::backend::renderer::element::AsRenderElements as _;
+        use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+        use smithay::backend::renderer::test::DummyRenderer;
+        let output = fixture
+            .state
+            .space
+            .outputs()
+            .next()
+            .cloned()
+            .expect("the fixture's monitor");
+        let scale = smithay::utils::Scale::from(1.0);
+        let mut renderer = DummyRenderer;
+        let mut elements: Vec<WaylandSurfaceRenderElement<DummyRenderer>> = Vec::new();
+        for each in crate::effect::xray::SessionLayers.entries(&fixture.state, &output, cut) {
+            match each {
+                Stacked::Layer(surface, geometry) => elements.extend(surface.render_elements(
+                    &mut renderer,
+                    geometry.loc.to_physical_precise_round(1.0),
+                    scale,
+                    1.0,
+                )),
+                Stacked::Panes(nodes) => {
+                    for ((_, window, ..), _) in nodes {
+                        if let Some(window) = window {
+                            elements.extend(crate::render::toplevel_elements(
+                                &mut renderer,
+                                &window,
+                                (0, 0).into(),
+                                scale,
+                                1.0,
+                            ));
+                        }
+                    }
+                }
+                Stacked::Surface(..) => {}
+            }
+        }
+        let size = crate::offscreen::xray_size(&fixture.state, &output);
+        crate::keyed::Inputs::of(crate::keyed::Kind::Xray, size, 1.0, &elements)
+    }
+
+    /// **The xray capture is keyed**: a layer surface in the cut that
+    /// commits makes it stale; a window that commits does not.
+    #[test]
+    fn the_xray_capture_is_stale_only_when_its_cut_changes() {
+        fx2_fixture!(fixture, "xray-keyed");
+        let (wallpaper, _layered) = layer_surface(
+            &mut fixture,
+            "wallpaper",
+            zwlr_layer_shell_v1::Layer::Background,
+        );
+        let (_pane, window) = one_window(&mut fixture);
+        pump_all(&mut fixture);
+        let key = |fixture: &mut Fixture| xray_key(fixture, crate::effect::xray::Cut::Background);
+        let mut capture = crate::keyed::Capture::<u32>::default();
+        capture.drawn(1, key(&mut fixture));
+        commit_again(&mut fixture, &window);
+        pump_all(&mut fixture);
+        assert!(
+            !capture.stale(&key(&mut fixture)),
+            "a window's commit staled xray"
+        );
+        commit_layer_again(&mut fixture, &wallpaper);
+        pump_all(&mut fixture);
+        assert!(
+            capture.stale(&key(&mut fixture)),
+            "the wallpaper's commit did not stale xray"
+        );
+    }
+
+    /// **xray is drawn at the monitor's scale times `xray.scale`**: the
+    /// mode itself at `effects.xray.scale = 1`, half of it each way at 0.5.
+    #[test]
+    fn the_xray_target_is_the_monitor_at_its_scale_times_xray_scale() {
+        fx2_fixture!(fixture, "xray-size");
+        let output = fixture
+            .state
+            .space
+            .outputs()
+            .next()
+            .cloned()
+            .expect("an output");
+        let mode = output.current_mode().expect("a mode").size;
+        assert_eq!(crate::offscreen::xray_size(&fixture.state, &output), mode);
+        fixture.state.effect_settings.xray.scale = 0.5;
+        assert_eq!(
+            crate::offscreen::xray_size(&fixture.state, &output),
+            (mode.w / 2, mode.h / 2).into()
+        );
+    }
+
+    /// **The xray rasterises its scenes at the monitor's scale**: what
+    /// `offscreen::xray_job` hands `render::stacked_elements` asks a hosted
+    /// scene for the picture the frame draws, at the monitor's own scale,
+    /// and places it at the cut's, at `effects.xray.scale` 0.5 as at 1.
+    #[test]
+    fn the_xray_rasterises_its_scenes_at_the_monitors_scale() {
+        fx2_fixture!(fixture, "xray-raster");
+        let output = fixture
+            .state
+            .space
+            .outputs()
+            .next()
+            .cloned()
+            .expect("an output");
+        let scale = output.current_scale().fractional_scale();
+        assert_eq!(
+            crate::offscreen::xray_raster(&fixture.state, &output),
+            crate::surface::Raster::at(scale)
+        );
+        fixture.state.effect_settings.xray.scale = 0.5;
+        let raster = crate::offscreen::xray_raster(&fixture.state, &output);
+        assert_eq!(
+            raster.scale, scale,
+            "rasterised at the cut's scale, not the monitor's"
+        );
+        assert!(
+            (raster.place - scale * 0.5).abs() < f64::EPSILON,
+            "placed at {}, not the cut's scale",
+            raster.place
+        );
+    }
+
+    /// A window whose root surface declares no opaque region: what a T2
+    /// slot behind it is for. `one_window`'s, which sets none.
+    fn translucent_window(fixture: &mut Fixture) -> (crate::pane::PaneId, Window) {
+        let opened = one_window(fixture);
+        fixture_effects(&mut fixture.state);
+        opened
+    }
+
+    /// The one chain the user's rules bound.
+    fn only_user_chain(state: &Solium) -> &crate::effect::plan::BoundChain {
+        state
+            .chains
+            .first_for_test(crate::effect::rules::Origin::User)
+            .expect("a user chain")
+    }
+
+    /// `sol.effects(<lua table>)` through the compositor's `Command::Effects`
+    /// arm, the engine's own keys beside the rules, as the shipped `init.lua`
+    /// hands `config.effects` over (until Task 48's `lua/effects.lua`).
+    fn apply_options(fixture: &mut Fixture, lua: &str) {
+        super::apply_effects_lua(&mut fixture.state, lua);
+        assert!(
+            fixture.state.effects.problems().is_empty(),
+            "{:?}",
+            fixture.state.effects.problems()
+        );
+    }
+
+    /// A second 1920×1080 monitor to the right of the fixture's.
+    fn two_monitors(fixture: &mut Fixture) {
+        let _ = a_screen(&mut fixture.state, "fx2-right", (1920, 0));
+    }
+
+    /// The fixture's own monitor, at the origin.
+    fn first_monitor(fixture: &Fixture) -> String {
+        fixture
+            .state
+            .output_at((0, 0).into())
+            .map(|output| output.name())
+            .expect("the fixture's monitor")
+    }
+
+    /// The window moved so it lies across the seam between the fixture's
+    /// two monitors.
+    fn straddle(fixture: &mut Fixture, window: &Window) {
+        fixture
+            .state
+            .space
+            .map_element(window.clone(), (1880, 100), false);
+        fixture.state.space.refresh();
+        pump_all(fixture);
+    }
+
+    /// The monitor the layout puts a pane on, by its centre.
+    fn pane_monitor(fixture: &Fixture, pane: crate::pane::PaneId) -> String {
+        fixture
+            .state
+            .pane_outer_of(pane)
+            .and_then(|outer| fixture.state.output_of(outer))
+            .map(|output| output.name())
+            .expect("the pane's monitor")
+    }
+
+    /// Lock the session through the client's `ext_session_lock_v1`, every
+    /// monitor then showing the lock, so the client is told `locked` and
+    /// may unlock, as `lock_focus`' tests do.
+    fn lock_session(fixture: &mut Fixture) -> ext_session_lock_v1::ExtSessionLockV1 {
+        let locks = fixture
+            .client
+            .locks
+            .clone()
+            .expect("ext_session_lock_manager_v1 bound");
+        let lock = locks.lock(&fixture.qh, ());
+        pump_all(fixture);
+        assert!(fixture.state.lock.is_some(), "the session did not lock");
+        let outputs: Vec<Output> = fixture.state.space.outputs().cloned().collect();
+        for output in outputs {
+            let frame = fixture.state.lock_frame();
+            fixture.state.frame_presented(&output, frame);
+        }
+        pump_all(fixture);
+        lock
+    }
+
+    /// Unlock what [`lock_session`] locked.
+    fn unlock_session(fixture: &mut Fixture, lock: ext_session_lock_v1::ExtSessionLockV1) {
+        lock.unlock_and_destroy();
+        pump_all(fixture);
+        assert!(fixture.state.lock.is_none(), "the session did not unlock");
+    }
+
+    /// One pass's resolve: the pass's warps planned first, as `Gpu::resolve`
+    /// plans them, then the slots, their boxes and places, and the T2 cuts
+    /// and memos wanted, in the store's next pass.
+    fn resolved(fixture: &mut Fixture) -> crate::effect::plan::Slots {
+        let pass = fixture.state.store.next_pass();
+        crate::render::plan_warps(&mut fixture.state);
+        let mut slots = crate::render::build_slots(&mut fixture.state);
+        crate::render::record_boxes(&fixture.state, &mut slots);
+        crate::render::want_t2(&mut fixture.state, &mut slots, pass);
+        slots
+    }
+
+    /// The `T2Key` `run_slots` would build for the slot's first place this
+    /// pass, through the pure `render::t2_key`, with no self capture.
+    fn t2_key_of(
+        fixture: &mut Fixture,
+        owner: crate::effect::plan::Owner,
+        slot: crate::effect::rules::Slot,
+    ) -> Option<crate::effect::memo::T2Key> {
+        let slots = resolved(fixture);
+        let place = slots.places(&owner, slot).first()?.clone();
+        let part = place.part;
+        let chain = fixture.state.chains.get(slots.key(&owner, slot)?)?;
+        let work =
+            crate::render::t2_work(chain.memo()?, slots.shared_on(&owner, slot, &place.monitor));
+        Some(crate::render::t2_key(
+            &fixture.state.memos,
+            &fixture.state.xrays,
+            &place,
+            chain,
+            &work,
+            part.content,
+            part.radii,
+            None,
+        ))
+    }
+
+    /// **A backdrop blur binds as T2, its memo split**: `{ "blur" }` behind
+    /// a client, no `source`, is no longer refused, and its whole plan is
+    /// the memo.
+    #[test]
+    fn a_backdrop_blur_binds_as_t2_with_its_memo_split() {
+        fx2_fixture!(fixture, "t2-binds");
+        fixture_effects(&mut fixture.state);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur" } }"#,
+        );
+        assert!(
+            fixture.state.effects.problems().is_empty(),
+            "{:?}",
+            fixture.state.effects.problems()
+        );
+        let chain = only_user_chain(&fixture.state);
+        assert_eq!(chain.tier, crate::effect::rules::Tier::Xray);
+        let memo = chain.memo().expect("split");
+        assert!(memo.suffix.steps.is_empty());
+        assert_eq!(memo.prefix.as_ref().map(|p| p.steps.len()), Some(6));
+        assert_eq!(chain.memo_keys().len(), 1, "one export, one memo");
+    }
+
+    /// **xray is wanted only on a monitor a T2 slot reads**, and only its
+    /// cut.
+    #[test]
+    fn xray_is_wanted_only_on_a_monitor_a_t2_slot_reads() {
+        fx2_fixture!(fixture, "t2-lazy");
+        two_monitors(&mut fixture);
+        let (_pane, _window) = translucent_window(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur" } }"#,
+        );
+        let _slots = resolved(&mut fixture);
+        assert_eq!(
+            fixture.state.xrays.wanted(),
+            vec![(
+                first_monitor(&fixture),
+                crate::effect::xray::Cut::Background
+            )]
+        );
+    }
+
+    /// **The first frame waits for its xray** (spec C14): with a T2 rule
+    /// wanted and every program compiled, the effects are not ready until
+    /// every wanted cut has been built once; with none wanted they are ready
+    /// as the host is.
+    #[test]
+    fn the_first_frame_waits_for_its_xray() {
+        fx2_fixture!(fixture, "xray-warmup");
+        assert_eq!(
+            fixture.state.effects_ready(),
+            fixture.state.effects.ready(),
+            "no rule, no xray to wait for"
+        );
+        translucent_window(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur" } }"#,
+        );
+        // Every program asked compiled, so the xray is all that is waited for.
+        fixture
+            .state
+            .effects
+            .compile_pending(&mut crate::effect::host::tests::Refusing);
+        assert!(
+            fixture.state.effects.ready(),
+            "the premise: nothing to compile"
+        );
+        let _slots = resolved(&mut fixture);
+        assert!(
+            !fixture.state.effects_ready(),
+            "ready before its xray was built"
+        );
+        let monitor = first_monitor(&fixture);
+        fixture
+            .state
+            .xrays
+            .drawn(&monitor, crate::effect::xray::Cut::Background, true);
+        assert!(
+            fixture.state.effects_ready(),
+            "not ready once its xray was built"
+        );
+        assert_eq!(
+            fixture.state.first_frame_ready(),
+            fixture.state.effects_ready(),
+            "one gate, the effects one of its terms"
+        );
+    }
+
+    /// **A held first frame asks for the next pass, and the cap lets it
+    /// through**: with every program compiled and a T2 slot's cut not
+    /// built, the end of `prepare` holds (so `elements` draws only the
+    /// clear colour) and asks for another pass, since nothing else may
+    /// damage the screen to release it; at `startup.first_frame.max_ms` it
+    /// is drawn whatever is late, asking for nothing. With no rule nothing
+    /// is held and nothing is asked (spec §8.4).
+    #[test]
+    fn a_held_first_frame_asks_for_the_next_pass() {
+        fx2_fixture!(fixture, "warm-hold");
+        translucent_window(&mut fixture);
+        fixture.state.redraw = false;
+        assert!(
+            !crate::render::hold_first_frame(&mut fixture.state),
+            "held with no rule"
+        );
+        assert!(!fixture.state.redraw, "a pass asked for with no rule");
+        // A session starting afresh, its first pass not asked yet.
+        fixture.state.warm = crate::warm::Warm::default();
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur" } }"#,
+        );
+        // Every program asked compiled, so only the cut holds the frame.
+        fixture
+            .state
+            .effects
+            .compile_pending(&mut crate::effect::host::tests::Refusing);
+        let _slots = resolved(&mut fixture);
+        fixture.state.redraw = false;
+        assert!(crate::render::hold_first_frame(&mut fixture.state));
+        assert!(fixture.state.redraw, "a held pass asked for no next one");
+        fixture.state.redraw = false;
+        fixture
+            .state
+            .clock
+            .advance(std::time::Duration::from_millis(
+                crate::warm::FirstFrame::default().max_ms,
+            ));
+        assert!(
+            !crate::render::hold_first_frame(&mut fixture.state),
+            "held past max_ms"
+        );
+        assert!(!fixture.state.redraw);
+    }
+
+    /// **A held memo is in the memory report** (Ruling F30): memos are held
+    /// outside the pool's free-list budget, so `memory_report` counts them
+    /// itself, as `memos_kb`.
+    #[test]
+    fn a_held_memo_is_in_the_memory_report() {
+        fx2_fixture!(fixture, "memo-memory");
+        assert_eq!(fixture.state.memory().memos_kb, 0, "no memo held");
+        translucent_window(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur" } }"#,
+        );
+        let _slots = resolved(&mut fixture);
+        let held = fixture.state.memos.held_bytes();
+        assert!(held > 1024, "the premise: a monitor's memo is held");
+        assert_eq!(fixture.state.memory().memos_kb, held / 1024);
+    }
+
+    /// **Two windows with one blur want one memo.**
+    #[test]
+    fn two_windows_with_one_blur_want_one_memo() {
+        fx2_fixture!(fixture, "t2-shared");
+        fixture_effects(&mut fixture.state);
+        let (left, right) = side_by_side_windows(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur" } }"#,
+        );
+        let slots = resolved(&mut fixture);
+        for pane in [left, right] {
+            assert_eq!(
+                slots
+                    .places(
+                        &crate::effect::plan::Owner::Pane(
+                            pane,
+                            crate::effect::plan::PaneSlot::Client
+                        ),
+                        crate::effect::rules::Slot::Behind
+                    )
+                    .len(),
+                1,
+                "the premise: each window has its place"
+            );
+        }
+        assert_eq!(fixture.state.memos.len(), 1);
+        assert_eq!(slots.memos().len(), 1, "the xray phase runs it once");
+    }
+
+    /// **While the session is locked nothing of it is captured, run or
+    /// read**: a self blur (T1) and a backdrop blur (T2) want no slot, no
+    /// self capture and no xray, and both come back on unlock ([16] §5,
+    /// *Review log* finding 6). Task 47 adds an alpha-masked T2 rule and
+    /// Task 58 a region rule to the same rules, each with its own check.
+    #[test]
+    fn nothing_of_the_session_is_captured_while_locked() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Slot;
+        fx2_fixture!(fixture, "session-locked");
+        let (pane, _window) = translucent_window(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{
+            { match = "*", part = "client", slot = "replace", effect = { "blur", source = "self" } },
+            { match = "*", part = "client", slot = "behind", effect = "blur" },
+        }"#,
+        );
+        let lock = lock_session(&mut fixture);
+        let mut slots = crate::render::build_slots(&mut fixture.state);
+        assert!(
+            slots.is_empty(),
+            "a slot of the session is wanted behind the lock"
+        );
+        crate::render::record_boxes(&fixture.state, &mut slots);
+        assert!(
+            crate::render::self_inputs(&fixture.state, &slots).is_empty(),
+            "a client captured behind the lock"
+        );
+        crate::render::want_t2(&mut fixture.state, &mut slots, 1);
+        assert!(fixture.state.xrays.wanted().is_empty());
+        unlock_session(&mut fixture, lock);
+        let slots = crate::render::build_slots(&mut fixture.state);
+        assert!(slots.wanted(&Owner::Pane(pane, PaneSlot::Client), Slot::Replace));
+        assert!(slots.wanted(&Owner::Pane(pane, PaneSlot::Client), Slot::Behind));
+    }
+
+    /// **A reload that changes `xray.scale` rebuilds the cut once and runs
+    /// each of its memos once**: the capture's key holds its size, so the
+    /// kept capture is stale (*Review log* finding 8).
+    #[test]
+    fn a_reload_changing_xray_scale_rebuilds_its_cut_and_reruns_its_memos_once() {
+        fx2_fixture!(fixture, "xray-reload");
+        let _wallpaper = layer_surface(
+            &mut fixture,
+            "wallpaper",
+            zwlr_layer_shell_v1::Layer::Background,
+        );
+        translucent_window(&mut fixture);
+        let (cut, monitor) = (
+            crate::effect::xray::Cut::Background,
+            first_monitor(&fixture),
+        );
+        let rules =
+            r#"rules = { { match = "*", part = "client", slot = "behind", effect = "blur" } }"#;
+        let wanted = |fixture: &mut Fixture| {
+            let _slots = resolved(fixture);
+            fixture
+                .state
+                .memos
+                .keys()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>()
+        };
+        apply_options(&mut fixture, &format!("{{ {rules} }}"));
+        let before = wanted(&mut fixture);
+        assert!(!before.is_empty(), "the premise: a memo is wanted");
+        let mut capture = crate::keyed::Capture::<u32>::default();
+        capture.drawn(1, xray_key(&mut fixture, cut));
+        fixture.state.xrays.drawn(&monitor, cut, true);
+        let generation = fixture.state.xrays.generation(&monitor, cut).unwrap_or(0);
+        for key in &before {
+            fixture.state.memos.ran(key, generation);
+        }
+        let held: Vec<_> = before.iter().cloned().collect();
+        assert!(
+            crate::render::memos_to_run(&fixture.state.memos, &fixture.state.xrays, &held)
+                .is_empty(),
+            "the premise: every memo ran over this cut"
+        );
+        apply_options(
+            &mut fixture,
+            &format!("{{ xray = {{ scale = 0.5 }}, {rules} }}"),
+        );
+        assert!(
+            capture.stale(&xray_key(&mut fixture, cut)),
+            "a new scale kept the old capture"
+        );
+        fixture.state.xrays.drawn(&monitor, cut, true);
+        let after = wanted(&mut fixture);
+        assert_eq!(after, before, "the same prefixes, the same memos");
+        let after: Vec<_> = after.into_iter().collect();
+        assert_eq!(
+            crate::render::memos_to_run(&fixture.state.memos, &fixture.state.xrays, &after).len(),
+            after.len(),
+            "each memo runs once more"
+        );
+    }
+
+    /// **A window across two monitors has one T2 place on each**, and one,
+    /// on its own pane's monitor, with `effects.xray.straddle = "own"`
+    /// (amended 2026-10-08, configurable).
+    #[test]
+    fn a_window_across_two_monitors_has_a_t2_place_on_each() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Slot;
+        fx2_fixture!(fixture, "t2-straddle");
+        two_monitors(&mut fixture);
+        let (pane, window) = translucent_window(&mut fixture);
+        straddle(&mut fixture, &window);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur" } }"#,
+        );
+        let slots = resolved(&mut fixture);
+        let places = slots.places(&Owner::Pane(pane, PaneSlot::Client), Slot::Behind);
+        assert_eq!(places.len(), 2, "{places:?}");
+        assert_ne!(places[0].monitor, places[1].monitor);
+        assert!(
+            places.iter().all(|place| place.own == places[0].own),
+            "a suffix runs at the part's own size on either monitor"
+        );
+        fixture.state.effect_settings.xray.straddle = crate::effect::xray::Straddle::Own;
+        let slots = resolved(&mut fixture);
+        let places = slots.places(&Owner::Pane(pane, PaneSlot::Client), Slot::Behind);
+        assert_eq!(
+            places
+                .iter()
+                .map(|place| place.monitor.clone())
+                .collect::<Vec<_>>(),
+            vec![pane_monitor(&fixture, pane)]
+        );
+    }
+
+    /// **`effects.memo.split` reaches the bound chain, and `memo = false`
+    /// is never split** (amended 2026-10-08, configurable): under `"off"`
+    /// a backdrop blur has no prefix; a rule saying `memo = false` has none
+    /// whatever the configuration says.
+    #[test]
+    fn the_memo_split_key_reaches_the_bound_chain() {
+        fx2_fixture!(fixture, "memo-split-key");
+        fixture_effects(&mut fixture.state);
+        let rules =
+            r#"rules = { { match = "*", part = "client", slot = "behind", effect = "blur" } }"#;
+        apply_options(
+            &mut fixture,
+            &format!("{{ memo = {{ split = \"off\" }}, {rules} }}"),
+        );
+        assert_eq!(
+            only_user_chain(&fixture.state)
+                .memo()
+                .map(|memo| memo.prefix.is_none()),
+            Some(true)
+        );
+        apply_options(&mut fixture, &format!("{{ {rules} }}"));
+        assert_eq!(
+            only_user_chain(&fixture.state)
+                .memo()
+                .and_then(|memo| memo.prefix.as_ref())
+                .map(|p| p.steps.len()),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn a_rule_with_memo_false_is_never_split() {
+        fx2_fixture!(fixture, "memo-false");
+        fixture_effects(&mut fixture.state);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur", memo = false } }"#,
+        );
+        let chain = only_user_chain(&fixture.state);
+        assert_eq!(chain.memo().map(|memo| memo.prefix.is_none()), Some(true));
+        assert!(chain.memo_keys().is_empty());
+    }
+
+    /// **Over `effects.memo.budget_mib` no memo is held and each place runs
+    /// the whole plan** (amended 2026-10-08, configurable): two translucent
+    /// windows behind a blur on a 1 MiB budget want no memo, and both
+    /// places are unshared, so `run_slots` runs the unsplit plan for each.
+    #[test]
+    fn over_the_memo_budget_a_slot_runs_its_whole_plan() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Slot;
+        fx2_fixture!(fixture, "memo-budget");
+        fixture_effects(&mut fixture.state);
+        let (a, b) = side_by_side_windows(&mut fixture);
+        apply_options(
+            &mut fixture,
+            r#"{ memo = { budget_mib = 1 }, rules = { { match = "*", part = "client", slot = "behind", effect = "blur" } } }"#,
+        );
+        let slots = resolved(&mut fixture);
+        assert_eq!(
+            fixture.state.memos.len(),
+            0,
+            "a memo was held over the budget"
+        );
+        let monitor = first_monitor(&fixture);
+        let chain = only_user_chain(&fixture.state);
+        for pane in [a, b] {
+            let owner = Owner::Pane(pane, PaneSlot::Client);
+            assert_eq!(slots.places(&owner, Slot::Behind).len(), 1, "the premise");
+            let shared = slots.shared_on(&owner, Slot::Behind, &monitor);
+            assert_eq!(
+                crate::render::t2_work(chain.memo().expect("T2"), shared),
+                crate::render::T2Work::Whole
+            );
+        }
+        assert!(slots.memos().is_empty(), "the xray phase runs no memo");
+    }
+
+    /// **A rule may read the wallpaper alone** (amended 2026-10-08,
+    /// configurable): with `effects.xray.layers = { "background", "bottom" }`
+    /// a window's rule wants `Cut::Bottom` by default and `Cut::Background`
+    /// with `cut = "background"`.
+    #[test]
+    fn a_rule_may_read_the_wallpaper_alone() {
+        fx2_fixture!(fixture, "rule-cut");
+        translucent_window(&mut fixture);
+        let monitor = first_monitor(&fixture);
+        for (cut, expected) in [
+            ("below", crate::effect::xray::Cut::Bottom),
+            ("background", crate::effect::xray::Cut::Background),
+        ] {
+            apply_options(
+                &mut fixture,
+                &format!(
+                    r#"{{ xray = {{ layers = {{ "background", "bottom" }} }}, rules = {{ {{ match = "*", part = "client", slot = "behind", effect = "blur", cut = "{cut}" }} }} }}"#
+                ),
+            );
+            let _slots = resolved(&mut fixture);
+            assert_eq!(
+                fixture.state.xrays.wanted(),
+                vec![(monitor.clone(), expected)],
+                "cut = {cut}"
+            );
+        }
+    }
+
+    /// **A T2 slot that reads no memo re-runs when its xray is redrawn**
+    /// (fix round 2026-10-08): with `memo = false` the suffix is the whole
+    /// plan and samples `backdrop` itself, so its key carries the cut's
+    /// generation; nothing redrawn, nothing re-runs.
+    #[test]
+    fn a_t2_slot_with_memo_false_reruns_when_its_xray_is_redrawn() {
+        fx2_fixture!(fixture, "memo-false-xray");
+        let (pane, _) = translucent_window(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur", memo = false } }"#,
+        );
+        reruns_when_its_xray_is_redrawn(
+            &mut fixture,
+            crate::effect::plan::Owner::Pane(pane, crate::effect::plan::PaneSlot::Client),
+        );
+    }
+
+    /// **Over `effects.memo.budget_mib` too** (`T2Work::Whole`, its `memo`
+    /// 0).
+    #[test]
+    fn a_t2_slot_over_the_memo_budget_reruns_when_its_xray_is_redrawn() {
+        fx2_fixture!(fixture, "memo-budget-xray");
+        let (pane, _) = translucent_window(&mut fixture);
+        apply_options(
+            &mut fixture,
+            r#"{ memo = { budget_mib = 1 }, rules = { { match = "*", part = "client", slot = "behind", effect = "blur" } } }"#,
+        );
+        reruns_when_its_xray_is_redrawn(
+            &mut fixture,
+            crate::effect::plan::Owner::Pane(pane, crate::effect::plan::PaneSlot::Client),
+        );
+    }
+
+    fn reruns_when_its_xray_is_redrawn(fixture: &mut Fixture, owner: crate::effect::plan::Owner) {
+        use crate::effect::rules::Slot;
+        let before = t2_key_of(fixture, owner.clone(), Slot::Behind).expect("a key");
+        assert_eq!(before.memo, 0, "this slot reads no memo");
+        let state = crate::effect::store::T2State {
+            key: Some(before),
+            ..crate::effect::store::T2State::default()
+        };
+        assert!(
+            !state.needs_run(t2_key_of(fixture, owner.clone(), Slot::Behind).expect("a key")),
+            "nothing moved and it re-ran"
+        );
+        for (monitor, cut) in fixture.state.xrays.wanted() {
+            fixture.state.xrays.drawn(&monitor, cut, true);
+        }
+        assert!(
+            state.needs_run(t2_key_of(fixture, owner, Slot::Behind).expect("a key")),
+            "a redrawn wallpaper left the slot's backdrop stale"
+        );
+    }
+
+    /// **A dragged window's T2 key moves, and its memo does not**: the
+    /// suffix (here, a crop's placement) follows the window and the memo,
+    /// keyed by the monitor, the cut and the prefix alone, stays the one
+    /// memo (Ruling F37).
+    #[test]
+    fn a_dragged_windows_t2_key_moves_and_its_memo_does_not() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Slot;
+        fx2_fixture!(fixture, "t2-drag");
+        let (pane, window) = translucent_window(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur" } }"#,
+        );
+        let owner = Owner::Pane(pane, PaneSlot::Client);
+        let before = t2_key_of(&mut fixture, owner.clone(), Slot::Behind).expect("a key");
+        let held = |fixture: &Fixture| {
+            let mut keys: Vec<_> = fixture.state.memos.keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        let memos = held(&fixture);
+        assert_eq!(memos.len(), 1, "the premise: one memo");
+        let at = fixture
+            .state
+            .space
+            .element_location(&window)
+            .expect("mapped");
+        fixture
+            .state
+            .space
+            .map_element(window.clone(), (at.x + 1, at.y), false);
+        fixture.state.space.refresh();
+        let after = t2_key_of(&mut fixture, owner, Slot::Behind).expect("a key");
+        assert_ne!(
+            after.padded, before.padded,
+            "a drag left the key where it was"
+        );
+        assert_eq!(held(&fixture), memos, "a drag made another memo");
+    }
+
+    /// **A drag finer than an xray pixel moves the T2 key** (Task 42's
+    /// review, carried into Task 44): at `effects.xray.scale = 0.5` a 1 px
+    /// drag that leaves the place's box in xray pixels where it was still
+    /// moves the key, which holds the box in the monitor's own pixels
+    /// (`T2Place.screen`), so the suffix re-runs (Ruling F37).
+    #[test]
+    fn a_drag_finer_than_an_xray_pixel_moves_the_t2_key_at_half_scale() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Slot;
+        fx2_fixture!(fixture, "t2-fine-drag");
+        let (pane, window) = translucent_window(&mut fixture);
+        apply_options(
+            &mut fixture,
+            r#"{ xray = { scale = 0.5 }, rules = { { match = "*", part = "client", slot = "behind", effect = "blur" } } }"#,
+        );
+        let owner = Owner::Pane(pane, PaneSlot::Client);
+        let in_xray = |fixture: &mut Fixture| {
+            resolved(fixture)
+                .places(&owner, Slot::Behind)
+                .first()
+                .map(|place| place.padded)
+                .expect("a place")
+        };
+        // Of two 1 px drags in a row at half scale, one crosses an xray
+        // pixel and the other does not, whichever column it starts at.
+        let mut finer = 0;
+        for _ in 0..2 {
+            let was = in_xray(&mut fixture);
+            let before = t2_key_of(&mut fixture, owner.clone(), Slot::Behind).expect("a key");
+            let at = fixture
+                .state
+                .space
+                .element_location(&window)
+                .expect("mapped");
+            fixture
+                .state
+                .space
+                .map_element(window.clone(), (at.x + 1, at.y), false);
+            fixture.state.space.refresh();
+            if in_xray(&mut fixture) != was {
+                continue;
+            }
+            finer += 1;
+            let after = t2_key_of(&mut fixture, owner.clone(), Slot::Behind).expect("a key");
+            assert_ne!(
+                after.padded, before.padded,
+                "a drag finer than an xray pixel left the key where it was"
+            );
+        }
+        assert_eq!(
+            finer, 1,
+            "the premise: one of two 1 px drags stays inside an xray pixel"
+        );
+    }
+
+    /// `window` placed at `to`, gliding there for `duration` from now on a
+    /// straight line, as `tiling.apply` places a window (`Solium::place`,
+    /// the call [`glide`] makes).
+    fn glide_to(
+        fixture: &mut Fixture,
+        window: &Window,
+        to: Rectangle<i32, Logical>,
+        duration: Duration,
+    ) {
+        let start = fixture.state.clock.now();
+        glide(
+            &mut fixture.state,
+            window,
+            to,
+            duration,
+            present::Curve::Linear,
+            start,
+        );
+        pump_all(fixture);
+    }
+
+    /// `window` moved by `by` at once, as one step of a drag's `sol.place`.
+    fn place_by(fixture: &mut Fixture, window: &Window, by: (i32, i32)) {
+        let pane = fixture.state.panes.id_of(window).expect("a pane");
+        let at = fixture.state.pane_outer_of(pane).expect("on screen");
+        glide_to(
+            fixture,
+            window,
+            Rectangle::new(at.loc + Point::from(by), at.size),
+            Duration::ZERO,
+        );
+    }
+
+    /// One pass's resolve and the slot's T2 places.
+    fn places_of(
+        fixture: &mut Fixture,
+        owner: crate::effect::plan::Owner,
+        slot: crate::effect::rules::Slot,
+    ) -> Vec<crate::effect::plan::T2Place> {
+        resolved(fixture).places(&owner, slot).to_vec()
+    }
+
+    /// `{ effect = "genie", progress = 0.5, … }` toward a strip below the
+    /// pane: a genie held half way, as `effects-check genie` holds one.
+    fn genie_half(fixture: &Fixture, pane: crate::pane::PaneId) -> String {
+        format!(
+            r#"{{ effect = "genie", progress = 0.5, axis = "down", to = {} }}"#,
+            below(fixture, pane)
+        )
+    }
+
+    /// **A gliding window's T2 place follows where it is drawn**, pass by
+    /// pass, not the place it glides to (Ruling F37, amended 2026-10-14,
+    /// live under motion and warps: the maintainer's capture of a blur
+    /// showing its destination's backdrop half way through a relayout).
+    #[test]
+    fn a_gliding_windows_t2_place_follows_its_drawn_rectangle() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Slot;
+        fx2_fixture!(fixture, "glide-place");
+        let (pane, window) = translucent_window(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur" } }"#,
+        );
+        let owner = Owner::Pane(pane, PaneSlot::Client);
+        let from = fixture.state.pane_outer_of(pane).expect("on screen");
+        let scale = fixture.state.scale_of(from);
+        let rest = places_of(&mut fixture, owner.clone(), Slot::Behind)[0].screen;
+        glide_to(
+            &mut fixture,
+            &window,
+            Rectangle::new(from.loc + Point::from((600, 0)), from.size),
+            Duration::from_millis(1000),
+        );
+        for step in 1..=4 {
+            fixture.state.clock.advance(Duration::from_millis(200));
+            let outer = fixture.state.pane_outer_of(pane).expect("on screen");
+            let along = fixture.state.drawn(pane, outer).rect.loc.x - f64::from(from.loc.x);
+            assert!(
+                along > 1.0 && along < 599.0,
+                "pass {step}: the glide is not under way, so nothing was tested"
+            );
+            let at = places_of(&mut fixture, owner.clone(), Slot::Behind)[0].screen;
+            assert!(
+                (f64::from(at.loc.x - rest.loc.x) - along * scale).abs() <= 1.0,
+                "pass {step}: the place is {} px along where the window is drawn {along} logical px along",
+                at.loc.x - rest.loc.x
+            );
+            assert_eq!(
+                at.size, rest.size,
+                "pass {step}: a glide from rest resized the place"
+            );
+        }
+        fixture.state.clock.advance(Duration::from_millis(400));
+        let landed = places_of(&mut fixture, owner, Slot::Behind)[0].screen;
+        assert!(
+            (f64::from(landed.loc.x - rest.loc.x) - 600.0 * scale).abs() <= 1.0,
+            "at rest the place is where the layout put it"
+        );
+    }
+
+    /// **A gliding window's T2 place is measured at the pass's one
+    /// instant**, the one the walk draws at, not at whatever the clock says
+    /// later in `prepare` (amended 2026-10-14, live under motion and warps:
+    /// a fast relayout's blur lagged its window by its speed times the
+    /// pass's own time). 600 px in 100 ms, 4 ms of `prepare` between the
+    /// warps' plan and the places: 24 px apart.
+    #[test]
+    fn a_gliding_windows_t2_place_is_measured_at_the_passs_instant() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Slot;
+        fx2_fixture!(fixture, "glide-instant");
+        let (pane, window) = translucent_window(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur" } }"#,
+        );
+        let owner = Owner::Pane(pane, PaneSlot::Client);
+        let from = fixture.state.pane_outer_of(pane).expect("on screen");
+        let scale = fixture.state.scale_of(from);
+        let rest = places_of(&mut fixture, owner.clone(), Slot::Behind)[0].screen;
+        glide_to(
+            &mut fixture,
+            &window,
+            Rectangle::new(from.loc + Point::from((600, 0)), from.size),
+            Duration::from_millis(100),
+        );
+        fixture.state.clock.advance(Duration::from_millis(30));
+        let _ = fixture.state.store.next_pass();
+        crate::render::plan_warps(&mut fixture.state);
+        let at = fixture.state.presented.at().expect("the pass's instant");
+        fixture.state.clock.advance(Duration::from_millis(4));
+        let mut slots = crate::render::build_slots(&mut fixture.state);
+        crate::render::record_boxes(&fixture.state, &mut slots);
+        let outer = fixture.state.pane_outer_of(pane).expect("on screen");
+        let walked = fixture.state.drawn_id_at(pane, outer, at).rect.loc.x - f64::from(from.loc.x);
+        let later = fixture.state.drawn(pane, outer).rect.loc.x - f64::from(from.loc.x);
+        assert!(
+            later - walked > 10.0,
+            "the clock did not move the glide, so nothing was tested"
+        );
+        let placed = slots.places(&owner, Slot::Behind)[0].screen;
+        assert!(
+            (f64::from(placed.loc.x - rest.loc.x) - walked * scale).abs() <= 1.0,
+            "the place is {} px along where the walk draws the window {walked} logical px along",
+            placed.loc.x - rest.loc.x
+        );
+    }
+
+    /// **A plain blur on a gliding window moves its crop and runs
+    /// nothing**: its key's box moves every pass, its memo and xray do not,
+    /// and its crop of the memo moves with the window (amended 2026-10-14).
+    #[test]
+    fn a_plain_blur_on_a_gliding_window_moves_its_crop_and_runs_nothing() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Slot;
+        fx2_fixture!(fixture, "glide-crop");
+        let (pane, window) = translucent_window(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur" } }"#,
+        );
+        let owner = Owner::Pane(pane, PaneSlot::Client);
+        assert!(matches!(
+            crate::render::t2_work(only_user_chain(&fixture.state).memo().expect("T2"), true),
+            crate::render::T2Work::Crop(_)
+        ));
+        let from = fixture.state.pane_outer_of(pane).expect("on screen");
+        glide_to(
+            &mut fixture,
+            &window,
+            Rectangle::new(from.loc + Point::from((600, 0)), from.size),
+            Duration::from_millis(1000),
+        );
+        fixture.state.clock.advance(Duration::from_millis(300));
+        let one = t2_key_of(&mut fixture, owner.clone(), Slot::Behind).expect("a key");
+        let crop_one = places_of(&mut fixture, owner.clone(), Slot::Behind)[0].map;
+        fixture.state.clock.advance(Duration::from_millis(300));
+        let two = t2_key_of(&mut fixture, owner.clone(), Slot::Behind).expect("a key");
+        let crop_two = places_of(&mut fixture, owner, Slot::Behind)[0].map;
+        assert_ne!(
+            one.padded, two.padded,
+            "the box did not move with the glide"
+        );
+        assert_eq!(
+            (one.memo, one.xray),
+            (two.memo, two.xray),
+            "a glide moved the memo or the xray"
+        );
+        assert!(
+            crop_two.offset[0] > crop_one.offset[0],
+            "the crop did not move with the window"
+        );
+    }
+
+    /// **A suffix re-runs while its window glides, and not at rest**
+    /// (`blur-tint`: the blur is the memo, the tint the suffix; amended
+    /// 2026-10-14).
+    #[test]
+    fn a_suffix_reruns_while_gliding_and_not_at_rest() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Slot;
+        fx2_fixture!(fixture, "glide-suffix");
+        let (pane, window) = translucent_window(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur-tint" } }"#,
+        );
+        let owner = Owner::Pane(pane, PaneSlot::Client);
+        assert_eq!(
+            crate::render::t2_work(only_user_chain(&fixture.state).memo().expect("T2"), true),
+            crate::render::T2Work::Suffix
+        );
+        let from = fixture.state.pane_outer_of(pane).expect("on screen");
+        glide_to(
+            &mut fixture,
+            &window,
+            Rectangle::new(from.loc + Point::from((600, 0)), from.size),
+            Duration::from_millis(1000),
+        );
+        let mut t2 = crate::effect::store::T2State::default();
+        for step in 1..=4 {
+            fixture.state.clock.advance(Duration::from_millis(200));
+            let key = t2_key_of(&mut fixture, owner.clone(), Slot::Behind).expect("a key");
+            assert!(
+                t2.needs_run(key),
+                "pass {step}: the suffix did not re-run while its window glided"
+            );
+            t2.key = Some(key);
+        }
+        fixture.state.clock.advance(Duration::from_millis(400));
+        t2.key = t2_key_of(&mut fixture, owner.clone(), Slot::Behind);
+        fixture.state.clock.advance(Duration::from_millis(100));
+        let still = t2_key_of(&mut fixture, owner, Slot::Behind).expect("a key");
+        assert!(!t2.needs_run(still), "the suffix re-ran at rest");
+    }
+
+    /// **A dragged window re-runs its suffix and not its memo**: its box in
+    /// the monitor moved, the xray under it did not.
+    #[test]
+    fn a_dragged_windows_suffix_reruns_and_its_memo_does_not() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Slot;
+        fx2_fixture!(fixture, "drag-suffix");
+        let (pane, window) = translucent_window(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur-tint" } }"#,
+        );
+        let owner = Owner::Pane(pane, PaneSlot::Client);
+        let before = t2_key_of(&mut fixture, owner.clone(), Slot::Behind).expect("a key");
+        place_by(&mut fixture, &window, (40, 0));
+        let after = t2_key_of(&mut fixture, owner, Slot::Behind).expect("a key");
+        assert_ne!(
+            after.padded, before.padded,
+            "the suffix's key did not move with the window"
+        );
+        assert_eq!(after.memo, before.memo, "the memo moved with a window");
+        assert_eq!(after.xray, before.xray, "the xray moved with a window");
+    }
+
+    /// **A self effect is kept while its window moves without drawing**,
+    /// and re-runs on every commit while it moves (R4: live content); the
+    /// self capture is the same for any `source = "self"` chain (amended
+    /// 2026-10-14).
+    #[test]
+    fn a_self_effect_is_kept_while_moved_and_reruns_on_every_commit() {
+        fx2_fixture!(fixture, "drag-self");
+        let (_pane, window) = translucent_window(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "replace", effect = { "blur", source = "self" } } }"#,
+        );
+        let mut capture = crate::keyed::Capture::<u32>::default();
+        capture.drawn(1, self_key(&mut fixture, &window, 64));
+        place_by(&mut fixture, &window, (40, 0));
+        assert!(
+            !capture.stale(&self_key(&mut fixture, &window, 64)),
+            "a move without a commit recaptured"
+        );
+        for _ in 0..3 {
+            commit_again(&mut fixture, &window);
+            place_by(&mut fixture, &window, (10, 0));
+            assert!(
+                capture.stale(&self_key(&mut fixture, &window, 64)),
+                "a commit while moving was not recaptured"
+            );
+            capture.drawn(1, self_key(&mut fixture, &window, 64));
+        }
+    }
+
+    /// **A warped pane's behind slot is drawn beneath its warp, live**
+    /// (Ruling F37, amended 2026-10-14, live under motion and warps): held
+    /// half way through a genie, its client's behind slot is beneath, and
+    /// its place is the bounds of the client's cells of the genie's mesh,
+    /// reaching below the pane, not the pane at rest; its front slot stays
+    /// in the capture at rest; and with `effects.xray.warped = "rest"`
+    /// nothing is beneath and the place is at rest, the first draft's
+    /// behaviour ([16] decision 3).
+    #[test]
+    fn a_warped_panes_behind_slot_is_drawn_beneath_its_warp() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Slot;
+        fx2_fixture!(fixture, "warp-beneath");
+        let (pane, _window) = translucent_window(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{
+                { match = "*", part = "client", slot = "behind", effect = "blur" },
+                { match = "*", part = "client", slot = "front", effect = "blur-tint" },
+            }"#,
+        );
+        let owner = Owner::Pane(pane, PaneSlot::Client);
+        let flat_behind = places_of(&mut fixture, owner.clone(), Slot::Behind)[0].screen;
+        let flat_front = places_of(&mut fixture, owner.clone(), Slot::Front)[0].screen;
+        let genie = genie_half(&fixture, pane);
+        present_deform(&mut fixture, pane, &genie);
+        let slots = resolved(&mut fixture);
+        assert!(
+            matches!(
+                fixture.state.presented.get(pane),
+                Some(crate::render::Planned::Warp { .. })
+            ),
+            "the genie is not planned, so nothing was tested"
+        );
+        assert!(
+            slots.is_beneath(&owner, Slot::Behind),
+            "a genied pane's behind slot stayed in its capture"
+        );
+        assert!(
+            !slots.is_beneath(&owner, Slot::Front),
+            "a front slot left the capture"
+        );
+        let bent = slots.places(&owner, Slot::Behind)[0].screen;
+        assert!(
+            bent.loc.y + bent.size.h > flat_behind.loc.y + flat_behind.size.h,
+            "the behind slot reads the backdrop where the pane rests, not down the funnel"
+        );
+        assert_eq!(
+            slots.places(&owner, Slot::Front)[0].screen,
+            flat_front,
+            "a front slot left its rest"
+        );
+        fixture.state.effect_settings.xray.warped = crate::effect::xray::Warped::Rest;
+        let slots = resolved(&mut fixture);
+        assert!(
+            !slots.is_beneath(&owner, Slot::Behind),
+            "warped = rest drew the slot beneath"
+        );
+        assert_eq!(
+            slots.places(&owner, Slot::Behind)[0].screen,
+            flat_behind,
+            "warped = rest moved the place"
+        );
+    }
+
+    /// **Under `straddle = "own"` a warped slot across two monitors stays
+    /// in its capture**: its one place cannot feed the beneath draw on the
+    /// other monitor, where the capture's hole would show the screen below
+    /// (amended 2026-10-14, live under motion and warps).
+    #[test]
+    fn a_warped_slot_across_two_monitors_under_own_stays_in_its_capture() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Slot;
+        fx2_fixture!(fixture, "warp-own");
+        two_monitors(&mut fixture);
+        let (pane, window) = translucent_window(&mut fixture);
+        straddle(&mut fixture, &window);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur" } }"#,
+        );
+        let owner = Owner::Pane(pane, PaneSlot::Client);
+        let genie = genie_half(&fixture, pane);
+        present_deform(&mut fixture, pane, &genie);
+        assert!(
+            resolved(&mut fixture).is_beneath(&owner, Slot::Behind),
+            "under each the straddling genie is not beneath, so nothing was tested"
+        );
+        fixture.state.effect_settings.xray.straddle = crate::effect::xray::Straddle::Own;
+        assert!(
+            !resolved(&mut fixture).is_beneath(&owner, Slot::Behind),
+            "under own a slot with one place was drawn beneath two monitors"
+        );
+    }
+
+    /// **Two parts that cannot both hold their memo do not trade it while
+    /// their keys move every pass** (Task 42's re-review, carried into Task
+    /// 44): a window's client and its pane, each with its own backdrop blur
+    /// on one monitor and cut, under a budget that holds one memo; their
+    /// memo keys move every pass, as an animated prefix uniform moves them,
+    /// the lesser of the two flipping between them; the part admitted first
+    /// keeps the memo, since `want_t2` says it read it last pass.
+    #[test]
+    fn two_parts_under_a_one_memo_budget_do_not_trade_it_as_their_keys_move() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Slot;
+        const MIB: u64 = 1024 * 1024;
+        fx2_fixture!(fixture, "memo-no-trade");
+        let (pane, _window) = translucent_window(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur" },
+                 { match = "*", part = "pane", slot = "behind", effect = "blur" } }"#,
+        );
+        let owners = [
+            Owner::Pane(pane, PaneSlot::Client),
+            Owner::Pane(pane, PaneSlot::Pane),
+        ];
+        let monitor = first_monitor(&fixture);
+        let slots = resolved(&mut fixture);
+        let rules: Vec<_> = owners
+            .iter()
+            .map(|owner| {
+                slots
+                    .key(owner, Slot::Behind)
+                    .expect("the premise: each part's slot is wanted")
+            })
+            .collect();
+        assert_ne!(rules[0], rules[1], "the premise: two rules");
+        for owner in &owners {
+            assert_eq!(
+                slots
+                    .places(owner, Slot::Behind)
+                    .iter()
+                    .map(|place| place.monitor.clone())
+                    .collect::<Vec<_>>(),
+                vec![monitor.clone()],
+                "the premise: one place, on the one monitor"
+            );
+        }
+        assert_eq!(
+            fixture.state.memos.len(),
+            1,
+            "the premise: one blur is one memo, with no budget"
+        );
+        let one = fixture.state.memos.held_bytes();
+        let budget = one.div_ceil(MIB);
+        assert!(
+            2 * one > budget * MIB,
+            "the premise: {budget} MiB holds one memo of {one} bytes, not two"
+        );
+        fixture.state.effect_settings.memo.budget_mib = budget;
+        let mut holder: Option<usize> = None;
+        for pass in 0..1000_u64 {
+            // The lesser key is the client's on even passes, the pane's on
+            // odd ones, and no key comes back.
+            let (low, high) = (2 * pass + 1, 2 * pass + 2);
+            let keys = if pass % 2 == 0 {
+                [low, high]
+            } else {
+                [high, low]
+            };
+            for (rule, key) in rules.iter().zip(keys) {
+                fixture
+                    .state
+                    .chains
+                    .get_mut_for_test(*rule)
+                    .expect("bound")
+                    .set_memo_keys_for_test(vec![key]);
+            }
+            let slots = resolved(&mut fixture);
+            let shared: Vec<usize> = owners
+                .iter()
+                .enumerate()
+                .filter(|(_, owner)| slots.shared_on(owner, Slot::Behind, &monitor))
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(shared.len(), 1, "pass {pass}: one memo is held");
+            match holder {
+                None => holder = Some(shared[0]),
+                Some(was) => assert_eq!(shared[0], was, "pass {pass}: the memo changed hands"),
+            }
+        }
+    }
+
+    /// **A part that left a monitor gives its T2 result there back** as
+    /// `run_slots` runs it (`effect::store::SlotState::keep_t2`): a window
+    /// across two monitors has a T2 state on each; moved onto one, a pass
+    /// keeps only that monitor's.
+    #[test]
+    fn a_part_that_left_a_monitor_gives_its_t2_result_there_back() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Slot;
+        fx2_fixture!(fixture, "t2-left");
+        two_monitors(&mut fixture);
+        let (pane, window) = translucent_window(&mut fixture);
+        straddle(&mut fixture, &window);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur" } }"#,
+        );
+        let owner = Owner::Pane(pane, PaneSlot::Client);
+        let held_on = |fixture: &Fixture| -> Vec<String> {
+            fixture
+                .state
+                .store
+                .get(&owner, Slot::Behind)
+                .map(|held| held.t2.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+        let _slots = resolved(&mut fixture);
+        assert_eq!(
+            held_on(&fixture).len(),
+            2,
+            "the premise: a T2 state on each monitor"
+        );
+        fixture
+            .state
+            .space
+            .map_element(window.clone(), (100, 100), false);
+        fixture.state.space.refresh();
+        pump_all(&mut fixture);
+        let mut slots = resolved(&mut fixture);
+        assert_eq!(
+            slots.places(&owner, Slot::Behind).len(),
+            1,
+            "the premise: the window is on one monitor"
+        );
+        let Solium {
+            store,
+            effects,
+            chains,
+            memos,
+            xrays,
+            ..
+        } = &mut fixture.state;
+        let mut cx = crate::render::RunCx {
+            store,
+            effects: &*effects,
+            chains,
+            masked: None,
+            now: 0.0,
+            pass: 2,
+            memos,
+            xrays: &*xrays,
+            motion: (std::time::Duration::ZERO, 0.0),
+            waited: false,
+        };
+        let mut runner = crate::render::tests::NoGpu::default();
+        for nest in [crate::render::Nest::Inner, crate::render::Nest::Whole] {
+            crate::render::run_slots(
+                &mut cx,
+                &mut crate::pool::Pool::new(0),
+                &mut runner,
+                &mut slots,
+                &crate::effect::store::Drawn::default(),
+                nest,
+            );
+        }
+        assert_eq!(
+            held_on(&fixture),
+            vec![first_monitor(&fixture)],
+            "the monitor the window left kept its T2 result"
+        );
+    }
+
+    /// **The self capture is padded by the effect's reach**: client pixels
+    /// plus twice the reach, each way, the client's corner at the reach.
+    #[test]
+    fn the_self_capture_is_padded_by_the_effects_reach() {
+        use smithay::backend::renderer::test::DummyRenderer;
+        fx2_fixture!(fixture, "self-padded");
+        let (_pane, window) = one_window(&mut fixture);
+        let source = crate::offscreen::PartSource::Client(&window);
+        let size = crate::offscreen::part_size(&fixture.state, &source, 1.0, 6).expect("a size");
+        let plain = crate::offscreen::client_pixels(
+            crate::render::flat(&fixture.state, &window)
+                .expect("flat")
+                .client
+                .size,
+            1.0,
+        );
+        assert_eq!(size, (plain.w + 12, plain.h + 12).into());
+        let elements = crate::offscreen::part_elements(&mut DummyRenderer, &source, 6, 1.0);
+        let corner = elements.first().map(|element| {
+            smithay::backend::renderer::element::Element::geometry(
+                element,
+                smithay::utils::Scale::from(1.0),
+            )
+            .loc
+        });
+        assert_eq!(
+            corner,
+            Some((6, 6).into()),
+            "the client's corner is not at the pad"
+        );
+    }
+
+    /// **Every wanted slot has its part's box, padded by its chain's reach**:
+    /// a client's, a scripted surface's on its monitor and a layer
+    /// surface's, each its own pixels plus twice the reach each way, the
+    /// part inside it; with no rule, none.
+    #[test]
+    fn every_wanted_slot_has_its_part_box_padded_by_its_reach() {
+        use crate::effect::plan::{Owner, PaneSlot, PartBox};
+        use crate::effect::rules::Slot;
+        use smithay::reexports::wayland_server::Resource as _;
+        fx2_fixture!(fixture, "self-boxes");
+        let (pane, window) = one_window(&mut fixture);
+        with_tint_folder(&mut fixture);
+        let _ = fixture
+            .state
+            .surfaces
+            .declare(crate::scripted::Declaration::for_test(
+                "dock",
+                std::path::PathBuf::from("dock.qml"),
+                crate::scripted::Layer::Top,
+                crate::scripted::On::EveryMonitor,
+            ));
+        let _bar = bar(
+            &mut fixture.display,
+            &mut fixture.state,
+            &fixture.conn,
+            &fixture.client,
+            &fixture.qh,
+            30,
+        );
+        let mut none = crate::render::build_slots(&mut fixture.state);
+        crate::render::record_boxes(&fixture.state, &mut none);
+        assert!(
+            none.boxed(&Owner::Pane(pane, PaneSlot::Client), Slot::Behind)
+                .is_none()
+        );
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = { "tint", reach = 6 } },
+                 { match = "*", part = "surface:dock", slot = "behind", effect = { "tint", reach = 2.5 } },
+                 { match = "*", part = "layer_shell:restore-*", slot = "front", effect = "tint" } }"#,
+        );
+        let mut slots = crate::render::build_slots(&mut fixture.state);
+        crate::render::record_boxes(&fixture.state, &mut slots);
+        let client = crate::render::flat(&fixture.state, &window)
+            .expect("flat")
+            .client
+            .size;
+        assert_eq!(
+            slots.boxed(&Owner::Pane(pane, PaneSlot::Client), Slot::Behind),
+            Some(PartBox::around(
+                crate::offscreen::client_pixels(client, 1.0),
+                6,
+                [0.0; 4]
+            ))
+        );
+        let dock = fixture.state.surfaces.named("dock").expect("declared");
+        assert_eq!(
+            slots.boxed(
+                &Owner::Surface(dock, "fx2-self-boxes".to_owned()),
+                Slot::Behind
+            ),
+            Some(PartBox::around((1920, 1080).into(), 3, [0.0; 4])),
+            "a reach of 2.5 pads by a whole pixel more"
+        );
+        let (layer, geometry) = fixture
+            .state
+            .space
+            .outputs()
+            .find_map(|output| {
+                let map = smithay::desktop::layer_map_for_output(output);
+                let layer = map.layers().next()?.clone();
+                let geometry = map.layer_geometry(&layer)?;
+                Some((layer, geometry))
+            })
+            .expect("the bar is mapped");
+        assert_eq!(
+            slots.boxed(&Owner::LayerShell(layer.wl_surface().id()), Slot::Front),
+            Some(PartBox::around(
+                crate::offscreen::client_pixels(geometry.size, 1.0),
+                0,
+                [0.0; 4]
+            ))
+        );
+    }
+
+    /// **Only a chain reading its part asks for a capture**: a T1 chain
+    /// (`tint` reads `self`) does, a T0 one (`ring` reads only `shape`)
+    /// does not, wherever it is.
+    #[test]
+    fn only_a_chain_reading_its_part_asks_for_a_capture() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Slot;
+        fx2_fixture!(fixture, "self-only-t1");
+        let (pane, _window) = one_window(&mut fixture);
+        with_tint_folder(&mut fixture);
+        let place = fixture.scratch.clone().expect("the tint folder's place");
+        crate::effect::host::tests::folder(
+            &place,
+            "ring",
+            "return { api = 1, inputs = { 'shape' }, frag = 'effect.frag' }",
+            &[(
+                "effect.frag",
+                "vec4 sol_effect(vec2 uv) { return vec4(sol_shape(uv)); }\n",
+            )],
+        );
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "tint" },
+                 { match = "*", part = "client", slot = "front", effect = "ring" },
+                 { match = "*", part = "pane", slot = "behind", effect = "ring" } }"#,
+        );
+        let slots = crate::render::build_slots(&mut fixture.state);
+        assert_eq!(slots.wants().count(), 3, "the premise: three slots wanted");
+        let asked: Vec<_> = crate::render::self_inputs(&fixture.state, &slots)
+            .into_iter()
+            .map(|input| (input.owner, input.slot))
+            .collect();
+        assert_eq!(asked, [(Owner::Pane(pane, PaneSlot::Client), Slot::Behind)]);
+    }
+
+    /// **A pane no monitor shows is resolved for nothing**, the cull
+    /// `prepare` makes: a window parked a screen away, as a hidden
+    /// workspace's are, gathers no fact and wants no slot though a rule
+    /// matches it, while the window on screen does.
+    #[test]
+    fn a_pane_no_monitor_shows_gathers_no_fact_and_wants_no_slot() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Slot;
+        fx2_fixture!(fixture, "rule-offscreen");
+        let (shown, _) = one_window(&mut fixture);
+        let parked = open_kept(&mut fixture);
+        fixture
+            .state
+            .map_stacked(parked.clone(), (-5000, 300), false);
+        fixture.state.sync_panes();
+        let parked = fixture.state.panes.id_of(&parked).expect("a pane");
+        with_tint_folder(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "tint" } }"#,
+        );
+        let slots = crate::render::build_slots(&mut fixture.state);
+        assert!(slots.wanted(&Owner::Pane(shown, PaneSlot::Client), Slot::Behind));
+        assert!(!slots.wanted(&Owner::Pane(parked, PaneSlot::Client), Slot::Behind));
+        assert_eq!(
+            slots.facts_gathered(),
+            1,
+            "the parked window's facts were gathered"
         );
     }
 
@@ -19910,6 +23955,34 @@ end)
             );
         }
 
+        /// **A window that went keeps its app id for its frame**: what its
+        /// frame is told as `appId` while it fades is what it was told while
+        /// the window was here, so a bar showing the application's icon fades
+        /// out with it, as it keeps its title
+        /// (`a_window_that_left_is_nobodys_to_find`).
+        #[test]
+        fn a_window_that_left_keeps_its_app_id_for_its_frame() {
+            let mut desk = Desk::new();
+            let opened = desk.open_surface();
+            opened.toplevel.set_app_id("the-app-that-went".to_owned());
+            desk.pump();
+            land(&mut desk);
+            assert_eq!(
+                desk.state.pane_app_id(opened.pane),
+                "the-app-that-went",
+                "the premise: the frame is told the client's app id"
+            );
+
+            opened.toplevel.destroy();
+            desk.pump();
+            let _ = left_of(&desk.state, opened.pane);
+            assert_eq!(
+                desk.state.pane_app_id(opened.pane),
+                "the-app-that-went",
+                "the frame fading out lost its app id"
+            );
+        }
+
         /// **#126: a window whose client has gone is drawn, and is nothing
         /// else.**
         ///
@@ -24989,7 +29062,7 @@ end)
         /// elements. The pointer is asked of the hit tests themselves.
         mod stacking {
             use super::*;
-            use crate::render::Stacked;
+            use crate::render::{Stacked, Walked};
             use crate::scripted::Layer as Scripted;
             use smithay::backend::input::ButtonState;
             use zwlr_layer_shell_v1::Layer as Client;
@@ -25004,6 +29077,8 @@ end)
                 Script(crate::scripted::SurfaceId),
                 /// A pane.
                 Pane(crate::pane::PaneId),
+                /// An effect's slot beside a surface.
+                Effect(crate::effect::rules::Slot),
             }
 
             /// The desk's monitor.
@@ -25016,21 +29091,42 @@ end)
                 drawn_by(desk, screen())
             }
 
-            /// What the monitor at `monitor` draws, topmost first.
+            /// What the monitor at `monitor` draws, topmost first, through
+            /// the walk `elements` draws with, no slot ready: so every
+            /// stacking test is the walk's guard that with no slot nothing
+            /// moves.
             fn drawn_by(desk: &Desk, monitor: Rectangle<i32, Logical>) -> Vec<Seen> {
-                crate::render::stacked(&desk.state, monitor, desk.state.clock.now())
-                    .into_iter()
-                    .flat_map(|each| match each {
-                        Stacked::Layer(surface, _) => {
-                            vec![Seen::Layer(surface.wl_surface().id().protocol_id())]
+                drawn_with(desk, monitor, &|_, _| false)
+            }
+
+            /// [`drawn_by`], with the slots `ready` says are ready.
+            fn drawn_with(
+                desk: &Desk,
+                monitor: Rectangle<i32, Logical>,
+                ready: &dyn Fn(&crate::effect::plan::Owner, crate::effect::rules::Slot) -> bool,
+            ) -> Vec<Seen> {
+                let output = desk
+                    .state
+                    .output_for(monitor)
+                    .map(|output| output.name())
+                    .unwrap_or_default();
+                let mut drawn = Vec::new();
+                crate::render::stacked_walk(
+                    crate::render::stacked(&desk.state, monitor, desk.state.clock.now()),
+                    &output,
+                    ready,
+                    |walked| match walked {
+                        Walked::Stacked(Stacked::Layer(surface, _)) => {
+                            drawn.push(Seen::Layer(surface.wl_surface().id().protocol_id()));
                         }
-                        Stacked::Surface(id, _, _) => vec![Seen::Script(id)],
-                        Stacked::Panes(nodes) => nodes
-                            .into_iter()
-                            .map(|((pane, ..), _)| Seen::Pane(pane))
-                            .collect(),
-                    })
-                    .collect()
+                        Walked::Stacked(Stacked::Surface(id, _, _)) => drawn.push(Seen::Script(id)),
+                        Walked::Stacked(Stacked::Panes(nodes)) => {
+                            drawn.extend(nodes.into_iter().map(|((pane, ..), _)| Seen::Pane(pane)))
+                        }
+                        Walked::Slot(_, slot, ..) => drawn.push(Seen::Effect(slot)),
+                    },
+                );
+                drawn
             }
 
             /// Whether `top` is drawn over `bottom`, both being drawn.
@@ -25273,6 +29369,124 @@ end)
                 );
             }
 
+            /// **A layer-shell `behind` slot is drawn just under its surface,
+            /// and a scripted surface's `front` just over it.**
+            #[test]
+            fn a_layer_shell_behind_slot_is_drawn_just_under_its_surface_and_a_surface_front_slot_just_over_it()
+             {
+                use crate::effect::plan::Owner;
+                use crate::effect::rules::Slot;
+                let mut desk = Desk::new();
+                let (bar, _bar) = layer_surface(&mut desk, Client::Top, None, 30, 30);
+                let bar_id = id(&bar);
+                let script = scripted(&mut desk, "strip", Scripted::Bottom, strip(0, 1920));
+                let ready = |owner: &Owner, slot: Slot| match owner {
+                    Owner::LayerShell(id) => id.protocol_id() == bar_id && slot == Slot::Behind,
+                    Owner::Surface(id, _) => *id == script && slot == Slot::Front,
+                    Owner::Pane(..) => false,
+                };
+                let drawn = drawn_with(&desk, screen(), &ready);
+                let at = |seen| drawn.iter().position(|each| *each == seen).expect("drawn");
+                assert_eq!(
+                    at(Seen::Effect(Slot::Behind)),
+                    at(Seen::Layer(bar_id)) + 1,
+                    "{drawn:?}"
+                );
+                assert_eq!(
+                    at(Seen::Effect(Slot::Front)) + 1,
+                    at(Seen::Script(script)),
+                    "{drawn:?}"
+                );
+            }
+
+            /// **Every failure leaves a layer surface and a scripted surface
+            /// drawn**: the stacked walk with failing rules on both is the
+            /// walk with none (the owners `every_failure_leaves_the_part_drawn`
+            /// cannot make).
+            #[test]
+            fn every_failure_leaves_layer_and_scripted_surfaces_drawn() {
+                use crate::effect::plan::Owner;
+                use crate::effect::rules::Slot;
+                let mut desk = Desk::new();
+                let (bar, _bar) = layer_surface(&mut desk, Client::Top, None, 30, 30);
+                let script = scripted(&mut desk, "strip", Scripted::Bottom, strip(0, 1920));
+                let plain = drawn(&desk);
+                let fixtures = std::path::Path::new(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/effects"
+                ));
+                desk.state.effects =
+                    crate::effect::host::Host::new(crate::effect::host::Library::with(
+                        Some(fixtures.to_owned()),
+                        fixtures.join("none"),
+                    ));
+                let rules = r#"{ { match = "*", part = "layer_shell:*", slot = "behind", effect = "ring" },
+                                 { match = "*", part = "layer_shell:*", slot = "replace", effect = "fail-compile" },
+                                 { match = "*", part = "surface:strip", slot = "front", effect = "ring" },
+                                 { match = "*", part = "surface:strip", slot = "replace", effect = "fail-compile" } }"#;
+                desk.state.apply_effects(Ok(
+                    crate::effect::rules::parse(&tree(rules)).expect("parses")
+                ));
+                desk.state
+                    .effects
+                    .compile_pending(&mut crate::effect::host::tests::Refusing);
+                let mut slots = crate::render::build_slots(&mut desk.state);
+                let bar_id = id(&bar);
+                let mut owners: Vec<(bool, Slot)> = slots
+                    .wants()
+                    .map(|(owner, slot, _)| match owner {
+                        Owner::LayerShell(surface) => (surface.protocol_id() == bar_id, slot),
+                        Owner::Surface(surface, _) => (*surface == script, slot),
+                        Owner::Pane(..) => (false, slot),
+                    })
+                    .collect();
+                owners.sort_by_key(|(_, slot)| format!("{slot:?}"));
+                assert_eq!(
+                    owners.len(),
+                    4,
+                    "the premise: both surfaces' two slots are wanted, and nothing else: {owners:?}"
+                );
+                assert!(owners.iter().all(|(theirs, _)| *theirs), "{owners:?}");
+                crate::render::record_boxes(&desk.state, &mut slots);
+                let Solium {
+                    store,
+                    effects,
+                    chains,
+                    memos,
+                    xrays,
+                    ..
+                } = &mut desk.state;
+                let mut cx = crate::render::RunCx {
+                    store,
+                    effects: &*effects,
+                    chains,
+                    masked: None,
+                    now: 0.0,
+                    pass: 1,
+                    memos,
+                    xrays: &*xrays,
+                    motion: (std::time::Duration::ZERO, 0.0),
+                    waited: false,
+                };
+                let mut runner = crate::render::tests::NoGpu::default();
+                crate::render::run_slots(
+                    &mut cx,
+                    &mut crate::pool::Pool::new(0),
+                    &mut runner,
+                    &mut slots,
+                    &crate::effect::store::Drawn::default(),
+                    crate::render::Nest::Inner,
+                );
+                assert_eq!(
+                    runner.runs, 4,
+                    "the premise: every chain was run, and failed"
+                );
+                assert_eq!(
+                    drawn_with(&desk, screen(), &|owner, slot| slots.is_ready(owner, slot)),
+                    plain
+                );
+            }
+
             /// **Below the windows, by layer too**: a client's background
             /// mapped after its bottom surface stays under it, and at each
             /// layer the client's surface is over the script's -- and the
@@ -25323,6 +29537,169 @@ end)
                     (None, None, None, Some(script_bottom)),
                     "(on the client's bottom surface: the surface the pointer reaches, the \
                      script's surface offered the press; the same beside it)"
+                );
+            }
+
+            /// **The scenes phase renders what a wanted cut holds and
+            /// nothing else** (Ruling F31): nothing with no cut wanted; the
+            /// script's wallpaper alone for a wallpaper cut on the desk's
+            /// monitor; the dock on `bottom` too for a bottom cut; never the
+            /// bar on `top`.
+            #[test]
+            fn the_scenes_phase_renders_only_what_a_wanted_cut_holds() {
+                use crate::effect::xray::Cut;
+                use crate::render::SceneRef;
+                let mut desk = Desk::new();
+                let _bar = scripted(&mut desk, "bar", Scripted::Top, strip(0, 1920));
+                let dock = scripted(&mut desk, "dock", Scripted::Bottom, strip(0, 1920));
+                let wallpaper = scripted(&mut desk, "wallpaper", Scripted::Background, screen());
+                assert!(crate::render::scenes_needed(&desk.state).is_empty());
+                let monitor = desk
+                    .state
+                    .output_for(screen())
+                    .map(|output| output.name())
+                    .expect("the desk's monitor");
+                desk.state.xrays.want(&monitor, Cut::Background);
+                assert_eq!(
+                    crate::render::scenes_needed(&desk.state),
+                    vec![SceneRef::Surface(wallpaper, monitor.clone())]
+                );
+                desk.state.xrays.clear_wants();
+                desk.state.xrays.want(&monitor, Cut::Bottom);
+                assert_eq!(
+                    crate::render::scenes_needed(&desk.state),
+                    vec![
+                        SceneRef::Surface(dock, monitor.clone()),
+                        SceneRef::Surface(wallpaper, monitor)
+                    ]
+                );
+            }
+
+            /// **A T2 rule on the background wants no slot** (Ruling F29):
+            /// nothing lies below a part on `background`, so its blur reads
+            /// nothing and is no problem either; the same rule on a `bottom`
+            /// surface, which reads the wallpaper, wants its slot.
+            #[test]
+            fn a_t2_rule_on_the_background_wants_no_slot() {
+                use crate::effect::plan::Owner;
+                use crate::effect::rules::Slot;
+                let mut desk = Desk::new();
+                let dock = scripted(&mut desk, "dock", Scripted::Bottom, strip(0, 1920));
+                let wallpaper = scripted(&mut desk, "wallpaper", Scripted::Background, screen());
+                desk.state.apply_effects(Ok(crate::effect::rules::parse(&tree(
+                    r#"{ { match = "*", part = "surface:dock", slot = "behind", effect = "blur" },
+                         { match = "*", part = "surface:wallpaper", slot = "behind", effect = "blur" } }"#,
+                ))
+                .expect("parses")));
+                assert!(
+                    desk.state.effects.problems().is_empty(),
+                    "{:?}",
+                    desk.state.effects.problems()
+                );
+                let monitor = desk
+                    .state
+                    .output_for(screen())
+                    .map(|output| output.name())
+                    .expect("the desk's monitor");
+                let slots = crate::render::build_slots(&mut desk.state);
+                assert!(
+                    slots.wanted(&Owner::Surface(dock, monitor.clone()), Slot::Behind),
+                    "the dock reads the wallpaper"
+                );
+                assert!(
+                    !slots.wanted(&Owner::Surface(wallpaper, monitor), Slot::Behind),
+                    "the wallpaper has nothing below it to read"
+                );
+            }
+
+            /// **xray holds the cut's bands and nothing else**: the
+            /// wallpaper and, with `bottom`, the desktop's widgets, the
+            /// client's over the script's, in `stacked`'s order; never a
+            /// pane, a `top` or `overlay` surface, or the pointer. And
+            /// `band_of` names each entry's band.
+            #[test]
+            fn xray_holds_the_cuts_bands_and_nothing_else() {
+                use crate::effect::xray::{Cut, SessionLayers, XraySource as _};
+                use crate::stack::{Band, Owner as Whose};
+                let mut desk = Desk::new();
+                let opened = desk.open_surface();
+                let window = window_of(&desk, opened.pane);
+                desk.state.space.map_element(window, (600, 500), false);
+                desk.state.space.refresh();
+                landed(&mut desk);
+                let _bar = scripted(&mut desk, "bar", Scripted::Top, strip(0, 1920));
+                let dock = scripted(&mut desk, "dock", Scripted::Bottom, strip(0, 1920));
+                let wallpaper = scripted(&mut desk, "wallpaper", Scripted::Background, screen());
+                let (_top, _top_layer) = layer_surface(&mut desk, Client::Top, None, 30, 0);
+                let (_overlay, _overlay_layer) =
+                    layer_surface(&mut desk, Client::Overlay, Some(200), 30, 0);
+                let (widgets, _widgets) =
+                    layer_surface(&mut desk, Client::Bottom, Some(200), 30, 0);
+                let (backdrop, _backdrop) =
+                    layer_surface(&mut desk, Client::Background, None, 30, 0);
+                let output = desk.state.output_for(screen()).expect("the desk's monitor");
+                let seen = |entries: &[Stacked]| -> Vec<Seen> {
+                    entries
+                        .iter()
+                        .flat_map(|each| match each {
+                            Stacked::Layer(surface, _) => {
+                                vec![Seen::Layer(surface.wl_surface().id().protocol_id())]
+                            }
+                            Stacked::Surface(id, ..) => vec![Seen::Script(*id)],
+                            Stacked::Panes(nodes) => nodes
+                                .iter()
+                                .map(|((pane, ..), _)| Seen::Pane(*pane))
+                                .collect(),
+                        })
+                        .collect()
+                };
+                let background = SessionLayers.entries(&desk.state, &output, Cut::Background);
+                let bottom = SessionLayers.entries(&desk.state, &output, Cut::Bottom);
+                assert_eq!(
+                    seen(&background),
+                    vec![Seen::Layer(id(&backdrop)), Seen::Script(wallpaper)],
+                    "the wallpaper alone, the client's over the script's"
+                );
+                assert_eq!(
+                    seen(&bottom),
+                    vec![
+                        Seen::Layer(id(&widgets)),
+                        Seen::Script(dock),
+                        Seen::Layer(id(&backdrop)),
+                        Seen::Script(wallpaper),
+                    ],
+                    "and the desktop's widgets over it"
+                );
+                assert!(background.iter().all(|each| matches!(
+                    crate::render::band_of(&desk.state, each),
+                    Band::Layer(Scripted::Background, _)
+                )));
+                assert!(bottom.iter().all(|each| !matches!(each, Stacked::Panes(_))));
+                let all = crate::render::stacked(&desk.state, screen(), desk.state.clock.now());
+                let order: Vec<&Stacked> =
+                    all.iter().filter(|each| bottom.contains(each)).collect();
+                assert_eq!(
+                    order,
+                    bottom.iter().collect::<Vec<_>>(),
+                    "not stacked's order"
+                );
+                let bands: Vec<Band> = all
+                    .iter()
+                    .map(|each| crate::render::band_of(&desk.state, each))
+                    .collect();
+                assert_eq!(
+                    bands,
+                    vec![
+                        Band::Layer(Scripted::Overlay, Whose::Client),
+                        Band::Layer(Scripted::Top, Whose::Client),
+                        Band::Layer(Scripted::Top, Whose::Script),
+                        Band::Windows,
+                        Band::Layer(Scripted::Bottom, Whose::Client),
+                        Band::Layer(Scripted::Bottom, Whose::Script),
+                        Band::Layer(Scripted::Background, Whose::Client),
+                        Band::Layer(Scripted::Background, Whose::Script),
+                    ],
+                    "the band of each of stacked's entries"
                 );
             }
 

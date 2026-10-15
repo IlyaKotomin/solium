@@ -384,6 +384,92 @@ pub(crate) fn recapture_always() -> bool {
     })
 }
 
+/// Whether every wanted xray cut is drawn on every pass, its memos run
+/// again over it: `SOLIUM_XRAY_REBUILD=always`, the control of every
+/// `xray_builds` and `memo_runs` count (Ruling F50). Dev only.
+/// `tests::xray_rebuild_always_is_asked_for_by_name`.
+pub(crate) fn xray_rebuild_named(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("always")
+}
+
+/// `SOLIUM_XRAY_REBUILD`, read once.
+pub(crate) fn xray_rebuild_always() -> bool {
+    thread_local! {
+        static DECIDED: std::cell::OnceCell<bool> = const { std::cell::OnceCell::new() };
+    }
+    DECIDED.with(|decided| {
+        *decided.get_or_init(|| {
+            xray_rebuild_named(std::env::var("SOLIUM_XRAY_REBUILD").ok().as_deref())
+        })
+    })
+}
+
+/// How many passes the first frame's gate is told the frame is not ready
+/// for, whatever else it waits on: `SOLIUM_WARM_INJECT=<passes>`, the
+/// control of `dev/effects-check.sh xray`'s first frames (Ruling F50), since
+/// nested every pass is ready at once and nothing would show the gate hold
+/// and let go. Dev only. Unset, 0, the gate as it is; a value that is not a
+/// whole number is 0 too, with a warning naming it.
+/// `tests::warm_inject_is_a_number_of_passes`.
+pub(crate) fn warm_inject_named(value: Option<&str>) -> (u64, Option<String>) {
+    match value.map(str::trim) {
+        None => (0, None),
+        Some(raw) => match raw.parse() {
+            Ok(passes) => (passes, None),
+            Err(_) => (
+                0,
+                Some(format!(
+                    "SOLIUM_WARM_INJECT={raw} is not a number of passes; nothing is injected"
+                )),
+            ),
+        },
+    }
+}
+
+/// `SOLIUM_WARM_INJECT`, read once, a bad value said once.
+pub(crate) fn warm_inject() -> u64 {
+    thread_local! {
+        static DECIDED: std::cell::OnceCell<u64> = const { std::cell::OnceCell::new() };
+    }
+    DECIDED.with(|decided| {
+        *decided.get_or_init(|| {
+            let (passes, warning) =
+                warm_inject_named(std::env::var("SOLIUM_WARM_INJECT").ok().as_deref());
+            if let Some(warning) = warning {
+                tracing::warn!("{warning}");
+            }
+            passes
+        })
+    })
+}
+
+/// The geometry effect whose grid the Rust genie builds instead of its
+/// file, `SOLIUM_GEOMETRY_ORACLE`, read once: for comparing the two on one
+/// build in `dev/effects-check.sh genie` only. A debug build's knob alone,
+/// so no release or packaged binary can draw an effect from Rust (Rulings
+/// 19, 23). `tests::the_geometry_oracle_is_named_by_its_effect`.
+#[cfg(debug_assertions)]
+pub(crate) fn geometry_oracle() -> Option<String> {
+    thread_local! {
+        static DECIDED: std::cell::OnceCell<Option<String>> = const { std::cell::OnceCell::new() };
+    }
+    DECIDED.with(|decided| {
+        decided
+            .get_or_init(|| oracle_named(std::env::var("SOLIUM_GEOMETRY_ORACLE").ok().as_deref()))
+            .clone()
+    })
+}
+
+/// `SOLIUM_GEOMETRY_ORACLE`'s value as an effect's name: trimmed, and none
+/// when empty. `tests::the_geometry_oracle_is_named_by_its_effect`.
+#[cfg(debug_assertions)]
+fn oracle_named(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
 /// Whether to show the Developer Tweaks panel.
 ///
 /// `--debug-mode` anywhere in the arguments, so it composes with the backend
@@ -398,6 +484,19 @@ pub(crate) fn debug_mode() -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// **The geometry oracle is named by its effect**, trimmed; unset or
+    /// empty names none.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn the_geometry_oracle_is_named_by_its_effect() {
+        assert_eq!(
+            super::oracle_named(Some(" genie ")),
+            Some("genie".to_owned())
+        );
+        assert_eq!(super::oracle_named(Some("")), None);
+        assert_eq!(super::oracle_named(None), None);
+    }
+
     use super::FenceWait;
 
     /// **The wait stays on unless it is switched off**, by a word that says
@@ -431,5 +530,30 @@ mod tests {
         assert!(super::recapture_named(Some("always")));
         assert!(!super::recapture_named(Some("never")));
         assert!(!super::recapture_named(None));
+    }
+
+    /// `SOLIUM_XRAY_REBUILD=always` draws every wanted xray cut on every
+    /// pass; anything else keeps a cut until what it shows changes.
+    #[test]
+    fn xray_rebuild_always_is_asked_for_by_name() {
+        assert!(super::xray_rebuild_named(Some("always")));
+        assert!(super::xray_rebuild_named(Some(" always\n")));
+        assert!(!super::xray_rebuild_named(Some("never")));
+        assert!(!super::xray_rebuild_named(None));
+    }
+
+    /// `SOLIUM_WARM_INJECT=<passes>` is a whole number of passes; unset, the
+    /// gate as it is (0), and anything else 0 with a warning naming it.
+    #[test]
+    fn warm_inject_is_a_number_of_passes() {
+        assert_eq!(super::warm_inject_named(Some("3")), (3, None));
+        assert_eq!(super::warm_inject_named(Some(" 2\n")), (2, None));
+        assert_eq!(super::warm_inject_named(None), (0, None));
+        let (passes, warning) = super::warm_inject_named(Some("three"));
+        assert_eq!(passes, 0);
+        assert!(
+            warning.is_some_and(|said| said.contains("three")),
+            "a value that is not a number is named"
+        );
     }
 }

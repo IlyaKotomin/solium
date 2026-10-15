@@ -15,13 +15,13 @@
 //! describes. So `prepare` compiles, and `elements` only reads what it
 //! compiled (`Programs::clip_compiled`).
 
-use smithay::backend::renderer::gles::{
-    GlesPixelProgram, GlesRenderer, GlesTexProgram, UniformName, UniformType,
-};
+use smithay::backend::renderer::gles::{GlesPixelProgram, GlesRenderer, GlesTexProgram};
 use solium_effects::fragment::{
-    CLIPPED_SOLID, CLIPPED_SURFACE, COLOUR_UNIFORM, Corners, Effect, GEO_PX_UNIFORM,
-    GEO_SIZE_UNIFORM, INPUT_TO_GEO_UNIFORM, Inputs, RADIUS_UNIFORM,
+    CLIPPED_SOLID, CLIPPED_SURFACE, Corners, Effect, Inputs, MASKED_TEXTURE,
 };
+
+mod uniforms;
+pub(crate) use uniforms::registration;
 
 /// Whether this renderer can run an effect that reads `inputs` at all.
 ///
@@ -162,6 +162,16 @@ pub(crate) struct Programs {
     clip: Option<ClipPrograms>,
     /// As `warp_failed`, for the clipped-surface programs.
     clip_failed: bool,
+    /// The program an effect's result is drawn through
+    /// (`effect::element::EffectElement`), on the same terms as `warp`.
+    masked: Option<GlesTexProgram>,
+    /// As `warp_failed`, for the masked program.
+    masked_failed: bool,
+    /// What a backdrop beneath a warped pane and its capture's hole are
+    /// drawn with (`warp/gl.rs`, Ruling F37), on the same terms as `warp`.
+    beneath: Option<crate::warp::BeneathProgram>,
+    /// As `warp_failed`, for the beneath program.
+    beneath_failed: bool,
     /// Set once an effect this renderer cannot run has been named, for the
     /// same reason and on the same terms. See [`Programs::refuse`].
     refused: bool,
@@ -199,20 +209,17 @@ impl Programs {
 
     /// The clipped-surface programs, compiled on first use between frames and
     /// latched (`tests::a_program_that_will_not_compile_is_tried_once`).
-    /// `None` leaves a rounded window square rather than undrawn. Wirecheck's
-    /// case 11h compiles the same two sources with the same uniforms.
+    /// `None` leaves a rounded window square rather than undrawn. Each is
+    /// registered with the uniforms its source declares
+    /// (`tests::the_registered_uniforms_are_the_declared_ones_but_smithays`);
+    /// wirecheck's case 11h compiles the same two through the same
+    /// [`registration`].
     pub(crate) fn clip(&mut self, renderer: &mut GlesRenderer) -> Option<&ClipPrograms> {
         once(&mut self.clip, &mut self.clip_failed, || {
-            let shared = [
-                UniformName::new(INPUT_TO_GEO_UNIFORM, UniformType::Matrix3x3),
-                UniformName::new(GEO_SIZE_UNIFORM, UniformType::_2f),
-                UniformName::new(RADIUS_UNIFORM, UniformType::_4f),
-                UniformName::new(GEO_PX_UNIFORM, UniformType::_1f),
-            ];
-            let texture = renderer.compile_custom_texture_shader(CLIPPED_SURFACE, &shared);
-            let mut solid_uniforms = shared.to_vec();
-            solid_uniforms.push(UniformName::new(COLOUR_UNIFORM, UniformType::_4f));
-            let solid = renderer.compile_custom_pixel_shader(CLIPPED_SOLID, &solid_uniforms);
+            let texture = renderer
+                .compile_custom_texture_shader(CLIPPED_SURFACE, &registration(CLIPPED_SURFACE));
+            let solid =
+                renderer.compile_custom_pixel_shader(CLIPPED_SOLID, &registration(CLIPPED_SOLID));
             match (texture, solid) {
                 (Ok(texture), Ok(solid)) => Some(ClipPrograms { texture, solid }),
                 (texture, solid) => {
@@ -233,6 +240,85 @@ impl Programs {
     /// whose style declares a rounding.
     pub(crate) fn clip_compiled(&self) -> Option<&ClipPrograms> {
         self.clip.as_ref()
+    }
+
+    /// The program an effect's result is drawn through, cut by its part's
+    /// mask (`effect::element`), compiled on first use between frames and
+    /// latched (`tests::a_program_that_will_not_compile_is_tried_once`), with
+    /// the uniforms its source declares
+    /// (`tests::the_masked_programs_registration_is_its_declared_uniforms`);
+    /// wirecheck's case 12h compiles the same through the same
+    /// [`registration`].
+    pub(crate) fn masked(&mut self, renderer: &mut GlesRenderer) -> Option<&GlesTexProgram> {
+        once(&mut self.masked, &mut self.masked_failed, || {
+            renderer
+                .compile_custom_texture_shader(MASKED_TEXTURE, &registration(MASKED_TEXTURE))
+                .map_err(|err| {
+                    tracing::warn!(?err, "the masked-texture shader did not compile");
+                })
+                .ok()
+        })
+    }
+
+    /// The masked program if [`Programs::masked`] has compiled it, for
+    /// `render::elements`, which must never compile (this module's doc).
+    pub(crate) fn masked_compiled(&self) -> Option<&GlesTexProgram> {
+        self.masked.as_ref()
+    }
+
+    /// The beneath program (Ruling F37, amended 2026-10-14, live under
+    /// motion and warps), compiled on first use between frames and latched
+    /// (`tests::a_program_that_will_not_compile_is_tried_once`), while an
+    /// effect is wanted (`render::prepare`'s compile phase). `None` keeps a
+    /// warped pane's behind slots in its capture at rest
+    /// ([`Programs::beneath_refused`]); wirecheck's case 13i compiles and
+    /// draws it.
+    #[expect(unsafe_code, reason = "compiling the beneath program's GL")]
+    pub(crate) fn beneath(
+        &mut self,
+        renderer: &mut GlesRenderer,
+    ) -> Option<crate::warp::BeneathProgram> {
+        once(&mut self.beneath, &mut self.beneath_failed, || {
+            // SAFETY: `with_context` makes the renderer's context current, and
+            // this runs between frames (`render::prepare`).
+            match renderer.with_context(|gl| unsafe { crate::warp::BeneathProgram::compile(gl) }) {
+                Ok(Ok(program)) => Some(program),
+                Ok(Err(why)) => {
+                    tracing::warn!(
+                        why,
+                        "the beneath program did not compile; a warped window's backdrop is read where it rests"
+                    );
+                    None
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        "no context to compile the beneath program in; a warped window's backdrop is read where it rests"
+                    );
+                    None
+                }
+            }
+        })
+        .copied()
+    }
+
+    /// The beneath program if [`Programs::beneath`] has compiled it, for
+    /// `render::elements` and the captures' walk, which never compile.
+    pub(crate) fn beneath_compiled(&self) -> Option<crate::warp::BeneathProgram> {
+        self.beneath
+    }
+
+    /// Whether the warp's program failed to compile, for good: a warped
+    /// pane is then drawn flat, so nothing is placed beneath it
+    /// (`render::measured`).
+    pub(crate) fn warp_refused(&self) -> bool {
+        self.warp_failed
+    }
+
+    /// Whether the beneath program failed to compile, for good: every
+    /// warped slot then stays in its capture at rest (`render::measured`).
+    pub(crate) fn beneath_refused(&self) -> bool {
+        self.beneath_failed
     }
 
     /// Say, once, that a style declares an effect this renderer cannot run.
@@ -396,5 +482,64 @@ mod tests {
             Some(7),
             "compiled once and kept"
         );
+    }
+
+    /// **The masked program's registration is its declared uniforms**: what
+    /// `Programs::masked` compiles `MASKED_TEXTURE` with, and wirecheck's
+    /// case 12h with it, names the mask's rectangle, radii and size with the
+    /// types the source declares (a `vec2` registered as `_1f` would leave
+    /// every fragment's mask unset, #94).
+    #[test]
+    fn the_masked_programs_registration_is_its_declared_uniforms() {
+        use smithay::backend::renderer::gles::UniformType;
+        use solium_effects::fragment::{
+            MASK_RADII_UNIFORM, MASK_RECT_UNIFORM, MASK_SIZE_UNIFORM, MASKED_TEXTURE,
+        };
+        let registered: Vec<_> = super::registration(MASKED_TEXTURE)
+            .into_iter()
+            .map(|uniform| (uniform.name.into_owned(), uniform.type_))
+            .collect();
+        assert_eq!(
+            registered,
+            vec![
+                (MASK_RECT_UNIFORM.to_owned(), UniformType::_4f),
+                (MASK_RADII_UNIFORM.to_owned(), UniformType::_4f),
+                (MASK_SIZE_UNIFORM.to_owned(), UniformType::_2f),
+            ]
+        );
+    }
+
+    /// **The registered uniforms are the declared ones but smithay's**, with
+    /// the declared types: #94's defect (a `vec4` registered as `_1f`) cannot
+    /// be written again, because nothing is written by hand. Every source
+    /// registered through [`registration`]: the clipped pair, and wirecheck's
+    /// case 11's `ROUNDED_CORNERS`.
+    #[test]
+    fn the_registered_uniforms_are_the_declared_ones_but_smithays() {
+        use smithay::backend::renderer::gles::UniformType;
+        for source in [
+            solium_effects::fragment::CLIPPED_SURFACE,
+            solium_effects::fragment::CLIPPED_SOLID,
+            solium_effects::fragment::ROUNDED_CORNERS,
+        ] {
+            let registered = super::registration(source);
+            let declared: Vec<_> = solium_effects::glsl::uniforms(source)
+                .into_iter()
+                .filter(|each| !super::uniforms::SMITHAYS.contains(&each.name.as_str()))
+                .collect();
+            assert_eq!(registered.len(), declared.len(), "{source}");
+            for (name, uniform) in registered.iter().zip(&declared) {
+                assert_eq!(name.name, uniform.name);
+                let expected = match uniform.ty {
+                    solium_effects::glsl::Glsl::Float => UniformType::_1f,
+                    solium_effects::glsl::Glsl::Vec2 => UniformType::_2f,
+                    solium_effects::glsl::Glsl::Vec3 => UniformType::_3f,
+                    solium_effects::glsl::Glsl::Vec4 => UniformType::_4f,
+                    solium_effects::glsl::Glsl::Mat3 => UniformType::Matrix3x3,
+                    other => panic!("{other:?} is not registered"),
+                };
+                assert_eq!(name.type_, expected, "{}", uniform.name);
+            }
+        }
     }
 }

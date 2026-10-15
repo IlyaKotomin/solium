@@ -17,6 +17,11 @@ sol.session(config.session)
 -- Settings the compositor itself holds, applied from the same file as
 -- everything else. All of them take effect immediately when reloaded.
 sol.pane(config.pane)
+-- How the compositor starts: the first frame waits for what it shows. Before
+-- the effects, which it waits for. See config.lua's `startup`.
+sol.startup(config.startup)
+-- Which effects go where. See config.lua's `effects`.
+sol.effects(config.effects)
 sol.loading(config.loading)
 -- Reload automatically when a file this configuration loaded changes
 -- (#223). See `config.lua`.
@@ -77,6 +82,8 @@ require("keyboard_indicator")
 require("actions")
 
 require("tweaks")
+-- What is broken in an effect or the configuration, on screen while it is.
+require("problems")
 
 require("modes")
 -- The pointer follows the keyboard, by what moved it: `focus.cursor` in
@@ -253,16 +260,19 @@ sol.bind("super+shift+r", function()
     sol.reload()
 end)
 
--- Dev: the genie. `deform` names an effect from `crates/effects` -- there is
--- one so far -- and `to` is what the window is pulled into. A rect here
--- because there is no dock yet; with one, `to = { window = id }` would follow
--- its icon as the icon moves, which a rect read out of this table cannot.
+-- Dev: the genie. `deform` names an effect folder -- `genie` ships, and
+-- your copy in ~/.config/solium/effects/genie/ is used instead -- and `to`
+-- is what the window is pulled into. A rect here because there is no dock
+-- yet; with one, `to = { window = id }` would follow its icon as the icon
+-- moves, which a rect read out of this table cannot.
 --
 -- `axis` is which edge leads, so a dock down the side of the screen is
--- `"left"` and the compositor turns the mesh to match. `spread` is how much of
--- the window is in motion at once: 0 pulls it in rigidly, larger values draw
--- the tail out behind it. Composes with a transform -- add `rotate_y` here and
--- the window tilts while it is sucked in.
+-- `"left"` and the compositor turns the mesh to match; `"auto"` picks the
+-- side the target lies on when the window starts to move. `spread` is the
+-- folder's param: how much of the window is in motion at once, 0 pulling it
+-- in rigidly, larger values drawing the tail out behind it. Composes with a
+-- transform -- add `rotate_y` here and the window tilts while it is sucked
+-- in.
 sol.bind("super+m", function()
     local area = sol.monitor()
     for _, window in ipairs(sol.windows()) do

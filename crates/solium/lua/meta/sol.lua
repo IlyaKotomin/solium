@@ -53,6 +53,8 @@
 ---@field max? sol.Size The largest the application says it can be, frame included; absent when it set no limit.
 ---@field cramped boolean Whether the layout last placed it with `cramped = true`.
 ---@field shown boolean Whether its application has shown its first frame yet.
+---@field fullscreen boolean Whether the compositor last told it to be fullscreen.
+---@field style string The pane style it is framed in, or `"none"` when it is drawn bare: fullscreen, drawing its own decorations, or under the style `"none"`.
 ---@field x11_type? string Its X11 `_NET_WM_WINDOW_TYPE`, lower case (`"normal"`, `"dialog"`, `"utility"`, `"toolbar"`, `"menu"`, `"dropdown-menu"`, `"popup-menu"`, `"tooltip"`, `"notification"`, `"splash"`); `"normal"` for an X11 window with no type of its own, same as EWMH's own default, and absent for a Wayland window, which has no such property to ask.
 ---@field accepts_input boolean Whether the window may ever be given the keyboard: an X11 client's own `WM_HINTS.input`, or `true` for a Wayland window, which has nothing equivalent to decline with. Not what decides whether a window reaches this list at all (#221) -- an ICCCM 'Globally Active' application can set this `false` and still be an ordinary, shown window -- so a row here can read `false`; it exists for a window rule to act on.
 ---@field class? string Its X11 `WM_CLASS` class, or absent for a Wayland window, which has no such property. `config.x11.hidden` matches against this and `instance` to decide whether the window was shown at all (#221).
@@ -120,6 +122,16 @@
 ---@field y? number
 ---@field w? number
 ---@field h? number
+
+---One row of `sol.problems()`: something broken in an effect, a rule or the
+---configuration, and where.
+---@class sol.Problem
+---@field effect string The effect's name, `"config"` for the configuration, `"rules"` for a rule of `sol.effects`, `"settings"` for the engine's own keys beside them, or `"present:<name>"` for a `sol.present` deform's params, at its effect's file and line when the effect is what failed.
+---@field file string The file the problem is in.
+---@field line? integer Its line in that file, where one is known.
+---@field column? integer Its column, where the compiler gave one.
+---@field message string What is wrong.
+---@field severity "error"|"warning" An error keeps the effect or the configuration from running as written; a warning does not.
 
 ---What `sol.keyboard{ ... }` may change. Every key is optional and one left
 ---out is left as it is. The first five are xkb names; setting any of them
@@ -215,12 +227,20 @@
 ---@field z? number Draw order and nothing else: higher is in front, equal keeps the stacking order, 0 is the default. Input still follows the rect.
 ---@field deform? sol.Deform A deformation of the window's mesh.
 
----A deformation, named by effect. Its other keys are that effect's parameters.
+---A deformation, named by effect. Its other keys are that effect's params,
+---bound and checked by the effect (an unknown one, or one of the wrong kind,
+---is named by `sol.problems()` and the window drawn undeformed); numbers,
+---booleans and four numbers, at most `effects.limits.params` numbers once
+---packed (a word param cannot blend between two presents and is refused).
 ---@class sol.Deform
----@field effect "genie" The effect, from `crates/effects`. An unknown one is logged and the window drawn undeformed.
+---@field effect string An effect folder's name, `"genie"` shipped; your copy in `~/.config/solium/effects/` is used instead. It must have a `mesh`. One nobody has is named by `sol.problems()`, and the window is drawn by `failed`.
 ---@field to { window: integer }|{ surface: string }|sol.Rect What the window is pulled into or drawn out of. A window or a surface is followed as it moves; a rect stays where it is. A surface on several monitors is the one on the window's own monitor.
----@field axis? "down"|"up"|"left"|"right" For the genie: which edge leads.
----@field spread? number For the genie: how much of the window is in motion at once. 0 is rigid.
+---@field axis? "auto"|"down"|"up"|"left"|"right" Which edge leads, the mesh's `t.axis`. `"auto"`, also when it is left out: the side the target lies on, picked when the window starts to move and kept for the flight.
+---@field progress? number How far into `to`, the mesh's `t.progress`: 1, all the way, when it is left out, which is what one animates towards; 0 is the window where it is. `t.direction` is -1 for a present.
+---@field seed? number A number in [0, 1) for the mesh's `t.seed`; 0 when it is left out.
+---@field failed? "flat"|"hide" This present's own: what it draws when its mesh is refused or its folder is missing, the window undeformed or nothing of it; `effects.present.failed`'s when it is left out.
+---@field on_reload? "flat"|"keep" This present's own: when a reload finds its folder changed while it plays, drawn flat for the rest of the move, or on the version it began with; a reload that leaves the folder as it was changes nothing, even one that changes `effects.sandbox`. `effects.present.on_reload`'s when it is left out.
+---@field spread? number The genie's param: how much of the window is in motion at once. 0 is rigid.
 
 ---Where `sol.place` puts a window.
 ---@class sol.PlaceOptions: sol.Rect
@@ -400,6 +420,7 @@
 ---| "layout" # Arrange the windows you already hold again: `()`.
 ---| "monitors" # The monitors changed, or were announced at startup or after a reload: `()`.
 ---| "restore" # These scripts replaced a running session's, after a reload and never at startup: `()`.
+---| "problems" # The problems changed: something broke, or a reload mended it: `()`. `sol.problems()` answers what they are now. Told once a change, after the frame that found it.
 ---| "text_input" # The focused text field changed: `(field, why)`, `field` being what `sol.text_input()` answers at that moment and `why` what changed -- `"field"`, one was enabled, or focused again by its window getting the keyboard back; `"caret"`, its client moved its caret; `"framed"`, its window started or stopped being drawn in a frame, as one going fullscreen does. Told at most once a pass of the event loop, before the frame is drawn, as the most that changed: a caret moved twice since the last frame is told once, where it is now, and a field enabled and then given its caret, as kitty gives it with its first key, is told once as `"field"`. A window moving with its field in it is not told. A field disabled, or its window losing the keyboard, is not told: `sol.text_input()` answers `nil` from then on, and `field` is never `nil` here.
 ---| "keyboard" # The live layout, Caps Lock or Num Lock changed, by a key or by `sol.keyboard{ ... }`: `(state, changed)`, `state` being what `sol.keyboard()` answers now and `changed` `"layout"`, `"caps"` or `"num"`. Never for ordinary typing, a new keymap or a configuration starting, nor while the session is locked: what is pressed at the lock screen is the lock screen's, and a lock screen that wants a Caps Lock warning draws its own. A change a `keyboard` listener makes is not told back to it.
 
@@ -485,6 +506,91 @@ function sol.keyboard(options) end
 ---framed or left bare.
 ---@return sol.TextField|nil
 function sol.text_input() end
+
+---What is broken in an effect, a rule or the configuration now, with its file
+---and line. The shipped `lua/problems.lua` shows them on the primary monitor
+---while there are any. A failed reload is one, under `"config"`, until a
+---reload succeeds.
+---@return sol.Problem[]
+function sol.problems() end
+
+---One rule of `sol.effects{ rules = … }`: which effect goes in which slot of
+---which part, for which windows or surfaces. A later rule for the same part
+---and slot wins over an earlier one, and yours over a pane style's.
+---@class sol.Rule
+---@field match "*"|table `"*"`, or the keys a part's kind matches on, each a word that is exact, `"*"`, or a prefix ending in `*`: `app_id`, `title`, `monitor`, `style` (`"none"` for a bare window), and `focused` and `fullscreen` as booleans, for a window's parts; `surface` for a scripted surface's (a plane such as `shell/dock` waits for planes); `layer_shell` for a layer surface's. No Lua patterns.
+---@field part string `pane`, `client`, `popup`, `layer:<name>`, `region:titlebar`, `surface:<name>` or `layer_shell:<namespace>`. Other regions, and the titlebar's own pixels as a chain's input, wait for `Solium.region`, and `output` for X4.2.
+---@field slot "behind"|"front"|"replace" Below the part, above it, or in its place. The part itself is always drawn: a `replace` whose effect fails draws the part.
+---@field effect string|table|false An effect's name; a link, `{ "blur", passes = 3 }`, its params beside the name, with `reach` and `bleed` overriding the effect's own; a chain of links in order, `{ { "blur" }, { "tint" } }`; or `false`, which empties the slot.
+---@field source? "self"|"xray"|"live"|"auto" What the chain's first input reads in place of its own: `"self"`, the part's own pixels, or `"xray"`, the backdrop from xray, which is what a chain reading the backdrop reads anyway. On the rule or in its first link. The live backdrop (`"live"`, `"auto"`) waits for X4.1 and is refused when the rules are applied.
+---@field mask? "shape"|"alpha" How the result is cut: the part's shape (the default), or the alpha of the part's own pixels, which needs `source = "self"`.
+---@field memo? boolean `false`: never share this rule's backdrop-only part per monitor, whatever `effects.memo.split` says; each part runs its whole chain. Default `true`.
+---@field cut? "below"|"background" Which layers a T2 chain reads: every configured layer below the part's own (`"below"`, the default) or the wallpaper alone (`"background"`), even when `effects.xray.layers` has `"bottom"`.
+---@field fade? { duration: number, easing?: string }|false How the slot comes and goes as the rule starts and stops matching: its result drawn at an opacity that eases from 0 to 1 over `duration` milliseconds (0 to 60000) on `easing` (a curve's name, `"outCubic"` when not given) when the rule starts to fill the slot, and back to 0 when it stops, nothing run again for it; turned round part of the way it goes back from where it got to. Left out, or `false`: filled and emptied at once.
+
+---What T2 effects read as the backdrop, `sol.effects`' `xray`: a sharp
+---picture of the layers below a part, per monitor, rebuilt only when what is
+---in it changes. A part on `bottom` reads the wallpaper alone, one on
+---`background` reads nothing, and every other one the layers named here.
+---@class sol.XrayOptions
+---@field layers? ("background"|"bottom")[] The layers T2 effects read as the backdrop: `"background"`, alone or with `"bottom"`; a list without `"background"`, an empty one included, is refused (a rule's `effect = false` turns an effect off). Default `{ "background" }`.
+---@field scale? number The picture's resolution as a share of the monitor's, 0.25 to 1. Default 1.
+---@field keep_ms? integer How long a picture nothing reads is kept, 0 to 60000 ms. Default 2000.
+---@field straddle? "each"|"own" A part across two monitors reads each monitor's picture, or only its own monitor's. Default `"each"`.
+---@field warped? "drawn"|"rest" A warped window's behind effect reads the backdrop where each of its pixels is drawn, or where the window rests, bent with it. A window that glides or is dragged always reads it where it is drawn. Default `"drawn"`.
+
+---How the part of a chain that reads only the backdrop is shared, `sol.effects`'
+---`memo`: run once per monitor and read by every part whose chain begins the
+---same way.
+---@class sol.MemoOptions
+---@field split? "resize"|"longest"|"off" How far the part of a chain that reads only the backdrop is shared per monitor: to its last step that changes size, as far as it reads only the backdrop, or not at all. Default `"resize"`.
+---@field keep_passes? integer Passes a shared result nobody reads is kept, 0 to 3600. Default 0.
+---@field budget_mib? integer The most memory shared results may hold, 0 (no cap) to 4096 MiB; past it a part runs its whole chain, and a held result past a lowered cap is given back. Default 0.
+
+---What `sol.effects` takes: the rules, and the engine's own numbers and
+---policies beside them, each with its default. A key it does not know,
+---`sandbox`, `limits`, `present`, `xray` or `memo` given anything but a
+---table, a number outside its bounds (`1/0` and `0/0` included) or a word
+---outside its words refuses the whole set, its rules too, named by
+---`sol.problems()` under `"settings"`, and what ran stays; `solium --check`
+---fails on it.
+---@class sol.EffectsOptions
+---@field rules? sol.Rule[] The rules; left out, none.
+---@field sandbox? { load_ms?: number, memory_mib?: integer } What an effect's own Lua may spend as it loads: `load_ms` for each call, shared by the checks a `mesh` is put through at load (100 by default, 10 to 5000), and `memory_mib` of memory (16 by default, 1 to 512). A folder past either is named by `sol.problems()` and not loaded; changing either loads every effect again.
+---@field limits? { params?: integer } How many numbers a geometry or a pixels effect's params may be once packed (8 by default, 1 to 64); one with more is named by `sol.problems()`, never cut.
+---@field present? { failed?: "flat"|"hide", on_reload?: "flat"|"keep" } What a `sol.present` deform draws when its mesh is refused or its folder is missing (`failed`: `"flat"`, the default, the window undeformed; `"hide"`, nothing of it), and when a reload finds its folder changed while it plays (`on_reload`: `"flat"`, the default, or `"keep"`, the version it began with; a reload that leaves the folder as it was changes nothing, even one that changes `sandbox`). A deform may say either for itself.
+---@field xray? sol.XrayOptions What T2 effects read as the backdrop.
+---@field memo? sol.MemoOptions How a chain's backdrop-only part is shared per monitor.
+---@field motion_hz? number How many times a second, at most, an effect's own steps for a part run again while only the part's place or size moves (a glide, a drag, a resize): a T2 effect's (the glass's refraction) as it moves, a T0 effect's (the shade) as it changes size. Between, the last result is drawn where the part is, stretched to its size: what shows through lags the part by at most `1 / motion_hz` of its motion, and is right again within that once it stops. A backdrop redrawn or new params run it at once. 0 runs them on every pass; otherwise 10 to 1000. Default 60.
+
+---Which effects go where, all at once: a set with a broken rule is refused
+---whole, its errors listed by `sol.problems()`, and the rules that ran stay.
+---Every effect a rule names is loaded and every link bound with its params
+---when this is called, at load and at every reload; `rules` left out is no
+---rules. The engine's own keys beside them are applied first, so the effects
+---the rules name load under them.
+---@param options? sol.EffectsOptions
+---@return nil
+function sol.effects(options) end
+
+---The first desktop frame's gate, `sol.startup`'s `first_frame`.
+---@class sol.FirstFrameOptions
+---@field hold? boolean Hold the first desktop frame (drawing only the clear colour) until what it shows is ready: every effect compiled and every backdrop picture a T2 effect reads built once. Default `true`.
+---@field max_ms? integer The longest it is held, 0 to 10000 ms; 0 never holds. What is still not ready then is drawn as it is, and named in the log. Default 2000.
+---@field on_reload? boolean Hold again after each successful reload until ready. Default `false`.
+
+---What `sol.startup` takes. A key it does not know, or a value outside its
+---type or bounds (`1/0` included), is refused whole, named by
+---`sol.problems()` under `"startup"`, and what ran stays.
+---@class sol.StartupOptions
+---@field first_frame? sol.FirstFrameOptions
+
+---How the compositor starts: the first frame's gate. Applied at once; a
+---reload re-reads it, and one with `on_reload` holds its frame again.
+---With no table, the defaults.
+---@param options? sol.StartupOptions
+---@return nil
+function sol.startup(options) end
 
 ---Read the monitors, or arrange them.
 ---
@@ -635,6 +741,10 @@ function sol.reload() end
 ---`qml/panes`, or a single file under `~/.config/solium/qml/decorations`; a
 ---path is anyone's; `"none"` draws no frame. `SOLIUM_PANE`, when set, wins over
 ---the name given here.
+---
+---A style folder's `effects.lua`, if it has one, is read here, every time, and
+---its effect rules bound for the windows it frames; what is wrong with it is
+---listed by `sol.problems()` under `style:<folder>`.
 ---@param name? string
 ---@return nil
 function sol.pane(name) end
@@ -1006,7 +1116,7 @@ function sol.unknown(key, meant) end
 ---@overload fun(event: "click", handler: fun(x: number, y: number))
 ---@overload fun(event: "surface", handler: fun(surface: string, action: string, data: any))
 ---@overload fun(event: "direction", handler: fun(verb: "focus"|"move", dir: "left"|"right"|"up"|"down"))
----@overload fun(event: "layout"|"monitors"|"restore", handler: fun())
+---@overload fun(event: "layout"|"monitors"|"restore"|"problems", handler: fun())
 ---@overload fun(event: "text_input", handler: fun(field: sol.TextField, why: "field"|"caret"|"framed"))
 ---@overload fun(event: "keyboard", handler: fun(state: sol.KeyboardState, changed: "layout"|"caps"|"num"))
 ---@param event sol.Event

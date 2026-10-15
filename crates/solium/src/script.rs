@@ -177,6 +177,15 @@ pub(crate) struct WindowInfo {
     /// already on screen whose limits changed (#115). See
     /// `real_client::client_sizes::a_launched_window_whose_minimum_does_not_fit_goes_where_overflow_says`.
     pub(crate) shown: bool,
+    /// Whether the compositor last told it to be fullscreen: the state its
+    /// configures carry, which a rule's `fullscreen` match reads.
+    /// `real_client::sol_windows_carries_every_window_match_key`.
+    pub(crate) fullscreen: bool,
+    /// The pane style it is framed in, or `"none"` when it is drawn bare:
+    /// fullscreen, drawing its own decorations, or under `pane = "none"`.
+    /// What a rule's `style` match reads (`state::style_fact`).
+    /// `real_client::sol_windows_carries_every_window_match_key`.
+    pub(crate) style: String,
     /// Its `_NET_WM_WINDOW_TYPE`, by the name `xwayland::window_type_name`
     /// gives it -- `"normal"` for an X11 window with none, same as
     /// `xwayland::places_itself` and `floats_over_its_parent` already read it
@@ -318,6 +327,23 @@ pub(crate) struct Snapshot {
     /// The focused text field and its caret, for `sol.text_input()`:
     /// `text_input::tests::an_enabled_field_has_its_caret_in_the_global_space`.
     pub(crate) text_input: Option<crate::text_input::Field>,
+    /// What is broken in an effect, a rule or the configuration, for
+    /// `sol.problems()`:
+    /// `tests::a_broken_effect_reaches_sol_problems_with_its_file_and_line`.
+    pub(crate) problems: Vec<ProblemRow>,
+}
+
+/// One problem, as `sol.problems()` hands it over: an effect, a rule or the
+/// configuration, where, and what. Rust publishes; `lua/problems.lua` shows
+/// (`tests::a_broken_effect_reaches_sol_problems_with_its_file_and_line`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ProblemRow {
+    pub(crate) effect: String,
+    pub(crate) file: String,
+    pub(crate) line: Option<u32>,
+    pub(crate) column: Option<u32>,
+    pub(crate) message: String,
+    pub(crate) severity: &'static str,
 }
 
 /// How a batch of transforms should animate.
@@ -353,11 +379,22 @@ pub(crate) enum Aim {
     Surface(String),
 }
 
-/// A deformation as a script asked for it: the shape, and what it is aimed at.
+/// A deformation as a script asked for it: the effect folder by name, its
+/// params, its axis (`"auto"` or none resolved when it is applied, once),
+/// how far, what it is aimed at, and its own seed and policies, each `None`
+/// for `effects.present`'s. Resolved through the effect host where the
+/// command is applied (`Solium::aimed`).
+/// `tests::a_script_names_an_effect_and_the_engine_answers`.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Deform {
-    pub(crate) effect: solium_effects::Deform,
+pub(crate) struct DeformSpec {
+    pub(crate) effect: String,
+    pub(crate) params: Vec<(String, solium_effects::spec::Value)>,
+    pub(crate) axis: Option<String>,
+    pub(crate) progress: f64,
     pub(crate) aim: Aim,
+    pub(crate) seed: Option<f64>,
+    pub(crate) failed: Option<crate::effect::settings::PresentFailed>,
+    pub(crate) on_reload: Option<crate::effect::settings::PresentReload>,
 }
 
 /// Who is in a named selection, in the words a script wrote.
@@ -389,7 +426,7 @@ pub(crate) enum Command {
         /// cheap path.
         matrix: Option<Mat4>,
         /// A deformation the drawn rect cannot express, such as a genie.
-        deform: Option<Deform>,
+        deform: Option<DeformSpec>,
         /// How deep the window is drawn. See [`crate::present::Frame::z`].
         ///
         /// Resolved rather than `Option`, unlike the four above it: nothing
@@ -612,6 +649,20 @@ pub(crate) enum Command {
     /// resolved in `cursor::theme::Settings::resolve`, not here, so that it is
     /// in one place and testable without Lua.
     Cursor(crate::cursor::theme::Configured),
+    /// `sol.effects{ rules = … }`: the user's rules, parsed, or every error
+    /// in them, applied whole or not at all
+    /// (`state::tests::a_broken_rule_keeps_the_rules_that_ran`); and the
+    /// engine's own keys beside them, `sandbox`, `limits`, `present`, `xray`
+    /// and `memo` (`tests::sol_effects_reaches_the_compositor_with_its_settings`,
+    /// `tests::sol_effects_reads_xray_and_memo`).
+    Effects {
+        rules: Result<Vec<crate::effect::rules::Rule>, Vec<crate::effect::rules::RuleError>>,
+        settings: Result<crate::effect::settings::Settings, String>,
+    },
+    /// `sol.startup{ first_frame = … }`: the first frame's gate, read and
+    /// checked (`warm::startup`), or why it was refused
+    /// (`tests::sol_startup_reaches_the_compositor`).
+    Startup(Result<crate::warm::FirstFrame, String>),
 }
 
 /// What moved the keyboard, as the `focus` event tells it and
@@ -1348,6 +1399,44 @@ impl Scripts {
         found
     }
 
+    /// The effect rules the configuration handed over as it loaded, the last
+    /// `sol.effects` winning, read without taking them, so `--check` sees
+    /// them and [`Self::startup`] still hands them over.
+    /// `check::tests::the_effects_a_rule_names_are_checked`.
+    pub(crate) fn effects_at_load(
+        &self,
+    ) -> Option<Result<Vec<crate::effect::rules::Rule>, Vec<crate::effect::rules::RuleError>>> {
+        self.lua.app_data_ref::<Pending>().and_then(|pending| {
+            pending
+                .commands
+                .iter()
+                .rev()
+                .find_map(|command| match command {
+                    Command::Effects { rules, .. } => Some(rules.clone()),
+                    _ => None,
+                })
+        })
+    }
+
+    /// The engine's own keys the configuration handed over as it loaded,
+    /// the last `sol.effects` winning, as [`Self::effects_at_load`] reads
+    /// its rules: `--check` judges them as the session would.
+    /// `check::tests::a_refused_effects_key_fails_the_check`.
+    pub(crate) fn effect_settings_at_load(
+        &self,
+    ) -> Option<Result<crate::effect::settings::Settings, String>> {
+        self.lua.app_data_ref::<Pending>().and_then(|pending| {
+            pending
+                .commands
+                .iter()
+                .rev()
+                .find_map(|command| match command {
+                    Command::Effects { settings, .. } => Some(settings.clone()),
+                    _ => None,
+                })
+        })
+    }
+
     /// What the configuration said through `sol.qml`, if anything.
     pub(crate) fn qml(&self) -> crate::qml::renderer::Configured {
         self.lua
@@ -1571,9 +1660,11 @@ impl Scripts {
 
         let source = std::fs::read_to_string(config)
             .with_context(|| format!("reading {}", config.display()))?;
-        // Named `@` and the path, as Lua names a file: its messages then say
-        // `<path>:<line>:` rather than `[string "<path>"]:<line>:`, and a
-        // stopped listener is logged with the whole path.
+        // Named `@<path>`, as Lua names a file it loads itself: its messages
+        // then say `<path>:<line>:` rather than `[string "<path>"]:<line>:`,
+        // a failed reload is put on the overlay at its line, and a stopped
+        // listener is logged with the whole path.
+        // `tests::a_configuration_error_names_its_file_and_line`,
         // `tests::an_error_in_the_configuration_names_it_as_a_file`,
         // `tests::a_stopped_listener_is_logged_with_its_file_and_line`.
         lua.load(&source)
@@ -1895,6 +1986,12 @@ impl Scripts {
     /// test found.
     pub(crate) fn monitors_changed(&mut self, snapshot: Snapshot) -> Outcome {
         self.dispatch(snapshot, move |lua, _| call_listeners(lua, "monitors", ()))
+    }
+
+    /// The problems changed: an effect broke or was mended, or a reload failed.
+    /// `tests::the_problems_event_reaches_its_listeners`.
+    pub(crate) fn problems_changed(&mut self, snapshot: Snapshot) -> Outcome {
+        self.dispatch(snapshot, move |lua, _| call_listeners(lua, "problems", ()))
     }
 
     /// These scripts have replaced a running session's, rather than started one.
@@ -2740,6 +2837,74 @@ fn build_api(lua: &Lua) -> mlua::Result<Table> {
         })?,
     )?;
 
+    // What is wrong in an effect, a rule or the configuration, with its file
+    // and line: `tests::a_broken_effect_reaches_sol_problems_with_its_file_and_line`.
+    sol.set(
+        "problems",
+        lua.create_function(|lua, ()| {
+            let snapshot = snapshot(lua)?;
+            let rows = lua.create_table()?;
+            for (index, problem) in snapshot.problems.iter().enumerate() {
+                let row = lua.create_table()?;
+                row.set("effect", problem.effect.clone())?;
+                row.set("file", problem.file.clone())?;
+                row.set("line", problem.line)?;
+                row.set("column", problem.column)?;
+                row.set("message", problem.message.clone())?;
+                row.set("severity", problem.severity)?;
+                rows.set(index + 1, row)?;
+            }
+            Ok(rows)
+        })?,
+    )?;
+
+    // Effects on parts of windows: `sol.effects{ rules = { … } }`, parsed
+    // here and applied whole, or not at all
+    // (`state::tests::a_broken_rule_keeps_the_rules_that_ran`), with the
+    // engine's own keys beside them (Ruling 28,
+    // `tests::sol_effects_reaches_the_compositor_with_its_settings`).
+    sol.set(
+        "effects",
+        lua.create_function(|lua, options: Option<Table>| {
+            let rules = match options
+                .as_ref()
+                .map(|table| table.get::<mlua::Value>("rules"))
+                .transpose()?
+            {
+                None | Some(mlua::Value::Nil) => Ok(Vec::new()),
+                Some(value) => match crate::effect::tree::Tree::from_lua(&value)? {
+                    Some(tree) => crate::effect::rules::parse(&tree),
+                    None => Ok(Vec::new()),
+                },
+            };
+            let settings = match options {
+                None => Ok(crate::effect::settings::Settings::default()),
+                Some(table) => {
+                    crate::effect::settings::parse(&crate::effect::settings::tree_of(&table)?)
+                }
+            };
+            with_pending(lua, |pending| {
+                pending.commands.push(Command::Effects { rules, settings });
+            })
+        })?,
+    )?;
+
+    // How the compositor starts: the first desktop frame's gate
+    // (`warm::Warm`), `startup.first_frame`, read and checked here and
+    // applied at once (`tests::sol_startup_reaches_the_compositor`).
+    sol.set(
+        "startup",
+        lua.create_function(|lua, options: Option<Table>| {
+            let read = match options {
+                None => Ok(crate::warm::FirstFrame::default()),
+                Some(table) => crate::warm::startup(&table)?,
+            };
+            with_pending(lua, |pending| {
+                pending.commands.push(Command::Startup(read));
+            })
+        })?,
+    )?;
+
     // Every window a layout may arrange, topmost first.
     //
     // `modal` and `parent` are here rather than behind a `sol.dialog(id)` of
@@ -2757,14 +2922,16 @@ fn build_api(lua: &Lua) -> mlua::Result<Table> {
     // limited neither side. `cramped` is the layout's own word coming back,
     // from `sol.place`. `app_id` is what `tiling.client_size_ignore` matches.
     // `shown` is whether the window's client has been shown yet; see
-    // `WindowInfo::shown`. `x11_type`, `accepts_input`, `class` and
-    // `instance` are read only from an X11 window's own properties (#221) --
-    // `nil` for a Wayland one, except `accepts_input`, which is `true` -- and
-    // exist for a window rule (#56) to act on a case the compositor's own
-    // default (hiding a window whose `class` or `instance` is in
-    // `config.x11.hidden`) does not already decide for it. `content_type` is
-    // what the window says it is showing (#71), `"none"` when it said
-    // nothing; see `WindowInfo::content_type`.
+    // `WindowInfo::shown`. `fullscreen` and `style` are the two match keys of
+    // an effect rule (`effects.rules`) nothing else here says, so every key a
+    // rule matches a window by can be read from Lua. `x11_type`,
+    // `accepts_input`, `class` and `instance` are read only from an X11
+    // window's own properties (#221) -- `nil` for a Wayland one, except
+    // `accepts_input`, which is `true` -- and exist for a window rule (#56) to
+    // act on a case the compositor's own default (hiding a window whose
+    // `class` or `instance` is in `config.x11.hidden`) does not already decide
+    // for it. `content_type` is what the window says it is showing (#71),
+    // `"none"` when it said nothing; see `WindowInfo::content_type`.
     sol.set(
         "windows",
         lua.create_function(|lua, ()| {
@@ -2788,6 +2955,8 @@ fn build_api(lua: &Lua) -> mlua::Result<Table> {
                 entry.set("max", size_table(lua, window.max)?)?;
                 entry.set("cramped", window.cramped)?;
                 entry.set("shown", window.shown)?;
+                entry.set("fullscreen", window.fullscreen)?;
+                entry.set("style", window.style.clone())?;
                 entry.set("x11_type", window.x11_type.clone())?;
                 entry.set("accepts_input", window.accepts_input)?;
                 entry.set("class", window.class.clone())?;
@@ -5553,29 +5722,16 @@ fn pivot_from(options: Option<&Table>) -> mlua::Result<(f32, f32)> {
     Ok((axis("pivot_x")?, axis("pivot_y")?))
 }
 
-/// A Lua table, read as an effect's parameters.
-///
-/// The bridge between `sol.present` and `crates/effects`, which has no
-/// dependencies and so cannot be handed an `mlua::Table`. Each effect asks for
-/// the parameters it has, by name, and defaults the rest -- which is what
-/// makes adding one a file in that crate and nothing here.
-///
-/// A read that errors is reported as absent. `mlua` coerces freely, so the
-/// only way to get an error out of these is a value of a kind that cannot
-/// become a number or a string at all -- a table where a spread should be --
-/// and for that the effect's own default is a better answer than refusing the
-/// whole call.
-struct Given<'a>(&'a Table);
-
-impl solium_effects::Params for Given<'_> {
-    fn number(&self, key: &str) -> Option<f64> {
-        self.0.get::<Option<f64>>(key).ok().flatten()
-    }
-
-    fn word(&self, key: &str) -> Option<String> {
-        self.0.get::<Option<String>>(key).ok().flatten()
-    }
-}
+/// The keys of a `deform` that are not the effect's params.
+const DEFORM_KEYS: [&str; 7] = [
+    "effect",
+    "to",
+    "axis",
+    "progress",
+    "seed",
+    "failed",
+    "on_reload",
+];
 
 /// Read a deformation out of a `sol.present` options table.
 ///
@@ -5584,44 +5740,106 @@ impl solium_effects::Params for Given<'_> {
 ///            to = { x = 600, y = 1040, w = 120, h = 24 } }
 /// ```
 ///
-/// The effect is *named* rather than described, and the name is looked up in
-/// the engine rather than matched here -- so an effect added to
-/// `crates/effects` is available to every script the moment it compiles,
-/// exactly as a curve added to `crates/animation` is. Its parameters come out
-/// of the same table and are that effect's business, not this function's.
+/// The effect is an effect folder, *named* rather than described: the name
+/// is resolved by the effect host where the command is applied, your copy in
+/// `~/.config/solium/effects/` before the shipped one. Every other key but
+/// `to`, `axis`, `progress`, `seed`, `failed` and `on_reload` is one of that
+/// effect's params, bound and checked by the effect, not here.
 ///
 /// `to` is the **anchor**: what the window is being pulled into, or drawn out
 /// of. See `present::Anchor` for why naming a thing rather than a rectangle is
-/// the point of the key.
-fn deform_from(options: &Table) -> mlua::Result<Option<Deform>> {
+/// the point of the key. `axis` is a word, `"auto"` among them; `progress`
+/// is 1 when it is not given, all the way in, which is what one animates
+/// towards; `seed`, `failed` and `on_reload` are refused outside their
+/// words, naming the key (`tests::a_deforms_own_keys_are_refused_outside_their_words`).
+fn deform_from(options: &Table) -> mlua::Result<Option<DeformSpec>> {
+    use crate::effect::settings::{PresentFailed, PresentReload, said};
+    use crate::effect::tree::Tree;
     let Some(deform) = options.get::<Option<Table>>("deform")? else {
         return Ok(None);
     };
-    let Some(name) = deform.get::<Option<String>>("effect")? else {
+    let Some(effect) = deform.get::<Option<String>>("effect")? else {
         return Err(mlua::Error::runtime(
             "a deform needs an `effect` name, such as { effect = \"genie\" }",
         ));
-    };
-    // Warned about and dropped rather than refused, the way an unknown easing
-    // is: a mode naming an effect this build does not have should lose the
-    // effect and not the window. `script::shipped` is what stops one shipping.
-    let Some(effect) = solium_effects::Deform::from_name(&name, &Given(&deform)) else {
-        tracing::warn!(
-            effect = name,
-            known = ?solium_effects::Deform::all().map(|(known, _)| known),
-            "unknown effect, drawing the window undeformed"
-        );
-        return Ok(None);
     };
     let Some(to) = deform.get::<Option<Table>>("to")? else {
         return Err(mlua::Error::runtime(
             "a deform needs a `to` to aim at: { window = id }, { surface = name } or a rect",
         ));
     };
-    Ok(Some(Deform {
+    let refused =
+        |key: &str, what: String| mlua::Error::runtime(format!("a deform's `{key}` is {what}"));
+    let axis = deform.get::<Option<String>>("axis")?;
+    if let Some(word) = &axis
+        && word != "auto"
+        && solium_effects::Axis::from_name(word).is_none()
+    {
+        let mut words = vec!["auto"];
+        words.extend(solium_effects::Axis::all().map(|(name, _)| name));
+        return Err(refused("axis", said(&words)));
+    }
+    let progress = deform.get::<Option<f64>>("progress")?.unwrap_or(1.0);
+    if !progress.is_finite() {
+        return Err(refused("progress", "a finite number".to_owned()));
+    }
+    let seed = deform.get::<Option<f64>>("seed")?;
+    if seed.is_some_and(|seed| !(0.0..1.0).contains(&seed)) {
+        return Err(refused("seed", "a number from 0 up to 1".to_owned()));
+    }
+    let word = |key: &str, words: &[&str]| -> mlua::Result<Option<String>> {
+        match deform.get::<Option<String>>(key)? {
+            Some(word) if !words.contains(&word.as_str()) => Err(refused(key, said(words))),
+            other => Ok(other),
+        }
+    };
+    let failed = word("failed", &PresentFailed::WORDS)?
+        .as_deref()
+        .and_then(PresentFailed::from_word);
+    let on_reload = word("on_reload", &PresentReload::WORDS)?
+        .as_deref()
+        .and_then(PresentReload::from_word);
+    let mut params = Vec::new();
+    for pair in deform.pairs::<String, Value>() {
+        let (key, value) = pair?;
+        if DEFORM_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        match Tree::from_lua(&value)?.as_ref().and_then(Tree::value) {
+            Some(value) => params.push((key, value)),
+            None => {
+                return Err(refused(
+                    &key,
+                    "not a param's value: a number, a boolean, a word or four numbers".to_owned(),
+                ));
+            }
+        }
+    }
+    params.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(Some(DeformSpec {
         effect,
+        params,
+        axis,
+        progress,
         aim: aim_from(&to)?,
+        seed,
+        failed,
+        on_reload,
     }))
+}
+
+/// The deform `sol.present(id, { deform = <lua> })` carries, for a state
+/// test to apply as the command would.
+#[cfg(test)]
+pub(crate) fn deform_for_test(lua: &str) -> DeformSpec {
+    let state = Lua::new();
+    let options: Table = state
+        .load(format!("return {{ deform = {lua} }}"))
+        .eval()
+        .expect("the test's deform");
+    deform_from(&options)
+        .expect("a deform")
+        .expect("a deform given")
 }
 
 /// Read a deform's anchor: a thing to follow, or a place to aim at.
@@ -6000,6 +6218,8 @@ mod tests {
                 max: None,
                 cramped: false,
                 shown: true,
+                fullscreen: false,
+                style: String::new(),
                 x11_type: None,
                 accepts_input: true,
                 class: None,
@@ -6035,6 +6255,7 @@ mod tests {
             cursor: (0.0, 0.0),
             screens: Vec::new(),
             text_input: None,
+            problems: Vec::new(),
             apps: Vec::new(),
         };
 
@@ -8395,6 +8616,8 @@ mod tests {
             max: None,
             cramped: false,
             shown: true,
+            fullscreen: false,
+            style: String::new(),
             x11_type: None,
             accepts_input: true,
             class: None,
@@ -8431,6 +8654,160 @@ mod tests {
         );
     }
 
+    /// **A configuration that fails to load names its file and line** as
+    /// `<path>:<line>:`, the form every other Lua error in Solium takes, so
+    /// a failed reload can be put on the overlay where it is
+    /// (`effect::host::config_problem`). Named as a bare string, the chunk
+    /// read `[string "<path>"]:2:`.
+    #[test]
+    fn a_configuration_error_names_its_file_and_line() {
+        let directory =
+            std::env::temp_dir().join(format!("solium-config-error-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&directory);
+        let config = directory.join("init.lua");
+        std::fs::write(&config, "sol.pane('none')\nthis is not lua\n")
+            .expect("writing the test script");
+        let error = Scripts::load(&config)
+            .err()
+            .map(|err| format!("{err:#}"))
+            .expect("a configuration that is not Lua fails to load");
+        let _ = std::fs::remove_dir_all(&directory);
+        assert!(
+            error.contains(&format!("{}:2: ", config.display())),
+            "{error}"
+        );
+    }
+
+    /// **A broken effect reaches `sol.problems()` with its file and line.**
+    #[test]
+    fn a_broken_effect_reaches_sol_problems_with_its_file_and_line() {
+        let directory =
+            std::env::temp_dir().join(format!("solium-problems-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&directory);
+        let config = directory.join("init.lua");
+        std::fs::write(
+            &config,
+            r#"
+            sol.bind("Super+P", function()
+                local row = sol.problems()[1]
+                sol.status(string.format("%s %s %d %s", row.effect, row.file, row.line, row.message))
+            end)
+        "#,
+        )
+        .expect("writing the test script");
+        let mut scripts = Scripts::load(&config).expect("loading the test script");
+        let mut snapshot = empty_snapshot();
+        snapshot.problems = vec![super::ProblemRow {
+            effect: "blur".to_owned(),
+            file: "/x/blur/down.frag".to_owned(),
+            line: Some(2),
+            column: None,
+            message: "`p_ofset` is not a param".to_owned(),
+            severity: "error",
+        }];
+        let outcome = scripts.key("super+p", snapshot);
+        let _ = std::fs::remove_dir_all(&directory);
+        assert_eq!(
+            outcome.status.as_deref(),
+            Some("blur /x/blur/down.frag 2 `p_ofset` is not a param")
+        );
+    }
+
+    /// **The `problems` event fires once per change**, to every listener.
+    #[test]
+    fn the_problems_event_reaches_its_listeners() {
+        let directory =
+            std::env::temp_dir().join(format!("solium-problems-event-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&directory);
+        let config = directory.join("init.lua");
+        std::fs::write(
+            &config,
+            "local n = 0\nsol.on('problems', function() n = n + 1; sol.status(tostring(n)) end)\n",
+        )
+        .expect("writing");
+        let mut scripts = Scripts::load(&config).expect("loading");
+        let outcome = scripts.problems_changed(empty_snapshot());
+        let _ = std::fs::remove_dir_all(&directory);
+        assert_eq!(outcome.status.as_deref(), Some("1"));
+    }
+
+    /// **The shipped configuration shows the problems on the primary
+    /// monitor**, in its top-right corner as `file:line: message` rows, at
+    /// most eight and then a count, taking no input; and takes the overlay
+    /// away when none are left.
+    #[test]
+    fn the_shipped_overlay_lists_the_problems_on_the_primary_monitor() {
+        let Some((directory, mut scripts)) =
+            shipped_init_with_user("solium-problems-overlay", "return {}")
+        else {
+            return;
+        };
+        let mut snapshot = one_screen(&[]);
+        snapshot.problems = (1..=10)
+            .map(|line| super::ProblemRow {
+                effect: "blur".to_owned(),
+                file: "/x/blur/down.frag".to_owned(),
+                line: Some(line),
+                column: None,
+                message: "`p_ofset` is not a param".to_owned(),
+                severity: if line == 1 { "warning" } else { "error" },
+            })
+            .collect();
+        let shown = scripts.problems_changed(snapshot).commands;
+        let gone = scripts.problems_changed(one_screen(&[])).commands;
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let declared: Vec<&crate::scripted::Declaration> = shown
+            .iter()
+            .filter_map(|command| match command {
+                Command::Surface(declared) if declared.name == "problems" => Some(&**declared),
+                _ => None,
+            })
+            .collect();
+        let [overlay] = declared.as_slice() else {
+            panic!("one overlay, not {}: {shown:?}", declared.len());
+        };
+        assert!(
+            overlay.scene.ends_with("problems.qml"),
+            "{:?}",
+            overlay.scene
+        );
+        assert_eq!(overlay.layer, crate::scripted::Layer::Overlay);
+        assert!(!overlay.interactive, "the overlay takes no input");
+        assert_eq!(
+            overlay.on,
+            crate::scripted::On::Rect(smithay::utils::Rectangle::new(
+                (840, 0).into(),
+                (760, 240).into()
+            )),
+            "the top-right corner of the 1600-wide primary monitor"
+        );
+        let properties = overlay.properties.render();
+        assert!(
+            properties.contains(
+                r#"{"severity":"warning","text":"/x/blur/down.frag:1: `p_ofset` is not a param"}"#
+            ),
+            "{properties}"
+        );
+        assert!(
+            properties.contains(r#""text":"/x/blur/down.frag:8: "#),
+            "{properties}"
+        );
+        assert!(
+            !properties.contains(r#""text":"/x/blur/down.frag:9: "#),
+            "{properties}"
+        );
+        assert!(
+            properties.contains(r#""text":"and 2 more""#),
+            "{properties}"
+        );
+        assert!(
+            gone.iter()
+                .any(|command| matches!(command, Command::SurfaceGone(name) if name == "problems")),
+            "the overlay stays with nothing left to show: {gone:?}"
+        );
+    }
+
     /// A snapshot with nothing in it, for the tests that only want a call made.
     fn empty_snapshot() -> Snapshot {
         Snapshot {
@@ -8441,22 +8818,24 @@ mod tests {
             cursor: (0.0, 0.0),
             screens: Vec::new(),
             text_input: None,
+            problems: Vec::new(),
             apps: Vec::new(),
         }
     }
 
-    /// **A script names an effect, and what comes back is the engine's.**
+    /// **A script names an effect folder, and its params and anchor come
+    /// through as it wrote them.**
     ///
-    /// The round trip nothing else covers: `crates/effects` has thorough unit
-    /// tests and knows nothing about Lua, and `script::shipped` reads names out
-    /// of files without running them. This is the join -- an effect resolved by
-    /// name, its parameters read through `Given`, and both kinds of anchor.
+    /// The join `script::shipped` cannot see: a deform's effect is a folder's
+    /// name, resolved by the effect host where the command is applied, its
+    /// params every key but the deform's own, and its anchor.
     ///
     /// The anchor is the half worth pinning. `{ window = 9 }` must survive as
     /// an *identity* all the way to the command, because the moment it becomes
     /// a rectangle here it is a rectangle measured when the key was pressed.
     #[test]
     fn a_script_names_an_effect_and_the_engine_answers() {
+        use solium_effects::spec::Value as Param;
         let directory = std::env::temp_dir().join("solium-script-test-deform");
         let _ = std::fs::create_dir_all(&directory);
         let config = directory.join("init.lua");
@@ -8467,10 +8846,13 @@ mod tests {
                 sol.present(1, { deform = { effect = "genie", axis = "left",
                                             spread = 2.5,
                                             to = { x = 10, y = 20, w = 30, h = 40 } } })
-                sol.present(2, { deform = { effect = "genie", to = { window = 9 } } })
+                sol.present(2, { deform = { effect = "genie", axis = "auto", progress = 0.5,
+                                            seed = 0.25, failed = "hide", on_reload = "keep",
+                                            to = { window = 9 } } })
                 sol.present(3, { deform = { effect = "nonsense", to = { window = 9 } } })
                 sol.present(4, {})
-                sol.present(5, { deform = { effect = "genie", to = { surface = "dock" } } })
+                sol.present(5, { deform = { effect = "genie", tint = { 1, 0, 0, 1 }, on = true,
+                                            to = { surface = "dock" } } })
             end)
             "#,
         )
@@ -8478,7 +8860,7 @@ mod tests {
 
         let mut scripts = Scripts::load(&config).expect("loading the test script");
         let outcome = scripts.key("super+1", Snapshot::default());
-        let deforms: Vec<Option<Deform>> = outcome
+        let deforms: Vec<Option<DeformSpec>> = outcome
             .commands
             .iter()
             .map(|command| match command {
@@ -8488,53 +8870,102 @@ mod tests {
             .collect();
         assert_eq!(deforms.len(), 5);
 
+        let spec = |effect: &str, params: Vec<(String, Param)>, aim: Aim| DeformSpec {
+            effect: effect.to_owned(),
+            params,
+            axis: None,
+            // Not named, so all the way in, which is what one animates
+            // towards.
+            progress: 1.0,
+            aim,
+            seed: None,
+            failed: None,
+            on_reload: None,
+        };
         assert_eq!(
             deforms[0],
-            Some(Deform {
-                effect: solium_effects::Deform::Genie {
-                    // Not named, so the effect's own default: all the way in,
-                    // which is what one animates towards.
-                    progress: 1.0,
-                    spread: 2.5,
-                    axis: solium_effects::Axis::Left,
-                },
-                aim: Aim::Rect(Rect {
-                    x: 10.0,
-                    y: 20.0,
-                    w: 30.0,
-                    h: 40.0
-                }),
+            Some(DeformSpec {
+                axis: Some("left".to_owned()),
+                ..spec(
+                    "genie",
+                    vec![("spread".to_owned(), Param::Number(2.5))],
+                    Aim::Rect(Rect {
+                        x: 10.0,
+                        y: 20.0,
+                        w: 30.0,
+                        h: 40.0
+                    }),
+                )
             })
         );
         assert_eq!(
             deforms[1],
-            Some(Deform {
-                effect: solium_effects::Deform::Genie {
-                    progress: 1.0,
-                    spread: 1.0,
-                    axis: solium_effects::Axis::Down,
-                },
-                aim: Aim::Window(9),
+            Some(DeformSpec {
+                axis: Some("auto".to_owned()),
+                progress: 0.5,
+                seed: Some(0.25),
+                failed: Some(crate::effect::settings::PresentFailed::Hide),
+                on_reload: Some(crate::effect::settings::PresentReload::Keep),
+                ..spec("genie", Vec::new(), Aim::Window(9))
             })
         );
-        // An effect this build does not have loses the effect, not the window.
-        assert_eq!(deforms[2], None);
+        // A folder nobody has is the effect host's to say, where the command
+        // is applied: here it is only a name.
+        assert_eq!(
+            deforms[2],
+            Some(spec("nonsense", Vec::new(), Aim::Window(9)))
+        );
         assert_eq!(deforms[3], None);
         // **A surface survives this far as a name.** It becomes a
         // `scripted::SurfaceId` in `Solium::aimed`, which is the first place
         // that can see whether there is a surface by that name -- and the id is
-        // what keeps `present::Frame` `Copy`.
+        // what keeps `present::Frame` `Copy`. Params of every kind, sorted.
         assert_eq!(
             deforms[4],
-            Some(Deform {
-                effect: solium_effects::Deform::Genie {
-                    progress: 1.0,
-                    spread: 1.0,
-                    axis: solium_effects::Axis::Down,
-                },
-                aim: Aim::Surface("dock".to_owned()),
-            })
+            Some(spec(
+                "genie",
+                vec![
+                    ("on".to_owned(), Param::Bool(true)),
+                    ("tint".to_owned(), Param::Vec4([1.0, 0.0, 0.0, 1.0])),
+                ],
+                Aim::Surface("dock".to_owned()),
+            ))
         );
+    }
+
+    /// **A deform's own keys are refused outside their words**, each naming
+    /// the key: `seed` in [0, 1), `failed`, `on_reload`, `axis`, and a param
+    /// that is no param's value.
+    #[test]
+    fn a_deforms_own_keys_are_refused_outside_their_words() {
+        let lua = Lua::new();
+        let cases = [
+            ("seed = 1", "`seed` is a number from 0 up to 1"),
+            ("seed = -0.5", "`seed` is a number from 0 up to 1"),
+            ("failed = 'fade'", "`failed` is \"flat\" or \"hide\""),
+            (
+                "on_reload = 'switch'",
+                "`on_reload` is \"flat\" or \"keep\"",
+            ),
+            ("axis = 'sideways'", "`axis` is \"auto\" or \"down\""),
+            ("progress = 0/0", "`progress` is a finite number"),
+            ("spread = { 1, 2 }", "`spread` is not a param's value"),
+        ];
+        for (key, says) in cases {
+            let options: Table = lua
+                .load(format!(
+                    "return {{ deform = {{ effect = 'genie', {key}, to = {{ window = 2 }} }} }}"
+                ))
+                .eval()
+                .expect("the test's table");
+            let error = deform_from(&options).expect_err(key).to_string();
+            assert!(error.contains(says), "{key}: {error}");
+        }
+        let options: Table = lua
+            .load("return { deform = { effect = 'genie', seed = 0, failed = 'flat', on_reload = 'flat', to = { window = 2 } } }")
+            .eval()
+            .expect("the test's table");
+        assert!(deform_from(&options).is_ok_and(|deform| deform.is_some()));
     }
 
     /// **A script says how deep a window is drawn and what it turns about.**
@@ -8892,6 +9323,8 @@ mod tests {
                     max: None,
                     cramped: false,
                     shown: true,
+                    fullscreen: false,
+                    style: String::new(),
                     x11_type: None,
                     accepts_input: true,
                     class: None,
@@ -8928,6 +9361,7 @@ mod tests {
             cursor: (0.0, 0.0),
             screens: Vec::new(),
             text_input: None,
+            problems: Vec::new(),
             apps: Vec::new(),
         }
     }
@@ -9294,6 +9728,32 @@ mod tests {
         );
     }
 
+    /// **The shipped configuration frames every window in `glass`**: the
+    /// shipped `init.lua` hands the compositor `pane = "glass"` when a
+    /// `user.lua` says nothing, and the style a `user.lua` names when it
+    /// names one, which is how to go back to `top`.
+    #[test]
+    fn the_shipped_configuration_frames_windows_in_glass() {
+        for (user, wanted) in [("return {}", "glass"), ("return { pane = \"top\" }", "top")] {
+            let Some((directory, mut scripts)) =
+                shipped_init_with_user("solium-script-test-pane", user)
+            else {
+                return;
+            };
+            let handed: Vec<Option<String>> = scripts
+                .startup()
+                .commands
+                .into_iter()
+                .filter_map(|command| match command {
+                    Command::Decoration { name } => Some(name),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(handed, vec![Some(wanted.to_owned())], "{user}");
+            let _ = std::fs::remove_dir_all(&directory);
+        }
+    }
+
     /// **`fullscreen.covers` reaches the compositor from the shipped
     /// `init.lua`**: the default when a `user.lua` says nothing, `"none"` when
     /// it says that, and the default kept for a word that is neither.
@@ -9497,6 +9957,301 @@ mod tests {
                 handed, expected,
                 "resize = {resize}: at load, then tiling, then scrolling"
             );
+        }
+    }
+
+    /// **`sol.effects` reaches the compositor as rules**, parsed.
+    #[test]
+    fn sol_effects_reaches_the_compositor_as_rules() {
+        let directory =
+            std::env::temp_dir().join(format!("solium-effects-rules-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&directory);
+        let config = directory.join("init.lua");
+        std::fs::write(
+            &config,
+            r#"sol.effects({ rules = { { match = { app_id = "mpv" }, part = "client", slot = "replace", effect = { "blur", source = "self" } } } })"#,
+        )
+        .expect("writing");
+        let mut scripts = Scripts::load(&config).expect("loading");
+        let commands = scripts.startup().commands;
+        let _ = std::fs::remove_dir_all(&directory);
+        let rules = commands.iter().find_map(|command| match command {
+            Command::Effects { rules, .. } => Some(rules.clone()),
+            _ => None,
+        });
+        assert_eq!(rules.expect("sent").expect("parsed").len(), 1);
+    }
+
+    /// **`sol.effects` reaches the compositor with its settings**: the
+    /// engine's keys beside the rules, parsed; a key out of its bounds is
+    /// the set's error; no options at all are the defaults.
+    #[test]
+    fn sol_effects_reaches_the_compositor_with_its_settings() {
+        let directory =
+            std::env::temp_dir().join(format!("solium-effects-settings-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&directory);
+        let config = directory.join("init.lua");
+        std::fs::write(
+            &config,
+            "sol.effects({ rules = {}, sandbox = { load_ms = 250 }, present = { failed = 'hide' } })\n\
+             sol.effects({ limits = { params = 99 } })\nsol.effects()\n",
+        )
+        .expect("writing");
+        let mut scripts = Scripts::load(&config).expect("loading");
+        let commands = scripts.startup().commands;
+        let _ = std::fs::remove_dir_all(&directory);
+        let sets: Vec<_> = commands
+            .into_iter()
+            .filter_map(|command| match command {
+                Command::Effects { settings, .. } => Some(settings),
+                _ => None,
+            })
+            .collect();
+        let [set, refused, none] = sets.as_slice() else {
+            panic!("three sets: {sets:?}");
+        };
+        let set = set.as_ref().expect("parsed");
+        assert_eq!(set.sandbox.load, std::time::Duration::from_millis(250));
+        assert_eq!(
+            set.present.failed,
+            crate::effect::settings::PresentFailed::Hide
+        );
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|error| error.contains("effects.limits.params")),
+            "{refused:?}"
+        );
+        assert_eq!(none, &Ok(crate::effect::settings::Settings::default()));
+    }
+
+    /// **`sol.effects` reads `xray` and `memo`** (Rulings F29, F30; amended
+    /// 2026-10-08, configurable): both reach the compositor in its settings,
+    /// parsed; a word outside `split`'s words is the set's error, naming it;
+    /// and a number that is not finite is refused by name rather than
+    /// dropped for the default, as `effect::settings::tree_of` keeps it in
+    /// both tables and in their lists, so `budget_mib = 1/0` is not "no
+    /// cap", `scale = 0/0` is not 1, and `layers = { "background", 0/0 }`
+    /// is not the wallpaper alone.
+    #[test]
+    fn sol_effects_reads_xray_and_memo() {
+        let directory =
+            std::env::temp_dir().join(format!("solium-effects-xray-memo-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&directory);
+        let config = directory.join("init.lua");
+        std::fs::write(
+            &config,
+            "sol.effects({ xray = { keep_ms = 0 }, memo = { split = 'off' } })\n\
+             sol.effects({ memo = { split = 'short' } })\n\
+             sol.effects({ memo = { budget_mib = 1/0 } })\n\
+             sol.effects({ xray = { scale = 0/0 } })\n\
+             sol.effects({ xray = { keep_ms = -1/0 } })\n\
+             sol.effects({ xray = 1/0 })\n\
+             sol.effects({ xray = { layers = { 0/0 } } })\n\
+             sol.effects({ xray = { layers = { 'background', 0/0 } } })\n",
+        )
+        .expect("writing");
+        let mut scripts = Scripts::load(&config).expect("loading");
+        let commands = scripts.startup().commands;
+        let _ = std::fs::remove_dir_all(&directory);
+        let sets: Vec<_> = commands
+            .into_iter()
+            .filter_map(|command| match command {
+                Command::Effects { settings, .. } => Some(settings),
+                _ => None,
+            })
+            .collect();
+        let [read, refused @ ..] = sets.as_slice() else {
+            panic!("eight sets: {sets:?}");
+        };
+        let read = read.as_ref().expect("parsed");
+        assert_eq!(
+            (read.xray.keep_ms, read.memo.split),
+            (0, solium_effects::stage::Split::Off)
+        );
+        assert_eq!(
+            (read.xray.scale, read.memo.budget_mib),
+            (1.0, 0),
+            "what was not said is the default"
+        );
+        let says = [
+            "`effects.memo.split`",
+            "`effects.memo.budget_mib`",
+            "`effects.xray.scale`",
+            "`effects.xray.keep_ms`",
+            "`effects.xray` is a table",
+            "`effects.xray.layers` is a list of words",
+            "`effects.xray.layers` is a list of words",
+        ];
+        assert_eq!(refused.len(), says.len(), "{refused:?}");
+        for (refused, says) in refused.iter().zip(says) {
+            assert!(
+                refused.as_ref().is_err_and(|error| error.contains(says)),
+                "{says}: {refused:?}"
+            );
+        }
+    }
+
+    /// **`sol.startup` reaches the compositor**: `first_frame` read and
+    /// checked into `Command::Startup`, with no table the default, and a
+    /// refused value, a number that is not finite or an unknown key an
+    /// `Err` naming what is wrong.
+    #[test]
+    fn sol_startup_reaches_the_compositor() {
+        let directory = std::env::temp_dir().join(format!("solium-startup-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&directory);
+        let config = directory.join("init.lua");
+        std::fs::write(
+            &config,
+            "sol.startup({ first_frame = { max_ms = 500 } })\n\
+             sol.startup()\n\
+             sol.startup({ first_frame = { max_ms = -1 } })\n\
+             sol.startup({ first_frame = { max_ms = 1/0 } })\n\
+             sol.startup({ frist_frame = {} })\n\
+             sol.startup({ first_frame = 5 })\n",
+        )
+        .expect("writing");
+        let mut scripts = Scripts::load(&config).expect("loading");
+        let commands = scripts.startup().commands;
+        let _ = std::fs::remove_dir_all(&directory);
+        let read: Vec<_> = commands
+            .into_iter()
+            .filter_map(|command| match command {
+                Command::Startup(first_frame) => Some(first_frame),
+                _ => None,
+            })
+            .collect();
+        let [given, none, refused @ ..] = read.as_slice() else {
+            panic!("six calls: {read:?}");
+        };
+        assert_eq!(
+            given,
+            &Ok(crate::warm::FirstFrame {
+                max_ms: 500,
+                ..crate::warm::FirstFrame::default()
+            })
+        );
+        assert_eq!(none, &Ok(crate::warm::FirstFrame::default()));
+        let says = [
+            "`startup.first_frame.max_ms`",
+            "`startup.first_frame.max_ms`",
+            "did you mean `first_frame`?",
+            "`startup.first_frame` is a table",
+        ];
+        assert_eq!(refused.len(), says.len(), "{refused:?}");
+        for (refused, says) in refused.iter().zip(says) {
+            assert!(
+                refused.as_ref().is_err_and(|error| error.contains(says)),
+                "{says}: {refused:?}"
+            );
+        }
+    }
+
+    /// **A broken rule reaches the compositor as its errors**, so the
+    /// compositor can keep the rules that ran and list them; and
+    /// `sol.effects{}` with no `rules` is an empty set, not an error.
+    #[test]
+    fn a_broken_rule_reaches_the_compositor_as_its_errors() {
+        let directory =
+            std::env::temp_dir().join(format!("solium-effects-broken-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&directory);
+        let config = directory.join("init.lua");
+        std::fs::write(
+            &config,
+            "sol.effects({ rules = { { match = '*', part = 'cleint', slot = 'behind', effect = false } } })\nsol.effects({})\n",
+        )
+        .expect("writing");
+        let mut scripts = Scripts::load(&config).expect("loading");
+        let commands = scripts.startup().commands;
+        let _ = std::fs::remove_dir_all(&directory);
+        let sets: Vec<_> = commands
+            .into_iter()
+            .filter_map(|command| match command {
+                Command::Effects { rules, .. } => Some(rules),
+                _ => None,
+            })
+            .collect();
+        let [broken, empty] = sets.as_slice() else {
+            panic!("two sets: {sets:?}");
+        };
+        let errors = broken.as_ref().expect_err("refused");
+        assert_eq!((errors[0].rule, errors[0].key), (1, "part"));
+        assert_eq!(empty, &Ok(Vec::new()));
+    }
+
+    /// **The shipped configuration declares no rules**, and hands that over,
+    /// so a reload that removes a user's rules takes them away; a `user.lua`'s
+    /// rules replace the empty list whole.
+    #[test]
+    fn the_shipped_configuration_declares_no_rules() {
+        for (user, wanted) in [
+            ("return {}", 0),
+            (
+                "return { effects = { rules = { { match = '*', part = 'client', slot = 'behind', effect = 'glow' } } } }",
+                1,
+            ),
+        ] {
+            let Some((directory, mut scripts)) =
+                shipped_init_with_user("solium-effects-none", user)
+            else {
+                return;
+            };
+            let unknown = scripts.unknown_settings().len();
+            let rules = scripts
+                .startup()
+                .commands
+                .into_iter()
+                .find_map(|command| match command {
+                    Command::Effects { rules, .. } => Some(rules),
+                    _ => None,
+                });
+            let _ = std::fs::remove_dir_all(&directory);
+            assert_eq!(
+                rules.expect("sent").expect("parsed").len(),
+                wanted,
+                "{user}"
+            );
+            assert_eq!(unknown, 0, "{user}: `effects` is a setting");
+        }
+    }
+
+    /// **The shipped configuration writes out the engine's defaults**:
+    /// `config.lua`'s `effects.sandbox`, `limits` and `present` are the
+    /// numbers Rust defaults to, so the two cannot drift; and a `user.lua`
+    /// that raises one reaches the compositor.
+    #[test]
+    fn the_shipped_configuration_writes_out_the_engines_defaults() {
+        for (user, wanted) in [
+            ("return {}", crate::effect::settings::Settings::default()),
+            (
+                "return { effects = { sandbox = { load_ms = 300 } } }",
+                crate::effect::settings::Settings {
+                    sandbox: crate::effect::settings::Caps {
+                        load: std::time::Duration::from_millis(300),
+                        ..crate::effect::settings::Caps::default()
+                    },
+                    ..crate::effect::settings::Settings::default()
+                },
+            ),
+        ] {
+            let Some((directory, mut scripts)) =
+                shipped_init_with_user("solium-effects-settings", user)
+            else {
+                return;
+            };
+            let unknown = scripts.unknown_settings().len();
+            let settings =
+                scripts
+                    .startup()
+                    .commands
+                    .into_iter()
+                    .find_map(|command| match command {
+                        Command::Effects { settings, .. } => Some(settings),
+                        _ => None,
+                    });
+            let _ = std::fs::remove_dir_all(&directory);
+            assert_eq!(settings, Some(Ok(wanted)), "{user}");
+            assert_eq!(unknown, 0, "{user}: every key is a setting");
         }
     }
 
@@ -11432,45 +12187,43 @@ mod shipped {
         }
     }
 
-    /// **Every effect the shipped configuration asks for exists.**
+    /// **Every effect the shipped configuration asks for is a shipped
+    /// folder.**
     ///
     /// The easing case above, one layer over. `sol.present` takes `deform = {
-    /// effect = "..." }` and the name is resolved in `crates/effects` rather
-    /// than matched in `script.rs`, which is what makes adding *fold* or
-    /// *curl* a file in that crate — and which also means a misspelling is no
-    /// longer a Lua error but a warning and an undeformed window, seen by
-    /// nobody who was not reading the log.
+    /// effect = "..." }` and the name is an effect folder's, resolved by the
+    /// effect host where the command is applied -- which also means a
+    /// misspelling is not a Lua error but a problem on the overlay and an
+    /// undeformed window, so it is caught here before it ships.
     #[test]
     fn every_effect_named_is_one_the_engine_has() {
         let asked = everywhere("effect =");
         assert!(!asked.is_empty(), "no effects found; the scan is broken");
+        let shipped = crate::assets::effects();
         for (file, line, name) in asked {
             assert!(
-                solium_effects::Deform::from_name(&name, &()).is_some(),
-                "{file}:{line} asks for effect {name:?}, which Deform::from_name cannot read. \
-                 Names: {:?}",
-                solium_effects::Deform::all().map(|(known, _)| known)
+                shipped.join(&name).join("effect.lua").is_file(),
+                "{file}:{line} asks for effect {name:?}, which is no folder with an effect.lua in {}",
+                shipped.display()
             );
         }
     }
 
     /// **And every axis, which is worse when it is wrong.**
     ///
-    /// An unknown *effect* is at least logged. An unknown parameter cannot be:
-    /// `crates/effects` has no logger by construction, and a word it cannot
-    /// read is indistinguishable there from one nobody wrote — so a genie
-    /// asked to sweep `"downwards"` silently sweeps `down`, which is right
-    /// four times in four and wrong the once somebody puts the dock on the
-    /// left.
+    /// A deform's `axis` is refused outside its words when the binding runs,
+    /// which is a binding that does nothing, seen by nobody who was not
+    /// reading the log. `"auto"` is one of them: the side the target lies
+    /// on, picked when the flight starts.
     #[test]
     fn every_axis_named_is_one_the_engine_has() {
         let asked = everywhere("axis =");
         assert!(!asked.is_empty(), "no axes found; the scan is broken");
         for (file, line, name) in asked {
             assert!(
-                solium_effects::Axis::from_name(&name).is_some(),
+                name == "auto" || solium_effects::Axis::from_name(&name).is_some(),
                 "{file}:{line} asks for axis {name:?}, which Axis::from_name cannot read. \
-                 Names: {:?}",
+                 Names: \"auto\" and {:?}",
                 solium_effects::Axis::all().map(|(known, _)| known)
             );
         }
@@ -12176,6 +12929,8 @@ mod dialogs {
             max: None,
             cramped: false,
             shown: true,
+            fullscreen: false,
+            style: String::new(),
             x11_type: None,
             accepts_input: true,
             class: None,
@@ -15743,6 +16498,8 @@ mod directions {
             max: None,
             cramped: false,
             shown: true,
+            fullscreen: false,
+            style: String::new(),
             x11_type: None,
             accepts_input: true,
             class: None,

@@ -35,14 +35,33 @@ fn newly_unwatched_paths(
 }
 
 impl Solium {
-    /// Turn what a script aimed at into what the compositor holds.
+    /// Turn what a script aimed at into what the compositor holds: the
+    /// anchor, and the effect folder through the host, its params bound and
+    /// packed, its axis resolved once, its seed and policies.
     ///
     /// The one place a surface's *name* becomes a [`crate::scripted::SurfaceId`]
     /// — which is what makes an anchor `Copy` and a `Frame` still cheap to
     /// blend. A name nobody has declared loses the effect and not the window,
     /// the same failure an anchor that stops resolving already has, and it says
     /// so once rather than every frame.
-    fn aimed(&self, deform: &crate::script::Deform) -> Option<present::Deform> {
+    ///
+    /// The folder is wanted (`"present"`, added to what earlier presents
+    /// want, so a second genie naming another effect does not drop the
+    /// first's mid-flight) and loaded at once. One nobody has carries no
+    /// effect ([`crate::effect::host::EffectId::NONE`]) and is drawn by its
+    /// `failed`, undeformed by default; params that do not bind, or pack past
+    /// `effects.limits.params`, are a problem on the overlay and the window
+    /// is drawn undeformed. `tests::real_client::a_present_deform_is_a_file`,
+    /// `tests::real_client::a_geometry_effect_with_twelve_params_presents_under_a_raised_limit`,
+    /// `tests::real_client::effects_present_is_the_default_a_deform_overrides`.
+    fn aimed(
+        &mut self,
+        pane: crate::pane::PaneId,
+        deform: &crate::script::DeformSpec,
+    ) -> Option<present::Deform> {
+        use crate::effect::geometry;
+        use crate::effect::host::{EffectId, Problem};
+        use crate::effect::settings::PresentReload;
         let anchor = match &deform.aim {
             crate::script::Aim::Rect(rect) => {
                 present::Anchor::Rect(present::logical((rect.x, rect.y), (rect.w, rect.h)))
@@ -59,8 +78,100 @@ impl Solium {
                 }
             },
         };
+        let name = deform.effect.as_str();
+        let failed = deform.failed.unwrap_or(self.effect_settings.present.failed);
+        let on_reload = deform
+            .on_reload
+            .unwrap_or(self.effect_settings.present.on_reload);
+        self.effects.add_wanted("present", [name.to_owned()]);
+        // The newest version: one still waiting for its frag to compile is
+        // drawn under the id it runs under from the next `prepare`, which
+        // compiles it first; else the one that runs
+        // (`tests::real_client::a_geometry_with_a_frag_presents_before_it_compiled`).
+        let found = self.effects.upcoming(name);
+        let running = self
+            .effects
+            .effect(name)
+            .filter(|_| !self.effects.has_pending(name));
+        // The axis, once, from where the window is drawn and where its
+        // target is now: `"auto"` (and none) the side the target lies on,
+        // kept for the whole flight.
+        let axis = match deform.axis.as_deref() {
+            Some(word) if word != "auto" => {
+                solium_effects::Axis::from_name(word).unwrap_or_default()
+            }
+            _ => {
+                let drawn = self
+                    .pane_outer_of(pane)
+                    .map(|outer| self.drawn(pane, outer).rect);
+                drawn.zip(self.anchor_rect(pane, anchor)).map_or_else(
+                    solium_effects::Axis::default,
+                    |(from, to)| {
+                        geometry::auto_axis(present::for_effects(from), present::for_effects(to))
+                    },
+                )
+            }
+        };
+        let geometry = |effect, params| present::Geometry {
+            effect,
+            progress: deform.progress,
+            params,
+            axis,
+            seed: deform.seed.unwrap_or(0.0),
+            failed,
+            on_reload,
+        };
+        let Some(id) = found else {
+            tracing::warn!(
+                effect = name,
+                "no geometry effect by that name loaded, drawing the window by its `failed`"
+            );
+            return Some(present::Deform {
+                effect: geometry(EffectId::NONE, geometry::Params::default()),
+                anchor,
+            });
+        };
+        // Bound against the version it is drawn with.
+        let (file, bound) = self
+            .effects
+            .latest(name)
+            .map(|loaded| (loaded.dir().join("effect.lua"), loaded.bind(&deform.params)))?;
+        // Its own problems, said again for this present or mended by it.
+        let label = format!("present:{name}");
+        self.effects.clear_problems_of(&label);
+        let packed = bound.map_err(|problem| problem.message).and_then(|bound| {
+            for warning in &bound.warnings {
+                self.effects.push_problem(Problem::warning(
+                    &label,
+                    &file,
+                    format!("sol.present: {}", warning.message),
+                ));
+            }
+            geometry::packed(&bound.params, self.effect_settings.limits.params)
+        });
+        let params = match packed {
+            Ok(params) => params,
+            Err(message) => {
+                self.effects.push_problem(Problem::error(
+                    &label,
+                    &file,
+                    None,
+                    format!("sol.present: {message}"),
+                ));
+                return None;
+            }
+        };
+        if let Some(held) = self.panes.get_mut(pane) {
+            let meshes = held.meshes_mut();
+            // A version still compiling is not pinned: the id answers for
+            // it once it runs.
+            meshes.pinned = running.filter(|_| on_reload == PresentReload::Keep);
+            // A present of its own: what it refuses is said again
+            // (`tests::real_client::a_present_refused_for_its_popups_alone_is_said_once`).
+            meshes.begin();
+        }
         Some(present::Deform {
-            effect: deform.effect,
+            effect: geometry(id, params),
             anchor,
         })
     }
@@ -188,7 +299,11 @@ impl Solium {
                     pivot,
                     animation,
                 } => {
-                    let Some(pane) = self.panes.by_script_id(id) else {
+                    let Some(pane_id) = self.panes.by_script_id(id).map(Pane::id) else {
+                        continue;
+                    };
+                    let deform = deform.and_then(|deform| self.aimed(pane_id, &deform));
+                    let Some(pane) = self.panes.get(pane_id) else {
                         continue;
                     };
                     let outer = self.pane_outer(pane);
@@ -205,7 +320,7 @@ impl Solium {
                         // own rectangle. See `Frame::zoom`.
                         zoom: Frame::zoom_of(rect, outer),
                         opacity: opacity.unwrap_or(1.0),
-                        deform: deform.and_then(|deform| self.aimed(&deform)),
+                        deform,
                         // Both arrive resolved: `script::depth_from` and
                         // `script::pivot_from` hold the defaults, so a table
                         // mentioning neither key produces them there rather
@@ -519,6 +634,8 @@ impl Solium {
                         self.redraw = true;
                     }
                 }
+                Command::Effects { rules, settings } => self.apply_effects_set(rules, settings),
+                Command::Startup(first_frame) => self.apply_startup(first_frame),
                 Command::Decoration { name } => {
                     // The slots windows occupy are kept; what changes is how
                     // much of each slot the frame takes, so every client is
@@ -543,6 +660,11 @@ impl Solium {
                         // layout's arithmetic and only the layout can redo it.
                         self.trigger_relayout();
                     }
+                    // Changed or not: the configuration's first `sol.pane`
+                    // may name the style already set, and its rules are
+                    // bound when the style is applied (Ruling 15,
+                    // `tests::sol_pane_binds_the_styles_rules_and_a_reload_binds_them_again`).
+                    self.apply_style_rules();
                 }
                 Command::PaneValues(fields) => {
                     if self.decorations.merge_values(fields) {
@@ -822,7 +944,43 @@ impl Solium {
                 // declares again inside this same held dispatch, so nothing
                 // flickers for one that still does.
                 self.workspaces = None;
+                // The effect folders, read again: a changed one is pending
+                // until the next `prepare` compiles it, and a broken one
+                // keeps what ran (`a_reload_reads_the_effect_folders_again`).
+                // Before the scripts start, so the rules their `sol.effects`
+                // hands over bind against the folders as they now are
+                // (`a_reload_binds_the_rules_against_the_folders_it_read`).
+                // A `sol.present` geometry under way keeps its name wanted,
+                // so an unchanged folder keeps its version and its id, and
+                // only a changed one ends the present by its `on_reload`
+                // (`tests::real_client::a_reload_that_leaves_a_presents_folder_unchanged_keeps_it`).
+                let now = self.clock.now();
+                let live: Vec<String> = self
+                    .panes
+                    .iter()
+                    .flat_map(|pane| present::geometries(pane, now))
+                    .filter_map(|geometry| self.effects.name_of(geometry.effect))
+                    .map(str::to_owned)
+                    .collect();
+                self.effects.reload_keeping(live);
+                // The style's rules, read and bound again against the folders
+                // as they now are, for a configuration that does not name its
+                // style again
+                // (`tests::sol_pane_binds_the_styles_rules_and_a_reload_binds_them_again`).
+                self.apply_style_rules();
+                // What the old configuration's refused `sol.effects` said is
+                // the old configuration's: the new one says it again, or it
+                // is gone (`tests::a_reload_drops_a_refused_settings_problem`).
+                self.effects.clear_problems_of("settings");
+                self.effects.clear_problems_of("startup");
                 self.start_scripts(Some(scripts));
+                // After the new configuration's `sol.startup`, so its
+                // `on_reload` is the one obeyed: the first frame's gate armed
+                // again (`tests::a_reload_arms_the_first_frames_gate_only_with_on_reload`).
+                self.warm.reloaded();
+                // A configuration that loads mends the one that did not
+                // (`a_failed_reload_is_a_problem_until_one_succeeds`).
+                self.effects.clear_problems_of("config");
                 // The re-announcement, in the order the doc comment states.
                 // Three dispatches and not one, each with its own snapshot,
                 // because what `monitors` does changes what `layout` is
@@ -863,6 +1021,13 @@ impl Solium {
             }
             Err(err) => {
                 tracing::error!(?err, config = %path.display(), "reload failed, keeping what was running");
+                // On the overlay of the configuration still running, at its
+                // file and line (`a_failed_reload_is_a_problem_until_one_succeeds`).
+                // Replacing the last one: a second failed reload is one
+                // problem, not two.
+                self.effects.clear_problems_of("config");
+                self.effects
+                    .push_problem(crate::effect::host::config_problem(&format!("{err:#}")));
             }
         }
     }
@@ -983,6 +1148,286 @@ impl Solium {
         let outcome = scripts.monitors_changed(snapshot);
         self.scripts = Some(scripts);
         self.apply(outcome);
+    }
+
+    /// Tell the scripts the problems changed. From `Solium::settle`, after
+    /// the frame, never from `render::prepare`
+    /// (`tests::settle_tells_the_scripts_once_per_change_of_the_problems`).
+    pub(crate) fn trigger_problems_changed(&mut self) {
+        let snapshot = self.snapshot();
+        let Some(mut scripts) = self.scripts.take() else {
+            return;
+        };
+        let outcome = scripts.problems_changed(snapshot);
+        self.scripts = Some(scripts);
+        self.apply(outcome);
+    }
+
+    /// One `sol.effects`: its settings and its rules, or, when either did
+    /// not parse, neither, with every error on the overlay (Ruling 28): the
+    /// settings first, so the folders the same call's rules name load under
+    /// its caps. `tests::a_refused_effects_setting_keeps_everything_as_it_was`,
+    /// `tests::a_refused_set_with_broken_rules_says_both`.
+    pub(crate) fn apply_effects_set(
+        &mut self,
+        rules: Result<Vec<crate::effect::rules::Rule>, Vec<crate::effect::rules::RuleError>>,
+        settings: Result<crate::effect::settings::Settings, String>,
+    ) {
+        match settings {
+            Err(error) => {
+                self.effects.clear_problems_of("settings");
+                self.effects
+                    .push_problem(crate::effect::host::Problem::error(
+                        "settings",
+                        &Scripts::config_path(),
+                        None,
+                        error,
+                    ));
+                // The rules' own errors too, as they say them alone; rules
+                // that parsed are not taken, since the set is refused.
+                if rules.is_err() {
+                    self.apply_effects(rules);
+                }
+            }
+            Ok(settings) => {
+                self.effects.clear_problems_of("settings");
+                if rules.is_ok() {
+                    self.apply_settings(settings);
+                }
+                self.apply_effects(rules);
+            }
+        }
+    }
+
+    /// `sol.startup`'s `first_frame`, the first frame's gate: taken whole,
+    /// or refused on the overlay under `startup`, keeping what ran.
+    /// `tests::sol_startup_configures_the_gate_and_a_refusal_keeps_what_ran`.
+    pub(crate) fn apply_startup(&mut self, first_frame: Result<crate::warm::FirstFrame, String>) {
+        self.effects.clear_problems_of("startup");
+        match first_frame {
+            Ok(first_frame) => self.warm.configure(first_frame),
+            Err(error) => self
+                .effects
+                .push_problem(crate::effect::host::Problem::error(
+                    "startup",
+                    &Scripts::config_path(),
+                    None,
+                    error,
+                )),
+        }
+    }
+
+    /// The engine's own keys, `effects.sandbox`, `limits` and `present`
+    /// (Ruling 28), and `xray` and `memo` (Rulings F29, F30): kept for what
+    /// reads them, and the caps handed to the host and to the reader of a
+    /// style's `effects.lua`, which read again what new caps may change.
+    /// `effects.memo.split` goes to the host before anything binds, so the
+    /// user's rules `apply_effects` binds next, and a style's rebound here
+    /// when it changed, are split by it.
+    /// `tests::effects_sandbox_reaches_the_host_and_the_styles_reader`,
+    /// `tests::real_client::the_memo_split_key_reaches_the_bound_chain`.
+    pub(crate) fn apply_settings(&mut self, settings: crate::effect::settings::Settings) {
+        let caps = settings.sandbox;
+        let split = self.effects.set_memo_split(settings.memo.split);
+        self.effect_settings = settings;
+        let caps = self.effects.set_caps(caps).then_some(caps);
+        if let Some(caps) = caps {
+            crate::style::set_caps(caps);
+        }
+        if caps.is_some() || split {
+            self.apply_style_rules();
+        }
+    }
+
+    /// Rules from `sol.effects`: all of them bound and runnable, or none
+    /// taken and the errors on the overlay, so a broken set keeps the rules
+    /// that ran (`tests::a_broken_rule_keeps_the_rules_that_ran`,
+    /// `tests::a_blur_rule_without_source_binds_and_live_is_refused`). The rules
+    /// taken hold their programs and a set replaced gives its back
+    /// (`tests::a_replaced_rule_set_holds_only_its_own_programs`); a set
+    /// refused leaves no compile asked for
+    /// (`tests::a_refused_rule_set_leaves_no_compile_asked_for`). A reload
+    /// replays `sol.effects`, so rules are bound again at every config load
+    /// (`tests::a_reload_binds_the_rules_against_the_folders_it_read`).
+    pub(crate) fn apply_effects(
+        &mut self,
+        rules: Result<Vec<crate::effect::rules::Rule>, Vec<crate::effect::rules::RuleError>>,
+    ) {
+        use crate::effect::host::Problem;
+        use crate::effect::plan::{Chains, rule_problem};
+        use crate::effect::rules::{Fill, Origin, RuleKey};
+        let file = Scripts::config_path();
+        let rules = match rules {
+            Ok(rules) => rules,
+            Err(errors) => {
+                self.effects.clear_problems_of("rules");
+                for error in errors {
+                    self.effects.push_problem(Problem::error(
+                        "rules",
+                        &file,
+                        None,
+                        format!(
+                            "effects.rules, rule {}, `{}`: {}",
+                            error.rule, error.key, error.message
+                        ),
+                    ));
+                }
+                return;
+            }
+        };
+        let generation = self.rules_generation.wrapping_add(1);
+        let taken = crate::effect::rules::Rules::new(Vec::new(), Vec::new(), rules, generation);
+        let before = self.rules.effects();
+        self.effects.want("rules", taken.effects());
+        let mut bound = Vec::new();
+        let mut problems = Vec::new();
+        for (index, rule) in taken.user().iter().enumerate() {
+            if rule.fill == Fill::Off {
+                continue;
+            }
+            match Chains::bind(&mut self.effects, rule) {
+                Ok(chain) => bound.push((
+                    RuleKey {
+                        origin: Origin::User,
+                        index: u32::try_from(index).unwrap_or(u32::MAX),
+                        generation,
+                    },
+                    chain,
+                )),
+                Err(problem) => problems.push(rule_problem(index + 1, problem, &file)),
+            }
+        }
+        self.effects.clear_problems_of("rules");
+        if !problems.is_empty() {
+            for problem in problems {
+                self.effects.push_problem(problem);
+            }
+            self.effects.want("rules", before);
+            self.effects.hold(self.chains.programs());
+            return;
+        }
+        self.rules_generation = generation;
+        for (key, chain) in bound {
+            self.chains.insert(key, chain);
+        }
+        self.chains.retain_generation(Origin::User, generation);
+        self.effects.hold(self.chains.programs());
+        self.rules = taken;
+        self.redraw = true;
+    }
+
+    /// Bind every rule again, after the formats probe changed what is known
+    /// (Ruling 11): the user's rules through `apply_effects`, a new
+    /// generation, so every slot starts afresh, and the style's through
+    /// `apply_style_rules`.
+    /// `tests::the_formats_probe_rebinds_the_rules_after_the_frame`,
+    /// `tests::the_formats_probe_rebinds_the_styles_rules_too`.
+    pub(crate) fn rebind_effects(&mut self) {
+        self.rebind = false;
+        let user = self.rules.user().to_vec();
+        self.apply_effects(Ok(user));
+        self.apply_style_rules();
+    }
+
+    /// The configured style's `effects.lua`: its problems on the overlay
+    /// under `style:<name>`, its effects wanted (origin `"style"`) and every
+    /// rule bound now, never lazily in `prepare` (Ruling 15). A rule that
+    /// cannot bind is a problem too, at the file and line of what failed or
+    /// else at `effects.lua`, and its slot stays empty; the others run.
+    /// `tests::a_styles_rules_are_bound_when_it_is_applied_and_its_problems_are_on_the_overlay`,
+    /// `tests::a_style_rule_that_cannot_bind_is_a_problem_and_the_others_run`,
+    /// `tests::the_formats_probe_rebinds_the_styles_rules_too`.
+    pub(crate) fn apply_style_rules_from(&mut self, dir: Option<&std::path::Path>) {
+        use crate::effect::host::Problem;
+        use crate::effect::plan::Chains;
+        use crate::effect::rules::{Fill, Origin, RuleKey};
+        let read = dir.map_or_else(crate::style::StyleRules::none, crate::style::rules_of);
+        let names: Vec<String> = read
+            .rules
+            .iter()
+            .filter_map(|rule| match &rule.fill {
+                Fill::Chain(links) => Some(links.iter().map(|link| link.effect.clone())),
+                Fill::Off => None,
+            })
+            .flatten()
+            .collect();
+        self.effects.want("style", names);
+        let effect = dir
+            .and_then(std::path::Path::file_name)
+            .map(|name| format!("style:{}", name.to_string_lossy()))
+            .unwrap_or_default();
+        let file = dir.map(|dir| dir.join("effects.lua")).unwrap_or_default();
+        let mut problems = read.problems.clone();
+        for (index, rule) in read.rules.iter().enumerate() {
+            if rule.fill == Fill::Off {
+                continue;
+            }
+            let key = RuleKey {
+                origin: Origin::Style,
+                index: u32::try_from(index).unwrap_or(u32::MAX),
+                generation: read.generation,
+            };
+            match Chains::bind(&mut self.effects, rule) {
+                Ok(chain) => self.chains.insert(key, chain),
+                Err(problem) => {
+                    self.chains.remove(key);
+                    problems.push(Problem {
+                        effect: effect.clone(),
+                        message: format!("effects.lua, rule {}: {}", index + 1, problem.message),
+                        file: if problem.line.is_some() {
+                            problem.file
+                        } else {
+                            file.clone()
+                        },
+                        ..problem
+                    });
+                }
+            }
+        }
+        self.chains
+            .retain_generation(Origin::Style, read.generation);
+        // What the style's chains run is held with the rest, so a style
+        // replaced gives its programs back and nothing it asked for is
+        // forgotten before it compiles
+        // (`tests::a_replaced_style_holds_only_its_own_programs`).
+        self.effects.hold(self.chains.programs());
+        self.list_style_problems(problems);
+        self.redraw = true;
+    }
+
+    /// `apply_style_rules_from` for the folder the configured style's frames
+    /// are built from (`decoration::style_dir`: none for `none`, a
+    /// single-file decoration or a name that is nowhere).
+    /// `tests::the_formats_probe_rebinds_the_styles_rules_too`,
+    /// `tests::sol_pane_binds_the_styles_rules_and_a_reload_binds_them_again`.
+    pub(crate) fn apply_style_rules(&mut self) {
+        let dir = crate::decoration::style_dir(self.decorations.style());
+        self.apply_style_rules_from(dir.as_deref());
+    }
+
+    /// Every pane style's problems, now `problems`: replaced only when they
+    /// differ from what is listed, so a style applied again unchanged tells
+    /// the `problems` listeners nothing
+    /// (`tests::a_styles_rules_are_bound_when_it_is_applied_and_its_problems_are_on_the_overlay`).
+    fn list_style_problems(&mut self, problems: Vec<crate::effect::host::Problem>) {
+        let mut unique: Vec<crate::effect::host::Problem> = Vec::with_capacity(problems.len());
+        for problem in problems {
+            if !unique.contains(&problem) {
+                unique.push(problem);
+            }
+        }
+        let listed = self
+            .effects
+            .problems()
+            .iter()
+            .filter(|each| each.effect.starts_with("style:"));
+        if listed.eq(unique.iter()) {
+            return;
+        }
+        self.effects.clear_problems_prefixed("style:");
+        for problem in unique {
+            self.effects.push_problem(problem);
+        }
     }
 
     /// Tell the scripts they have replaced a running session's, not started one.

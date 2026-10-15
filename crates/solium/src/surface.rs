@@ -31,7 +31,7 @@ use smithay::{
             gles::GlesRenderer,
         },
     },
-    utils::{Logical, Point, Rectangle, Transform},
+    utils::{Logical, Point, Rectangle, Size, Transform},
 };
 
 use crate::{
@@ -51,6 +51,85 @@ use crate::{
 /// change is enough friction that nobody tunes anything. Twice a second is
 /// under what anyone notices and over what a directory scan costs.
 const RELOAD_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The scale a scene is rasterised at, and the scale of the target its
+/// element is placed in. On a monitor the two are its scale. In an xray cut
+/// drawn at `effects.xray.scale` below 1 the scene is still rasterised at
+/// its monitor's own scale, so the `scenes` phase's one picture serves the
+/// cut and the frame, and only its element is placed at the cut's scale and
+/// drawn smaller: asked for the cut's own size, a scene was asked for two
+/// sizes a pass, an animated one rendered three times a pass and a still
+/// one made anew each time, so its cut was rebuilt on every pass (Task 45,
+/// `dev/effects-check.sh xray`).
+/// `tests::a_scene_in_an_xray_is_rasterised_at_its_monitors_scale`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Raster {
+    /// The scale QML rasterises the scene at.
+    pub(crate) scale: f64,
+    /// The scale of the target the element is placed in.
+    pub(crate) place: f64,
+}
+
+impl Raster {
+    /// Rasterised at `scale` into a target at `scale`: a monitor's own.
+    pub(crate) fn at(scale: f64) -> Self {
+        Self {
+            scale,
+            place: scale,
+        }
+    }
+
+    /// Rasterised at its monitor's `scale` into an xray cut drawn at `scale`
+    /// times `xray` (`effects.xray.scale`).
+    /// `tests::a_scene_in_an_xray_is_rasterised_at_its_monitors_scale`.
+    pub(crate) fn xray(scale: f64, xray: f64) -> Self {
+        Self {
+            scale,
+            place: scale * xray,
+        }
+    }
+
+    /// For `area` in its monitor's logical pixels: the scene's size in
+    /// device pixels at `scale`, at least one each way, which is what QML is
+    /// asked to rasterise; and its corner in the target's physical pixels at
+    /// `place`, where the element goes. The element keeps `area`'s logical
+    /// size, which the target's scale takes to its pixels.
+    /// `tests::a_scene_in_an_xray_is_rasterised_at_its_monitors_scale`.
+    #[cfg(test)]
+    pub(crate) fn of(self, area: Rectangle<i32, Logical>) -> ((i32, i32), (f64, f64)) {
+        self.over(area.size, area.to_f64())
+    }
+
+    /// [`Self::of`] for a scene laid out at `laid_out` logical pixels and
+    /// drawn over `drawn`: its size in device pixels at `scale`, and the
+    /// drawn corner in the target's physical pixels at `place`.
+    /// `ShellSurface::element_over`.
+    fn over(
+        self,
+        laid_out: Size<i32, Logical>,
+        drawn: Rectangle<f64, Logical>,
+    ) -> ((i32, i32), (f64, f64)) {
+        (
+            self.pixels(laid_out),
+            (drawn.loc.x * self.place, drawn.loc.y * self.place),
+        )
+    }
+
+    /// A scene laid out at `size` logical pixels, in device pixels at
+    /// `scale`, at least one each way: what QML is asked to rasterise.
+    pub(crate) fn pixels(self, size: Size<i32, Logical>) -> (i32, i32) {
+        // In device pixels, as `Decoration::frame` does and for the same
+        // reason: QML rasterises in pixels, so a scene drawn at its logical
+        // size on a 2x screen is drawn at half that screen's resolution and
+        // stretched.
+        let pixels = |logical: i32| {
+            #[expect(clippy::cast_possible_truncation, reason = "a scene on this screen")]
+            let scaled = (f64::from(logical) * self.scale).round() as i32;
+            scaled.max(1)
+        };
+        (pixels(size.w), pixels(size.h))
+    }
+}
 
 /// How a rendered scene reaches the screen.
 ///
@@ -405,18 +484,34 @@ impl ShellSurface {
         area: Rectangle<i32, Logical>,
         now: Duration,
         alpha: f32,
-        scale: f64,
+        raster: Raster,
     ) -> Drawn {
-        // In device pixels, as `Decoration::frame` does and for the same
-        // reason: QML rasterises in pixels, so a scene drawn at its logical
-        // size on a 2x screen is drawn at half that screen's resolution and
-        // stretched.
-        let pixels = |logical: i32| {
-            #[expect(clippy::cast_possible_truncation, reason = "a scene on this screen")]
-            let scaled = (f64::from(logical) * scale).round() as i32;
-            scaled.max(1)
-        };
-        let size = (pixels(area.size.w), pixels(area.size.h));
+        self.element_over(renderer, area.size, area.to_f64(), now, alpha, raster)
+    }
+
+    /// Draw the surface laid out at `laid_out` logical pixels, its picture
+    /// placed over `drawn`, at `alpha`: [`Self::element`] for a scene whose
+    /// own size is not the rectangle it is drawn over this frame. A
+    /// window's standing-in scene is laid out at the window's own size and
+    /// drawn wherever its presentation puts it, scaled with it, as its
+    /// layers are (`Decoration::layer_elements`), so a window zooming open,
+    /// gliding or fading draws the picture it has and asks Qt for no new
+    /// one; a new size is a new picture.
+    /// `render::tests::a_standing_in_scene_is_laid_out_at_its_windows_own_size`.
+    pub(crate) fn element_over(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        laid_out: Size<i32, Logical>,
+        drawn: Rectangle<f64, Logical>,
+        now: Duration,
+        alpha: f32,
+        raster: Raster,
+    ) -> Drawn {
+        let (size, position) = raster.over(laid_out, drawn);
+        #[expect(clippy::cast_possible_truncation, reason = "a scene on this screen")]
+        let drawn_size: Size<i32, Logical> =
+            (drawn.size.w.round() as i32, drawn.size.h.round() as i32).into();
+        let scale = raster.scale;
 
         // Before either path, and before anything is bound: a reload builds a
         // whole new scene, which on the GPU path takes the thread off to Qt.
@@ -437,34 +532,41 @@ impl ShellSurface {
                         size,
                         scale,
                         Placement {
-                            position: (
-                                f64::from(area.loc.x) * scale,
-                                f64::from(area.loc.y) * scale,
-                            ),
-                            size: area.size,
+                            position,
+                            size: drawn_size,
                             alpha,
                             kind: Kind::Unspecified,
                         },
                     )
                     .map(Element::Screen),
                 Backing::Memory { .. } => this
-                    .in_memory(renderer, area, alpha, scale, size)
+                    .in_memory(renderer, drawn_size, alpha, (scale, position), size)
                     .map(Element::Chrome),
             }
         })
     }
 
-    /// The software path, unchanged: Qt rasterises into a `QImage` and the
-    /// compositor uploads it.
+    /// Lay the scene out at `size` device pixels at `scale`, as the
+    /// software path does before it renders: a size it already has changes
+    /// nothing and leaves the scene clean. The GPU path's buffer follows the
+    /// size in `Gpu::sample` instead.
+    /// `render::tests::a_standing_in_scene_is_laid_out_at_its_windows_own_size`.
+    pub(crate) fn lay_out(&mut self, size: (i32, i32), scale: f64) {
+        self.scene.resize(size.0, size.1, scale);
+    }
+
+    /// The software path, unchanged: Qt rasterises into a `QImage` at
+    /// `scale` and the compositor uploads it, placed at `position`
+    /// ([`Raster::of`]).
     fn in_memory(
         &mut self,
         renderer: &mut GlesRenderer,
-        area: Rectangle<i32, Logical>,
+        drawn: Size<i32, Logical>,
         alpha: f32,
-        scale: f64,
+        (scale, position): (f64, (f64, f64)),
         size: (i32, i32),
     ) -> Option<MemoryRenderBufferRenderElement<GlesRenderer>> {
-        self.scene.resize(size.0, size.1, scale);
+        self.lay_out(size, scale);
 
         let rendered = match self.scene.render() {
             Ok(rendered) => rendered,
@@ -513,17 +615,20 @@ impl ShellSurface {
             }
         }
 
-        // `src` is the whole buffer in its own pixels and `size` is the
-        // logical destination, which the output scale then takes back up to
-        // exactly these pixels. The position is physical.
+        // `src` is the whole buffer in its own pixels and `drawn` is the
+        // logical destination, which the target's scale then takes to its
+        // pixels: exactly these on a monitor, fewer in an xray cut below
+        // scale 1 (`Raster`), and the window's presented size for a scene
+        // standing in for one (`Self::element_over`). The position is
+        // physical, in the target.
         let source = Rectangle::from_size((f64::from(size.0), f64::from(size.1)).into());
         MemoryRenderBufferRenderElement::from_buffer(
             renderer,
-            (f64::from(area.loc.x) * scale, f64::from(area.loc.y) * scale),
+            position,
             buffer,
             Some(alpha),
             Some(source),
-            Some(area.size),
+            Some(drawn),
             Kind::Unspecified,
         )
         .inspect_err(|err| tracing::warn!(?err, "could not upload the shell surface"))
@@ -600,6 +705,33 @@ mod tests {
     use super::ShellSurface;
     use crate::qml::hosted::{Hit, PointerKind, ScenePointer};
     use crate::qml::qt_test::on_the_qt_thread;
+
+    /// **A scene in an xray is rasterised at its monitor's scale**: asked
+    /// for the size it is drawn at on the monitor whatever
+    /// `effects.xray.scale` is, so the `scenes` phase's one render serves
+    /// the cut and the frame alike, and only its element is placed at the
+    /// cut's scale.
+    #[test]
+    fn a_scene_in_an_xray_is_rasterised_at_its_monitors_scale() {
+        use super::Raster;
+        let area = smithay::utils::Rectangle::new((100, 40).into(), (300, 200).into());
+        assert_eq!(Raster::at(1.5).of(area), ((450, 300), (150.0, 60.0)));
+        for scale in [1.0, 1.5, 2.0] {
+            let (on_screen, _) = Raster::at(scale).of(area);
+            for xray in [1.0, 0.5, 0.25] {
+                let (in_cut, corner) = Raster::xray(scale, xray).of(area);
+                assert_eq!(
+                    in_cut, on_screen,
+                    "scale {scale}, xray {xray}: asked for another size than on screen"
+                );
+                assert_eq!(
+                    corner,
+                    (100.0 * scale * xray, 40.0 * scale * xray),
+                    "scale {scale}, xray {xray}: placed off the cut's pixels"
+                );
+            }
+        }
+    }
 
     /// **A cached hit follows a dismissal**: the menu its `onDismissed`
     /// closed takes nothing at the point it took a press at a moment ago.
