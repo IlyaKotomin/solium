@@ -274,6 +274,26 @@ impl Chains {
             .map(|(_, chain)| chain)
     }
 
+    /// Every bound chain of `origin`'s newest generation, by its place in
+    /// its list, for a test to read.
+    #[cfg(test)]
+    pub(crate) fn all_for_test(&self, origin: Origin) -> Vec<(RuleKey, &BoundChain)> {
+        let newest = self
+            .by_key
+            .keys()
+            .filter(|key| key.origin == origin)
+            .map(|key| key.generation)
+            .max();
+        let mut all: Vec<(RuleKey, &BoundChain)> = self
+            .by_key
+            .iter()
+            .filter(|(key, _)| key.origin == origin && Some(key.generation) == newest)
+            .map(|(key, chain)| (*key, chain))
+            .collect();
+        all.sort_by_key(|(key, _)| key.index);
+        all
+    }
+
     /// The newest bound plan of `origin`'s, for a test to read.
     #[cfg(test)]
     pub(crate) fn first_plan_for_test(&self, origin: Origin) -> Option<&Plan> {

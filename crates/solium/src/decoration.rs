@@ -5591,66 +5591,48 @@ mod tests {
         (pixel[3], pixel[0].max(pixel[1]).max(pixel[2]))
     }
 
-    /// A layer's opacity, by name.
-    fn opacity_of(decoration: &Decoration, name: &str) -> f32 {
-        decoration
-            .layers
-            .iter()
-            .find(|layer| layer.name == name)
-            .map(LayerScene::opacity)
-            .expect("the layer")
-    }
-
-    /// **The glass shade is on a window without the keyboard, and off one
-    /// with it**: told `focused: false`, the `shade` layer is awake, at
-    /// opacity 1, and its picture dark on all four edges of a pane 400 by
-    /// 300, clear inside them; told `focused: true`, its opacity falls to 0
-    /// and it is dormant, drawing nothing. In both the bar has no fill. What
-    /// `render::chrome` hands every frame is `Solium::looks_focused`, the
-    /// keyboard's own answer.
+    /// **The glass style draws no shade of its own and its bar no fill**:
+    /// its layers are the bar and the keyboard pill, the shade being the
+    /// `shade` effect its `effects.lua` puts in front of the pane
+    /// (`state::tests::the_shipped_glass_style_binds_liquid_glass_behind_the_pane`);
+    /// and the bar, focused or not, draws nothing across its band but its
+    /// buttons, title and icon, so the glass behind it shows through.
     #[test]
-    fn the_glass_shade_is_on_a_window_without_the_keyboard_only() {
+    fn the_glass_style_draws_no_shade_and_its_bar_no_fill() {
         on_the_qt_thread(|| {
             let Some(mut decoration) = glass(400, 268) else {
                 return;
             };
+            let names: Vec<&str> = decoration
+                .layers
+                .iter()
+                .map(|layer| layer.name.as_str())
+                .collect();
+            assert!(!names.contains(&"shade"), "{names:?}");
+            assert_eq!(names.first(), Some(&"bar"), "{names:?}");
             let values = Values::default();
             let mut clock = std::time::Duration::from_secs(3_000_000);
-
-            decoration.tell(&look_with(&values, false), 400, 300);
-            run_qml_clock(&mut clock, 400);
-            assert!(!decoration.dormant_layers().contains(&"shade".to_owned()));
-            assert!((opacity_of(&decoration, "shade") - 1.0).abs() < f32::EPSILON);
-            for (x, y) in [(200, 0), (0, 150), (399, 150), (200, 299)] {
-                let (alpha, light) = layer_pixel(&mut decoration, "shade", x, y);
-                assert!(
-                    alpha >= 100 && light <= 8,
-                    "unfocused, ({x}, {y}): {alpha} {light}"
-                );
+            for focused in [false, true] {
+                decoration.tell(&look_with(&values, focused), 400, 300);
+                run_qml_clock(&mut clock, 100);
+                for y in [270, 284, 299] {
+                    assert_eq!(
+                        layer_pixel(&mut decoration, "bar", 200, y).0,
+                        0,
+                        "focused {focused}: a fill at (200, {y})"
+                    );
+                }
             }
-            assert_eq!(layer_pixel(&mut decoration, "shade", 200, 150).0, 0);
-            assert_eq!(layer_pixel(&mut decoration, "bar", 200, 290).0, 0, "a fill");
-
-            decoration.tell(&look_with(&values, true), 400, 300);
-            run_qml_clock(&mut clock, 400);
-            assert!(
-                decoration.dormant_layers().contains(&"shade".to_owned()),
-                "a focused window's shade is still drawn"
-            );
-            assert!(opacity_of(&decoration, "shade") < f32::EPSILON);
-            assert_eq!(layer_pixel(&mut decoration, "bar", 200, 290).0, 0, "a fill");
         });
     }
 
-    /// **The glass shade fades without drawing, and the bar draws once**: a
-    /// focus change, frame by frame for 400 ms as the compositor would ask,
-    /// draws one new picture of the bar (its title and buttons change
-    /// colour) and none of the shade, whose opacity falls from 1 to 0
-    /// through the frames, each way. What a busy screen spent on a focus
-    /// change was both layers of both windows drawn on every frame of the
-    /// fade.
+    /// **A focus change draws the glass bar once**: frame by frame for 400 ms
+    /// as the compositor would ask, one new picture of the bar (its title
+    /// and buttons change colour), each way. Nothing in it animates: the
+    /// shade's fade is the compositor's (`effect::fade`), and a bar drawn
+    /// again on every frame of a fade cost a busy screen its frames.
     #[test]
-    fn the_glass_shade_fades_without_drawing_and_the_bar_draws_once() {
+    fn a_focus_change_draws_the_glass_bar_once() {
         on_the_qt_thread(|| {
             let Some(mut decoration) = glass(400, 268) else {
                 return;
@@ -5664,131 +5646,35 @@ mod tests {
             }
             for focused in [true, false] {
                 decoration.tell(&look_with(&values, focused), 400, 300);
-                let (mut bar, mut shade, mut seen) = (0, 0, Vec::new());
+                let mut bar = 0;
                 for _ in 0..25 {
                     for layer in &mut decoration.layers {
                         if layer.scene.needs_render() {
-                            match layer.name.as_str() {
-                                "bar" => bar += 1,
-                                "shade" => shade += 1,
-                                _ => {}
+                            if layer.name == "bar" {
+                                bar += 1;
                             }
                             let _ = layer.scene.render();
                         }
                     }
-                    seen.push(opacity_of(&decoration, "shade"));
                     run_qml_clock(&mut clock, 16);
                 }
-                assert_eq!(
-                    (bar, shade),
-                    (1, 0),
-                    "focused {focused}: drawn (bar, shade)"
-                );
-                let end = if focused { 0.0 } else { 1.0 };
-                assert!(
-                    seen.iter().any(|alpha| *alpha > 0.05 && *alpha < 0.95)
-                        && seen
-                            .last()
-                            .is_some_and(|alpha| (*alpha - end).abs() < f32::EPSILON),
-                    "focused {focused}: the shade did not fade through the frames: {seen:?}"
-                );
+                assert_eq!(bar, 1, "focused {focused}: the bar was drawn {bar} times");
             }
         });
     }
 
-    /// **The glass style's numbers are its to change**, each one changing
-    /// what it draws: the shade's `shadeStrength`, `shadeColor` and
-    /// `shadeWidth`, its corners by `clientRadius` (`Pane.qml`'s
-    /// `client.radius`), how it follows the focus by `shadeDuration` and
-    /// `shadeEasing`, and the bar's `iconSize` the room its title is left.
-    /// Written onto the layers as a copy of the folder would write them, on a
-    /// pane 400 by 300. `tests/scenarios/pane-glass-drawn.lua` reads the
-    /// defaults.
+    /// **The glass bar's numbers are its to change**: its `iconSize` the room
+    /// its title is left, on a pane 120 wide; and its `resizeHz`, read as
+    /// the compositor reads it
+    /// (`tests::a_layer_is_drawn_again_for_a_new_size_at_most_resize_hz_times_a_second`).
+    /// The shade's are the `shade` effect's params, in `effects.lua`.
     #[test]
-    fn the_glass_styles_numbers_change_what_it_draws() {
+    fn the_glass_bars_numbers_change_what_it_draws() {
         on_the_qt_thread(|| {
-            let Some(mut decoration) = glass(400, 268) else {
-                return;
-            };
-            let values = Values::default();
-            let mut clock = std::time::Duration::from_secs(4_000_000);
-            let set = |decoration: &mut Decoration, name: &str, value: crate::json::Json| {
-                let shade = decoration
-                    .layers
-                    .iter_mut()
-                    .find(|layer| layer.name == "shade")
-                    .expect("the shade");
-                assert!(
-                    shade.scene.set_json(name, &value),
-                    "the shade has no {name}"
-                );
-            };
-            let number = crate::json::Json::Number;
-            let colour = |text: &str| crate::json::Json::Text(text.to_owned());
-
-            decoration.tell(&look_with(&values, false), 400, 300);
-            run_qml_clock(&mut clock, 400);
-            let edge = layer_pixel(&mut decoration, "shade", 200, 0).0;
-            assert!(edge >= 100, "the default shade: {edge}");
-            assert!(layer_pixel(&mut decoration, "shade", 200, 6).0 > 0);
-            assert!(
-                layer_pixel(&mut decoration, "shade", 1, 1).0 <= 8,
-                "a round corner"
-            );
-
-            set(&mut decoration, "shadeStrength", number(0.0));
-            assert_eq!(
-                layer_pixel(&mut decoration, "shade", 200, 0).0,
-                0,
-                "none at 0"
-            );
-            set(&mut decoration, "shadeStrength", number(0.5));
-            set(&mut decoration, "shadeColor", colour("#ffffff"));
-            let (alpha, light) = layer_pixel(&mut decoration, "shade", 200, 0);
-            assert!(
-                alpha >= 100 && u16::from(light) + 4 >= u16::from(alpha),
-                "a white shade: {alpha} {light}"
-            );
-            set(&mut decoration, "shadeColor", colour("#000000"));
-            set(&mut decoration, "shadeWidth", number(4.0));
-            assert_eq!(
-                layer_pixel(&mut decoration, "shade", 200, 6).0,
-                0,
-                "4 px in"
-            );
-            set(&mut decoration, "shadeWidth", number(12.0));
-            set(&mut decoration, "clientRadius", number(0.0));
-            assert!(
-                layer_pixel(&mut decoration, "shade", 1, 1).0 >= 60,
-                "a square corner"
-            );
-            set(&mut decoration, "clientRadius", number(16.0));
-
-            // How it follows the focus: 32 ms into its 240, as far as its
-            // curve has taken it, and with no time at all, at once.
-            let half_way = |decoration: &mut Decoration, clock: &mut std::time::Duration| {
-                decoration.tell(&look_with(&values, true), 400, 300);
-                run_qml_clock(clock, 48);
-                let seen = opacity_of(decoration, "shade");
-                decoration.tell(&look_with(&values, false), 400, 300);
-                run_qml_clock(clock, 400);
-                seen
-            };
-            let curved = half_way(&mut decoration, &mut clock);
-            set(&mut decoration, "shadeEasing", number(0.0));
-            let linear = half_way(&mut decoration, &mut clock);
-            assert!(
-                linear > curved + 0.08,
-                "Easing.Linear is further from the end than OutCubic: {linear} {curved}"
-            );
-            set(&mut decoration, "shadeDuration", number(0.0));
-            decoration.tell(&look_with(&values, true), 400, 300);
-            run_qml_clock(&mut clock, 16);
-            assert!(opacity_of(&decoration, "shade") < f32::EPSILON, "at once");
-
             let Some(mut narrow) = glass(120, 268) else {
                 return;
             };
+            let values = Values::default();
             narrow.tell(&look_with(&values, true), 120, 300);
             assert!(narrow.layers[0].scene.get_bool("roomForTitle"));
             narrow.layers[0].scene.set_int("iconSize", 32);
@@ -5796,6 +5682,7 @@ mod tests {
                 !narrow.layers[0].scene.get_bool("roomForTitle"),
                 "a larger icon leaves the title no room at 120"
             );
+            assert!((narrow.layers[0].resize_hz() - 30.0).abs() < f64::EPSILON);
         });
     }
 

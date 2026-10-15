@@ -310,7 +310,18 @@ So does `glass`, liquid glass, dark unless its `tint` says otherwise
 pane style puts behind every window it frames; a rule of yours for
 `{ style = "glass" }`, the `pane` part and its `behind` slot wins over the
 style's, with other params (`tint = { 1, 1, 1, 0.11 }` is light glass) or with
-`effect = false`.
+`effect = false`. And `shade`, a thin dark edge just inside a part's rounded
+outline ([its folder](../crates/solium/effects/shade/README.md)), which the
+`glass` style puts in front of a window without the keyboard with a rule's
+`fade`: the slot eases in as the rule starts to match and out as it stops,
+
+```lua
+{ match = { focused = false }, part = "pane", slot = "front", effect = "shade",
+  fade = { duration = 240, easing = "outCubic" } }
+```
+
+the compositor blending the result it has at another opacity on each frame
+and running nothing for it.
 An effect that reads the part's own pixels (`self`, or `source = "self"`, as
 the rule above gives the blur) is drawn in its slot, and runs again only when
 the window draws something new, changes size, or the rule's params change:

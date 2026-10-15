@@ -910,26 +910,47 @@ fn a_styles_rules_are_bound_when_it_is_applied_and_its_problems_are_on_the_overl
     let _ = std::fs::remove_dir_all(place);
 }
 
-/// **The shipped `glass` style binds liquid glass behind the whole pane**:
-/// its `effects.lua` holds one rule, the shipped `glass` effect in the
-/// pane's `behind` slot for a window that is not fullscreen, and applied
-/// with the shipped effects it binds as T2, reading the backdrop, with
-/// nothing on the overlay.
+/// **The shipped glass style binds liquid glass behind the pane and the
+/// shade in front of it**: its `effects.lua` has two rules, the `glass`
+/// effect behind every pane but a fullscreen one (T2, reading the backdrop),
+/// and the `shade` in front of every such pane without the keyboard (T0,
+/// reading only the pane's shape), fading in and out over 240 ms on
+/// `outCubic`; both bind, and the style's effects are wanted.
 #[test]
 fn the_shipped_glass_style_binds_liquid_glass_behind_the_pane() {
-    use crate::effect::rules::{Fill, Part, Slot, Tier};
+    use crate::effect::rules::{Fade, Fill, Part, Slot, Tier};
     let style = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/qml/panes/glass"));
     let read = crate::style::rules_of(style);
     assert!(read.problems.is_empty(), "{:?}", read.problems);
-    let [rule] = &read.rules[..] else {
-        panic!("one rule: {:?}", read.rules)
+    let [glass, shade] = &read.rules[..] else {
+        panic!("two rules: {:?}", read.rules)
     };
-    assert_eq!((&rule.part, rule.slot), (&Part::Pane, Slot::Behind));
-    assert_eq!(rule.matches.fullscreen, Some(false), "{:?}", rule.matches);
+    assert_eq!((&glass.part, glass.slot), (&Part::Pane, Slot::Behind));
+    assert_eq!(glass.matches.fullscreen, Some(false), "{:?}", glass.matches);
     assert!(
-        matches!(&rule.fill, Fill::Chain(links) if links.len() == 1 && links[0].effect == "glass"),
+        matches!(&glass.fill, Fill::Chain(links) if links.len() == 1 && links[0].effect == "glass"),
         "{:?}",
-        rule.fill
+        glass.fill
+    );
+    assert_eq!(glass.fade, None);
+    assert_eq!((&shade.part, shade.slot), (&Part::Pane, Slot::Front));
+    assert_eq!(
+        (shade.matches.fullscreen, shade.matches.focused),
+        (Some(false), Some(false)),
+        "{:?}",
+        shade.matches
+    );
+    assert!(
+        matches!(&shade.fill, Fill::Chain(links) if links.len() == 1 && links[0].effect == "shade"),
+        "{:?}",
+        shade.fill
+    );
+    assert_eq!(
+        shade.fade,
+        Some(Fade {
+            duration: std::time::Duration::from_millis(240),
+            curve: solium_animation::Curve::OutCubic,
+        })
     );
 
     let display = TestDisplay::new().expect("creating a test wayland display");
@@ -939,10 +960,12 @@ fn the_shipped_glass_style_binds_liquid_glass_behind_the_pane() {
         std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/effects")).to_path_buf(),
     ));
     state.apply_style_rules_from(Some(style));
-    assert!(
-        state.effects.has_pending("glass"),
-        "the style's effect is not wanted"
-    );
+    for effect in ["glass", "shade"] {
+        assert!(
+            state.effects.has_pending(effect),
+            "the style's {effect} is not wanted"
+        );
+    }
     assert!(
         !state
             .effects
@@ -952,12 +975,13 @@ fn the_shipped_glass_style_binds_liquid_glass_behind_the_pane() {
         "{:?}",
         state.effects.problems()
     );
-    let chain = state
+    let tiers: Vec<(u32, Tier)> = state
         .chains
-        .first_for_test(crate::effect::rules::Origin::Style)
-        .expect("the style's rule is bound");
-    assert_eq!(chain.tier, Tier::Xray);
-    assert!(chain.plan.reads.backdrop, "{:?}", chain.plan.reads);
+        .all_for_test(crate::effect::rules::Origin::Style)
+        .into_iter()
+        .map(|(key, chain)| (key.index, chain.tier))
+        .collect();
+    assert_eq!(tiers, [(0, Tier::Xray), (1, Tier::Generated)], "{tiers:?}");
 }
 
 /// **A style's rule that cannot bind is a problem at its `effects.lua`, and

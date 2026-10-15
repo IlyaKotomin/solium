@@ -3,15 +3,16 @@
 //
 //     SOLIUM_PANE=glass
 //
-// Four files, one job each:
+// Three files, one job each:
 //
 //   Pane.qml     what the frame reserves, the corners, and the layers;
 //   Frame.qml    the bar: the window buttons at the left, the title after
 //                them, the application's icon at the right, and no fill;
-//   Shade.qml    a thin dark edge just inside the window's rounded outline,
-//                round all four sides and the corners, while the window does
-//                not have the keyboard, fading in and out with it;
-//   effects.lua  one rule: the shipped `glass` effect behind the whole pane.
+//   effects.lua  two rules: the shipped `glass` effect behind the whole pane,
+//                and the shipped `shade` in front of it while the window does
+//                not have the keyboard, a thin dark edge just inside its
+//                rounded outline, round all four sides and the corners,
+//                fading in and out with the focus.
 //
 // **One shape, three things drawing it.** The compositor cuts the client's top
 // two corners, which are the window's: `client.radius` below. The client's
@@ -22,9 +23,16 @@
 // glass, the client and the bar have one outline, with one rim round it and no
 // seam where the bar meets the client. The shade follows that outline too.
 //
-// The numbers here and the ones at the top of `Frame.qml` and `Shade.qml` are
-// the style's to change: copy this folder to ~/.config/solium/qml/panes/glass/,
-// change them there, and your copy is used in place of this one.
+// **Nothing here is drawn again as the window changes size.** The shade is an
+// effect drawn from the window's shape on the GPU, and the bar is drawn again
+// for a new size at most `resizeHz` times a second while the size keeps
+// changing (below), its last picture stretched to the window in between, as
+// the application's own picture is until it has drawn at the new size.
+//
+// The numbers here, the ones at the top of `Frame.qml` and the shade's in
+// `effects.lua` are the style's to change: copy this folder to
+// ~/.config/solium/qml/panes/glass/, change them there, and your copy is used
+// in place of this one.
 
 import QtQuick
 import Solium
@@ -52,16 +60,6 @@ PaneStyle {
         depth: "frame"
         name: "bar"
         source: "Frame.qml"
-    }
-
-    // At `above`, over the client and the bar, so the shade darkens the
-    // window's own edge whatever the client draws; it takes no input, and is
-    // dormant while the window has the keyboard. Before the keyboard pill, so
-    // the pill is drawn over it.
-    Layer {
-        depth: "above"
-        name: "shade"
-        source: "Shade.qml"
     }
 
     // The keyboard pill at the focused text field's caret, when the

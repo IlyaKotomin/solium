@@ -307,7 +307,9 @@ number, its slot is left empty, and the rest run. `solium --check` reads the
 
 As with your own rules, each is drawn in its slot as far as its tier allows
 ([the effects reference](../../effects/README.md#tiers)). `glass/effects.lua`
-is the shipped one: the `glass` effect behind the whole pane.
+is the shipped one: the `glass` effect behind the whole pane, and the `shade`
+in front of it while the window does not have the keyboard, fading with the
+focus (a rule's `fade`).
 
 ## What is here
 
@@ -328,8 +330,8 @@ window.
 
 Each of those nine is one `frame` layer, which is what every decoration was
 before styles had layers, and the keyboard pill's layer, described below;
-`glass` has its shade at `above` besides. The rest are here to show what
-layers add:
+`glass`'s shade is not a layer but an effect its `effects.lua` puts in front
+of the pane. The rest are here to show what layers add:
 
 | folder | |
 |---|---|
@@ -366,14 +368,21 @@ shows nothing when the window has no app id or the theme has no icon for it
 
 A window without the keyboard has a thin dark shade just inside its rounded
 outline, on all four sides and through the corners, and a dimmer title. The
-shade is a layer of its own, `Shade.qml`, at `above`, so it darkens the
-window's own edge, an opaque application's too; it takes no input, and while
-the window has the keyboard and the shade has faded out it is `dormant`, so
-the window being typed in costs nothing for it. It comes and goes with the
-focus, on the compositor's clock, by its `layerOpacity`: its picture is drawn
-once per size and the fade only blends it, and the bar draws one new picture
-per focus change, with nothing in it animated.
-`tests/scenarios/pane-glass-drawn.lua` reads all of that off its pixels.
+shade is the shipped [`shade`](../../effects/shade/README.md) effect, which
+`effects.lua` puts in front of the whole pane, frame and client, for a window
+that is not `focused`: so it darkens the window's own edge, an opaque
+application's too, and takes no input. It reads only the window's shape (tier
+T0), so it is one pass on the GPU, run once per size of the window and never
+for what the application draws. Its rule's `fade` brings it in as the window
+loses the keyboard and takes it away as the window gets it back, 240 ms on
+`outCubic`: the compositor blends the edge it has at another opacity on each
+frame and runs nothing for it, and once it has faded out nothing is held or
+drawn for it, so the window being typed in costs nothing for it. The bar draws
+one new picture per focus change, with nothing in it animated, and while the
+window's size keeps changing it is drawn again at most `resizeHz` times a
+second, 30, stretched with the window between.
+`tests/scenarios/pane-glass-drawn.lua` reads the bar off its pixels, and
+wirecheck's case 13j the shade's.
 
 The client's top two corners are the window's, cut by the compositor; its
 bottom two are square where the bar meets it, and the glass behind the bar is
@@ -387,16 +396,19 @@ Its numbers, each a line to change in a copy of the folder,
 | `Pane.qml` | `client.radius`: the window's corners, in logical pixels | `16` |
 | `Pane.qml` | `insets.bottom`: the bar's height | `Theme.titlebarHeight`, 32 |
 | `Frame.qml` | `iconSize`: the application's icon, in logical pixels | `16` |
-| `Shade.qml` | `shadeColor`: the shade's colour | `"#000000"` |
-| `Shade.qml` | `shadeStrength`: how opaque it is at the window's very edge, 0 for no shade | `0.5` |
-| `Shade.qml` | `shadeWidth`: how far in it reaches, in logical pixels, fading to nothing there | `12` |
-| `Shade.qml` | `shadeDuration`: how long it takes to come and go with the focus, in milliseconds | `240` |
-| `Shade.qml` | `shadeEasing`: on which curve, any of QtQuick's `Easing` types | `Easing.OutCubic` |
+| `Frame.qml` | `resizeHz`: how often, at most, the bar is drawn again for a new size while the window's size keeps changing, in times a second; 0 at every size | `30` |
+| `effects.lua` | the shade's `width`: how far in it reaches, in pixels, fading to nothing there | `12` |
+| `effects.lua` | the shade's `strength`: how opaque it is at the window's very edge, 0 for no shade | `0.5` |
+| `effects.lua` | the shade's `color` | `{ 0, 0, 0, 1 }` |
+| `effects.lua` | the shade rule's `fade`: how long it takes to come and go with the focus, in milliseconds, and on which curve | `{ duration = 240, easing = "outCubic" }` |
 
-The glass itself is the effect's, and its params are changed where a rule
-names it: a rule of your own for `{ style = "glass" }`, `part = "pane"` and
-`slot = "behind"` wins over the style's, with other params, `tint = { 1, 1, 1,
-0.11 }` for light glass, or with `effect = false` for no glass.
+The glass and the shade are effects, and their params are changed where a rule
+names them: a rule of your own for `{ style = "glass" }` and `part = "pane"`
+wins over the style's for the same slot. At `slot = "behind"`, the glass:
+other params, `tint = { 1, 1, 1, 0.11 }` for light glass, or `effect = false`
+for no glass. At `slot = "front"`, with `focused = false` in its `match`, the
+shade: `effect = { "shade", width = 6, strength = 0.7 }`, a `fade` of its own,
+or `effect = false` for no shade.
 
 ## The keyboard pill
 

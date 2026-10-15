@@ -1379,21 +1379,31 @@ local defaults = {
     -- or shipped with Solium, put in a slot of a part of a window by a rule.
     -- See crates/solium/effects/README.md for the folders and docs/ricing.md
     -- for rules. With no rules nothing changes, and costs nothing. The
-    -- default pane style, "glass" (`pane` above), brings one rule of its
-    -- own: the `glass` effect behind every window it frames. A rule of yours
-    -- for `{ style = "glass" }`, the `pane` part and its `behind` slot wins
-    -- over it; `effect = false` there takes it away.
+    -- default pane style, "glass" (`pane` above), brings two rules of its
+    -- own: the `glass` effect behind every window it frames, and the `shade`
+    -- in front of one without the keyboard, fading with the focus. A rule of
+    -- yours for `{ style = "glass" }`, the `pane` part and its `behind` or
+    -- `front` slot wins over the style's; `effect = false` there takes it
+    -- away.
     effects = {
         -- { match = { app_id = "mpv" }, part = "client", slot = "replace",
         --   effect = { "blur", source = "self" } },
         -- { match = { app_id = "kitty" }, part = "client", slot = "behind",
         --   effect = "blur", memo = true, cut = "below" },
+        -- { match = { focused = false }, part = "pane", slot = "front",
+        --   effect = "shade", fade = { duration = 240, easing = "outCubic" } },
         --
         -- The first blurs a window's own pixels. The second, with no
         -- `source`, blurs what lies behind a translucent window: the layers
         -- below it (`cut = "background"`: the wallpaper alone, even where
         -- `xray.layers` holds "bottom"), blurred once per monitor and shared
-        -- between windows (`memo = false`: each window blurs it alone).
+        -- between windows (`memo = false`: each window blurs it alone). The
+        -- third darkens the edge of every window without the keyboard, and
+        -- its `fade` eases it in as the window loses the keyboard and out as
+        -- it gets it back, over 240 ms on `outCubic` (0 to 60000 ms; linear,
+        -- outCubic, outBack, inOutQuad, inOutCubic or spring): the
+        -- compositor blends the slot's result at another opacity on each
+        -- frame and runs nothing for it.
         --
         -- A list, so yours replaces this one whole. A set with a broken rule
         -- is refused whole, named on the overlay, and the rules that ran stay.

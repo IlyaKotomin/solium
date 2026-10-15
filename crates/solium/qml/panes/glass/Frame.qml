@@ -4,17 +4,24 @@
 // application's icon at the right. The bar has no fill at all, so what shows
 // through it is the glass `effects.lua` puts behind the whole pane, and the
 // bar and the window are one piece. A window without the keyboard is told
-// apart by the shade round its edge, `Shade.qml`, and by its dimmer title.
+// apart by the shade round its edge (the `shade` effect `effects.lua` puts in
+// front of it) and by its dimmer title.
 //
 // **Nothing here animates.** A focus change, a new title, a button under the
 // pointer, each is one new picture and no more: the shade's fade is the
-// compositor's to blend (`Shade.qml`), and a bar drawn again on every frame of
-// it cost a busy screen its frames
-// (`decoration::tests::the_glass_shade_fades_without_drawing_and_the_bar_draws_once`).
+// compositor's to blend, and a bar drawn again on every frame of it cost a
+// busy screen its frames
+// (`decoration::tests::a_focus_change_draws_the_glass_bar_once`).
 //
-// The number to change is under "The look" below, beside the two in
-// `Pane.qml`, the corners and the bar's height, and those in `Shade.qml`. The
-// panes README lists them.
+// **Nor is it drawn again at every size** while the window's size keeps
+// changing: at most `resizeHz` times a second, its picture stretched to the
+// window between (`Solium/Layer.qml`). A bar drawn at every step of a drag,
+// on every window the drag resized, cost the 260 Hz TTY trace of 2026-10-15
+// its frames (`decoration::tests::a_layer_is_drawn_again_for_a_new_size_at_most_resize_hz_times_a_second`).
+//
+// The numbers to change are under "The look" below, beside the two in
+// `Pane.qml`, the corners and the bar's height, and the shade's in
+// `effects.lua`. The panes README lists them.
 
 import QtQuick
 import Solium
