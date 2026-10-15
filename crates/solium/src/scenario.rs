@@ -21,11 +21,14 @@
 //! }
 //! ```
 //!
-//! With a client, on a 1920x1080 monitor and `us,ru` with Russian live (#132):
+//! With a client, on a 1920x1080 monitor and `us,ru` with Russian live (#132).
+//! `monitors = { { w, h }, ... }` names the monitors instead: side by side from
+//! the origin, top-aligned, `scenario-1` first.
 //!
 //! | step | |
 //! |---|---|
 //! | `open = true` | a window of 200x100, given the keyboard; with `app_id = "name"`, of that application |
+//! | `pointer = { x, y }` | the pointer moved there through the real input path, which also makes that monitor the one a new window opens on |
 //! | `answer = n` | the n-th window opened answers the last size it was configured with, as a client does |
 //! | `wait = ms` | that much time, on the compositor's clock, and the frame at the end of it settled |
 //! | `move = { x, y }` | the last window opened, put there |
@@ -54,10 +57,11 @@
 //! `surfaces` (by name: `x`, `y`, `w`, `h` for one placed at a rect, and its
 //! `properties`), `panes` (what `sol.pane_values` handed every pane), `field`
 //! (what `sol.text_input()` answers, `framed` included), `windows` (each
-//! window opened: `id`, `x`, `y`, `drawn` -- the rectangle it is drawn at
-//! now, `x`, `y`, `w`, `h` -- and `transformed`, whether it holds a
-//! presentation transform at all) and `unknown` (each setting `solium --check`
-//! would report: `key`, and the `meant` it suggests); or, on the Qt thread,
+//! window opened: `id`; `x`, `y`, `w`, `h`, where it lives; `drawn` -- the
+//! rectangle it is drawn at now, `x`, `y`, `w`, `h` -- and `transformed`,
+//! whether it holds a presentation transform at all) and `unknown` (each
+//! setting `solium --check` would report: `key`, and the `meant` it
+//! suggests); or, on the Qt thread,
 //! `pixel(layer, x, y)`, the frame's layer of that name rendered, answering
 //! `r, g, b, a` -- the scene is the layer `"scene"` -- and `dormant`, `true`
 //! by the name of each of the frame's layers that says it is dormant now.
@@ -161,28 +165,47 @@ fn configure(state: &mut crate::state::Solium, path: &Path, scenario: &Table) {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-/// A monitor of 1920x1080 at the origin, and `us,ru` with Russian live.
-fn furnish(state: &mut crate::state::Solium) {
-    use smithay::input::keyboard::{Layout, XkbConfig};
-    let output = Output::new(
-        "scenario-1".to_owned(),
-        PhysicalProperties {
-            size: (0, 0).into(),
-            subpixel: Subpixel::Unknown,
-            make: "solium".to_owned(),
-            model: "scenario".to_owned(),
+/// The monitors a scenario names, `{ w, h }` each, or one of 1920x1080.
+fn sizes_of(scenario: &Table) -> Vec<(i32, i32)> {
+    let named: Option<Vec<Table>> = scenario.get("monitors").expect("`monitors` is a list");
+    named.map_or_else(
+        || vec![(1920, 1080)],
+        |monitors| {
+            monitors
+                .iter()
+                .map(|size| (size.get(1).expect("w"), size.get(2).expect("h")))
+                .collect()
         },
-    );
-    output.change_current_state(
-        Some(Mode {
-            size: (1920, 1080).into(),
-            refresh: 60_000,
-        }),
-        None,
-        Some(Scale::Fractional(1.0)),
-        None,
-    );
-    state.space.map_output(&output, (0, 0));
+    )
+}
+
+/// Those monitors, side by side from the origin, top-aligned and named
+/// `scenario-1`, `scenario-2` and on; and `us,ru` with Russian live.
+fn furnish(state: &mut crate::state::Solium, sizes: &[(i32, i32)]) {
+    use smithay::input::keyboard::{Layout, XkbConfig};
+    let mut x = 0;
+    for (index, &(w, h)) in sizes.iter().enumerate() {
+        let output = Output::new(
+            format!("scenario-{}", index + 1),
+            PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
+                make: "solium".to_owned(),
+                model: "scenario".to_owned(),
+            },
+        );
+        output.change_current_state(
+            Some(Mode {
+                size: (w, h).into(),
+                refresh: 60_000,
+            }),
+            None,
+            Some(Scale::Fractional(1.0)),
+            None,
+        );
+        state.space.map_output(&output, (x, 0));
+        x += w;
+    }
     let keyboard = state.seat.get_keyboard().expect("the seat has a keyboard");
     keyboard
         .set_xkb_config(
@@ -242,6 +265,8 @@ fn world(lua: &Lua, desk: &Desk, windows: &[Window]) -> mlua::Result<Table> {
         if let Some(real) = state.real_geometry(window) {
             entry.set("x", real.loc.x)?;
             entry.set("y", real.loc.y)?;
+            entry.set("w", real.size.w)?;
+            entry.set("h", real.size.h)?;
         }
         if let Some(pane) = state.panes.of(window) {
             let drawn = state
@@ -287,7 +312,8 @@ fn with_a_client(path: &Path) {
     let lua = Lua::new();
     let scenario = read(&lua, path);
     let mut desk = Desk::new();
-    furnish(&mut desk.state);
+    furnish(&mut desk.state, &sizes_of(&scenario));
+    let region = crate::monitor::union(&desk.state.space).expect("a monitor");
     configure(&mut desk.state, path, &scenario);
     let mut windows: Vec<Window> = Vec::new();
     // Each window's surface and toplevel, in the order opened, for `answer`.
@@ -353,8 +379,33 @@ fn with_a_client(path: &Path) {
                 input.commit();
             }
             desk.pump();
+        } else if let Ok(Some(at)) = step.get::<Option<Table>>("pointer") {
+            let at: (f64, f64) = (at.get(1).expect("x"), at.get(2).expect("y"));
+            let was = desk
+                .state
+                .seat
+                .get_pointer()
+                .map(|pointer| pointer.current_location())
+                .unwrap_or_default();
+            crate::synth::send_motion(
+                &mut desk.state,
+                region,
+                smithay::utils::Point::from(at) - was,
+                0,
+            );
+            desk.pump();
+            let now = desk
+                .state
+                .seat
+                .get_pointer()
+                .map(|pointer| pointer.current_location())
+                .unwrap_or_default();
+            assert!(
+                (now.x - at.0).abs() < 0.5 && (now.y - at.1).abs() < 0.5,
+                "{} step {index}: the pointer did not reach {at:?}: it is at {now:?}",
+                path.display()
+            );
         } else if let Ok(Some(combo)) = step.get::<Option<String>>("key") {
-            let region = Rectangle::from_size((1920, 1080).into());
             assert!(
                 crate::synth::key(&mut desk.state, region, &combo, 0),
                 "{} step {index}: no key types {combo}",

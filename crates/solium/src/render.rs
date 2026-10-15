@@ -1108,6 +1108,7 @@ pub(crate) fn elements(
             scale,
             shift,
             screen.size,
+            now,
         ));
     }
 
@@ -2027,10 +2028,11 @@ fn cursor(
     scale: f64,
     shift: smithay::utils::Point<f64, smithay::utils::Logical>,
     screen: smithay::utils::Size<i32, smithay::utils::Logical>,
+    now: std::time::Duration,
 ) -> Vec<Element> {
-    let Some(pointer) = state.seat.get_pointer() else {
+    if state.seat.get_pointer().is_none() {
         return Vec::new();
-    };
+    }
     // The pointer is one thing in a global space and there are several screens
     // to draw it on. Each output draws it at its own offset, and the ones it is
     // not over draw it off their own edge, where the renderer discards it. No
@@ -2042,7 +2044,12 @@ fn cursor(
     // whether its picture reaches this output. It can animate, so drawing it
     // off every other monitor's edge would cost a full draw per monitor per
     // frame (`cursor::scene::tests::a_picture_is_drawn_only_on_the_outputs_it_touches`).
-    let location = pointer.current_location() + shift;
+    //
+    // Where the pointer is *drawn*, which is where it is unless a warp's
+    // flight is carrying its picture there (#220), at the instant this
+    // screen's frame sampled, so the picture and the windows under it agree.
+    // `tests::the_pointer_is_drawn_where_its_flight_has_got_to`.
+    let location = state.drawn_pointer_at(now) + shift;
 
     // `showing` rather than the field, which is now private. It is the one
     // reader, and it is where a cursor surface destroyed under a stationary
@@ -4121,6 +4128,31 @@ mod tests {
         assert_eq!(
             origin_at((99.6, 199.4).into(), (0, 0).into()),
             smithay::utils::Point::from((100, 199))
+        );
+    }
+
+    /// **The pointer is drawn where its flight has got to, at the instant
+    /// the screen is drawn at** (#220): its picture is placed at
+    /// `Solium::drawn_pointer_at` the `now` [`super::elements`] sampled for
+    /// everything else on the screen, which is where a warp's flight has
+    /// carried it then, and not at the pointer's own location, which a warp
+    /// moves at once.
+    ///
+    /// A source check, as the drag icon's test below is, and for its reason:
+    /// `cursor` needs a renderer this binary cannot make. It proves only that
+    /// `cursor` reads the drawn place at the frame's instant;
+    /// `drawn_pointer_at` itself is `state::tests::real_client::follow`'s.
+    #[test]
+    fn the_pointer_is_drawn_where_its_flight_has_got_to() {
+        let source = include_str!("render.rs");
+        let start = source
+            .find("\nfn cursor(")
+            .expect("render.rs still draws the pointer in `cursor`");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+        assert!(
+            body.contains("state.drawn_pointer_at(now)") && !body.contains("current_location()"),
+            "`cursor` does not place the pointer where its flight has got to at the frame's instant"
         );
     }
 

@@ -64,19 +64,49 @@ function modes.register(name, layout)
     modes.registered[name] = layout
 end
 
--- Whether the pointer moving over a window should focus it, in mode `name`
--- (#219): `config.focus.modes[name]`, or `config.focus.follow` -- which may
--- itself be `nil`, meaning the input profile's own answer for this machine
--- -- when the mode says nothing.
-local function follow_for(name)
-    local named = config.focus.modes[name]
-    if named == "click" then
+-- What one `focus.modes` entry says: `false` for "click", `true` for
+-- "follow", and `nil` for anything else, which counts as no entry.
+local function word(entry)
+    if entry == "click" then
         return false
     end
-    if named == "follow" then
+    if entry == "follow" then
         return true
     end
-    return config.focus.follow
+    return nil
+end
+
+-- Whether the pointer moving over a window should focus it, in mode `name`
+-- (#219, #128). Highest first: your own `config.focus.modes[name]`; your own
+-- `config.focus.follow`, for every mode at once; the shipped entry; and the
+-- machine's own answer for its form factor (#159), which `nil` asks the
+-- compositor for. `config.lua` keeps the shipped entries behind yours, in
+-- the table's `__index`, so `rawget` reads yours alone. A shipped "follow"
+-- is the machine's own answer -- follow where there is a pointer to hover,
+-- not on a tablet or a phone -- so of the shipped words only "click" is
+-- said here.
+-- `your_mode_entry_then_your_focus_follow_then_the_shipped_entry_then_the_machine`
+-- in `script.rs`, and
+-- `your_focus_follow_false_keeps_every_mode_from_following_unless_you_name_one`
+-- and `on_a_tablet_the_shipped_layouts_leave_hover_to_the_machine` in
+-- `state/tests.rs`.
+local function follow_for(name)
+    local focus = config.focus
+    local modes = type(focus.modes) == "table" and focus.modes or {}
+    local yours = word(rawget(modes, name))
+    if yours ~= nil then
+        return yours
+    end
+    if focus.follow ~= nil then
+        return focus.follow
+    end
+    local behind = getmetatable(modes)
+    local shipped = type(behind) == "table" and type(behind.__index) == "table"
+        and behind.__index[name]
+    if word(shipped) == false then
+        return false
+    end
+    return nil
 end
 
 -- Hand the resolved model to the compositor. Called here whenever the mode
@@ -89,11 +119,18 @@ end
 -- it, so `super+shift+r` while tiling would silently answer floating's
 -- click-only default until the next `super+t`.
 -- `a_reload_keeps_the_focus_model_tiling_was_switched_to`.
+--
+-- `after_close` is the mode's own entry in `config.focus.after_close` (#128),
+-- or nil -- the compositor's own rule, the window under the pointer and then
+-- the topmost -- for a mode that has none, as for a mode registered outside
+-- `config.lua`. `the_shipped_modes_each_hand_over_their_own_focus_model`.
 local function apply_focus_mode(name)
+    local after_close = config.focus.after_close
     sol.focus_mode({
         click = config.focus.click,
         follow = follow_for(name),
         clear_on_empty_click = config.focus.clear_on_empty_click,
+        after_close = type(after_close) == "table" and after_close[name] or nil,
     })
 end
 

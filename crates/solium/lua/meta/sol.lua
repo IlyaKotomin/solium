@@ -170,6 +170,32 @@
 ---@field duration? integer Milliseconds.
 ---@field easing? sol.Easing
 
+---What moved the keyboard, as the `"focus"` event tells it and
+---`sol.focus_source()` answers. A `sol.focus` is told with what its handler
+---was answering; inside `sol.focus_direction` or `sol.move_direction` it is
+---`"direction"` or `"move"`, whatever called those.
+---@alias sol.FocusSource
+---| "binding" # A key binding's handler: a workspace key, the overview's keys.
+---| "direction" # A `sol.focus_direction`'s listeners: `super+arrows`.
+---| "move" # A `sol.move_direction`'s listeners: `super+shift+arrows`.
+---| "click" # A press on a window, or a `"click"` listener while a script holds input.
+---| "scroll" # A `"scroll"` listener: the wheel with Super held.
+---| "drop" # A `"drop"` listener: a dragged window let go.
+---| "touch" # A touch on a window.
+---| "hover" # The pointer onto a window, with focus following the mouse.
+---| "surface" # A hosted scene's action: a bar's window chip, the dock, a search.
+---| "open" # A window opening, or an `"open"` listener.
+---| "activate" # An application bringing its window forward, or an `"activate"` listener.
+---| "settle" # The window the keyboard was on went, and another took over: as a close lands, the one `config.focus.after_close` chose.
+---| "script" # `sol.focus` from anything else.
+
+---A warp: where on a window the pointer goes, and how its picture flies
+---there. The pointer itself is there at once.
+---@class sol.Warp
+---@field to? "center"|{ x: number, y: number } Where on the window, as a share of its width and height. `"center"` by default. Not for a point, which is already a place.
+---@field motion? sol.Motion How the picture flies. Left out, it is there at once; a duration left out is 220 ms, an easing `"outCubic"`.
+---@field interrupt? "pointer"|"picture" Where the mouse carries on from if it moves before the picture lands: `"pointer"`, where the warp put it (the default), or `"picture"`, where the picture is drawn.
+
 ---Where and how `sol.present` draws a window. A key left out says nothing: with
 ---no rect the window is drawn at its own, with no opacity it is opaque, and
 ---with no rotation it is flat.
@@ -291,14 +317,22 @@
 ---@class sol.X11Options
 ---@field hidden? string[] WM_CLASS names to hide, matched case-insensitively against either field a client sets (`class` or `instance` on `sol.Window`). Replaces the whole default list rather than adding to it; default `{ "xwaylandvideobridge" }`.
 
----The input profile's focus policy (#219). A key left out keeps whatever it
----already answered -- there is no fixed default here the way `sol.idle` has
----one, since that would have to know the machine's own form factor
----(#159) and a mode calling this does not.
+---The input profile's focus policy (#219). A key left out is the machine's
+---own answer for it, the form factor's (#159) -- never what the call before
+---this one said, so a mode that names nothing does not inherit the mode before
+---it (#128).
 ---@class sol.FocusModeOptions
 ---@field click? boolean Whether a press focuses the window it lands on.
 ---@field follow? boolean Whether moving the pointer over a window focuses it.
+---@field after_close? sol.AfterClose|sol.AfterClose[] Where the keyboard goes when the window that has it closes, tried in order until one finds a window on screen; `{}` leaves it on nothing. Left out: `{ "pointer", "topmost" }`. An unknown word is logged and skipped.
 ---@field clear_on_empty_click? boolean Whether a press on empty desktop or the wallpaper clears keyboard focus. A press on a client's own shell surface (a bar, say) is not covered yet, even one that declines the keyboard: see #219.
+
+---One word of `sol.FocusModeOptions.after_close` (#128).
+---@alias sol.AfterClose
+---| "pointer" # The window under the pointer, where the windows are going.
+---| "neighbour" # The window that takes the closed one's place on its monitor -- one going into where it stood -- or the one nearest to it; of several, the one focused last.
+---| "recent" # The window focused most recently that is still open on its monitor.
+---| "topmost" # The topmost window on screen, on any monitor.
 
 ---The pointer's theme. A key left out, or no table, means the configuration
 ---did not say, and `XCURSOR_THEME` and `XCURSOR_SIZE` have their turn.
@@ -348,9 +382,10 @@
 ---What `sol.on` can listen for.
 ---@alias sol.Event
 ---| "open" # A window's life began: `(id)`.
----| "focus" # The keyboard moved to a window: `(id)`.
+---| "focus" # The keyboard moved to a window: `(id, source, changed)`, `source` what moved it, a `sol.FocusSource`, and `changed` whether it came from another window or none -- `false` for the window that had it focused again. `lua/follow.lua` takes the pointer along by them.
 ---| "activate" # A window asked to be brought forward, after the compositor answered: `(id, why)`. `why` is `"launch"` when an application already running answered a launch with a window it had, and `"request"` for anything else.
 ---| "closing" # A close was asked for and the window is fading: `(id)`.
+---| "close_landed" # A close the compositor asked for has played its animation: the window has faded out of sight where it stood, and its application has just been asked to go -- or, an X11 one that let the last request go unanswered, been ended: `(id)`. Told after `closing` and before the `close` or `refused` that follows; not told for a window that went, or answered with a dialog, before its close landed, nor for one whose application never came, which is told `close` there and then.
 ---| "refused" # Its application declined, and the window is back: `(id)`.
 ---| "close" # The window is gone: `(id)`.
 ---| "fullscreen" # A window went fullscreen, or left it: `(id, entering)`. Told once the change is made: its client has been sent its new size and it lives at its new rectangle. Once every listener has run, the compositor moves its picture there from where it is drawn, as a layout's glide does, with the timing a listener set with `sol.animate`, and at once if none set one. Until the client answers at its new size the window is held there and its last picture stretched into it, for a quarter of a second past the landing at most; the transform is released when the glide lands. With no timing the change puts no transform on the window and holds nothing. A window a mode is presenting is left where the mode draws it. A change a listener makes is made at once and not told.
@@ -732,10 +767,44 @@ function sol.present_group_clear(name, motion) end
 ---@return nil
 function sol.animate(options) end
 
----Give a window the keyboard.
+---Give a window the keyboard. The `"focus"` event is told with what this
+---handler is answering (`sol.focus_source()`). With `warp`, the pointer goes
+---to the window once it has the keyboard, as `sol.warp` takes it: `true` is
+---its centre at once, a table says where and how. A focus the session's lock
+---refuses takes the pointer nowhere.
 ---@param id integer
+---@param options? { warp?: boolean|sol.Warp }
 ---@return nil
-function sol.focus(id) end
+function sol.focus(id, options) end
+
+---Take the pointer to a window or a point.
+---
+---The pointer is there at once: what it is over, what is hovered, which
+---client has it and the shape it shows are the destination's from the first
+---instant, and no focus follows it. Its picture flies there from wherever it
+---is drawn, along `warp.motion`; `Solium.cursor` says so while it does
+---(`moving`, `from`, `to`, `velocity`). Moving the mouse mid-flight carries on
+---from where the pointer is, or from the picture as `warp.interrupt` says; the
+---jump is never measured as the mouse's speed; a press lands it; and a warp
+---asked for while a press is handled waits for the buttons to come up, so the
+---click goes where it was aimed, and is refused then if a menu the click opened
+---holds the pointer. Carried out once every
+---command of this handler is applied, so a window it has just moved is warped
+---to where it was moved; the last warp asked for wins. Kept on a screen.
+---Refused while a button or a client holds the pointer, and while the session
+---is locked. A window that is not there takes it nowhere. Anything but a
+---window's id or a point `{ x, y }` is an error, as is `to` with a point.
+---@param target integer|sol.Point A window's id, or a point in the global space.
+---@param warp? sol.Warp
+---@return nil
+function sol.warp(target, warp) end
+
+---What the handler running now is answering, in the `"focus"` event's words:
+---what a `sol.focus` made here would be told with. For a policy that acts
+---where no window takes the keyboard, as `lua/workspaces.lua` does for a
+---switch to an empty workspace.
+---@return sol.FocusSource
+function sol.focus_source() end
 
 ---Make a window fullscreen, or give it back its place if it already is. With no
 ---id, the focused window; with nothing focused, nothing happens.
@@ -920,7 +989,8 @@ function sol.unknown(key, meant) end
 ---finalizer, and the `__close` of a to-be-closed variable in the function a
 ---stop interrupts, run where no hook does, so the deadline cannot stop a loop
 ---in either.
----@overload fun(event: "open"|"focus"|"closing"|"refused"|"close", handler: fun(id: integer))
+---@overload fun(event: "open"|"closing"|"close_landed"|"refused"|"close", handler: fun(id: integer))
+---@overload fun(event: "focus", handler: fun(id: integer, source: sol.FocusSource, changed: boolean))
 ---@overload fun(event: "activate", handler: fun(id: integer, why: "launch"|"request"))
 ---@overload fun(event: "drop", handler: fun(id: integer, x: number, y: number))
 ---@overload fun(event: "resize", handler: fun(id: integer, edge_x: number, edge_y: number, horizontal_side: "left"|"right"|nil, vertical_side: "top"|"bottom"|nil))

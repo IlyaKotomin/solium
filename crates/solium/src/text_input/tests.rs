@@ -326,8 +326,11 @@ impl Desk {
 
     /// Give `window` the keyboard, as a click on it would.
     pub(crate) fn focus(&mut self, window: &Window) {
-        self.state
-            .focus_window(window, SERIAL_COUNTER.next_serial());
+        self.state.focus_window(
+            window,
+            SERIAL_COUNTER.next_serial(),
+            crate::script::FocusSource::Script,
+        );
         self.pump();
     }
 

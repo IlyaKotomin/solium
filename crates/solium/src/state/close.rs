@@ -37,8 +37,10 @@ impl Solium {
 
     /// Where a layout has a pane: the tile it asked for, or where the pane is
     /// when it is in none. What `Self::depart` compares across a `close` to
-    /// find the windows the layout grew into the space of one that went.
-    fn laid_out_at(&self, pane: &Pane) -> Rectangle<i32, Logical> {
+    /// find the windows the layout grew into the space of one that went, and
+    /// what `config.focus.after_close`'s `"neighbour"` measures each window
+    /// by (`Self::settle_focus`).
+    pub(super) fn laid_out_at(&self, pane: &Pane) -> Rectangle<i32, Logical> {
         pane.placed().unwrap_or_else(|| self.pane_outer(pane))
     }
 
@@ -248,10 +250,20 @@ impl Solium {
             if let Some(pane) = self.panes.get_mut(id) {
                 pane.mark_asked(now);
             }
+            // **The close has landed, and a layout waiting for that reflows
+            // now** (`reflow_on_close = "when_landed"`, #128): told before the
+            // keyboard moves, so `config.focus.after_close` judges where the
+            // other windows are going once the space is theirs. After
+            // `mark_asked`, so the window is still `leaving` in the snapshot,
+            // as it is until `close` or `refused`.
+            // `with_reflow_on_close_when_landed_the_grid_waits_for_the_close_to_land`.
+            self.trigger_close_landed(id);
             // **And the keyboard leaves with the pixels.** After `mark_asked`,
             // not before: `stop_closing` above has already cleared the other
             // half of `Pane::leaving`, so until this line the pane would still
-            // be a candidate for the keyboard it is about to give up.
+            // be a candidate for the keyboard it is about to give up. Where it
+            // stood is noted first, for `config.focus.after_close`.
+            self.note_keyboard_left(id);
             self.hand_off_keyboard(&window);
         }
         // Asked after the loop, not before it: `trigger_close` runs a script,
@@ -796,6 +808,15 @@ impl Solium {
         };
         let title = self.pane_title(id);
         let focused = self.looks_focused(id);
+        // Where it stood, for `config.focus.after_close`, if it had the
+        // keyboard: `settle_focus` hands it on once the frame's `sync_panes`
+        // finds the window gone.
+        // A field rather than `Self::note_keyboard_left`, which would borrow
+        // all of `self` while `pane` is still read below.
+        // `a_window_that_closes_itself_hands_the_keyboard_to_the_window_that_takes_its_place`.
+        if focused {
+            self.keyboard_left = Some((id, self.laid_out_at(pane)));
+        }
         // **On the fade it is already on, if a close the compositor started is
         // playing**: a client quitting inside those 190 ms leaves on that
         // close's schedule and from that close's transform, rather than
@@ -972,6 +993,22 @@ impl Solium {
             return;
         };
         let outcome = scripts.closing(pane.get(), snapshot);
+        self.scripts = Some(scripts);
+        self.apply(outcome);
+    }
+
+    /// Tell scripts a close has landed: its animation has played, and its
+    /// client has just been asked to go.
+    ///
+    /// See [`Scripts::close_landed`]. Fired from [`Self::settle_closing`]
+    /// alone, and only for a window with a client to ask: one whose
+    /// application never arrived is `close`d there instead.
+    fn trigger_close_landed(&mut self, pane: crate::pane::PaneId) {
+        let snapshot = self.snapshot();
+        let Some(mut scripts) = self.scripts.take() else {
+            return;
+        };
+        let outcome = scripts.close_landed(pane.get(), snapshot);
         self.scripts = Some(scripts);
         self.apply(outcome);
     }

@@ -195,6 +195,51 @@ pub(crate) mod tests {
         });
     }
 
+    /// **A published flight reaches `Solium.cursor`** (#220): `moving`,
+    /// `from` and `to`, each notified when it changes, so a scene can hear
+    /// the picture land.
+    #[test]
+    fn a_published_flight_reaches_solium_cursor() {
+        on_the_qt_thread(|| {
+            let (directory, path) = written(
+                "solium-pointer-flight",
+                r#"
+                import QtQuick
+                import Solium
+                Item {
+                    readonly property int moving: Solium.cursor.moving ? 1 : 0
+                    readonly property int fromX: Math.round(Solium.cursor.from.x)
+                    readonly property int fromY: Math.round(Solium.cursor.from.y)
+                    readonly property int toX: Math.round(Solium.cursor.to.x)
+                    readonly property int toY: Math.round(Solium.cursor.to.y)
+                    property int landings: 0
+                    onMovingChanged: if (moving === 0) landings++
+                }
+                "#,
+            );
+            let mut scene = built(&path);
+            let read = |scene: &mut Scene| {
+                ["moving", "fromX", "fromY", "toX", "toY"].map(|name| scene.get_int(name))
+            };
+            assert!(super::publish(
+                r#"{"moving":true,"from":{"x":100,"y":200},"to":{"x":900,"y":40}}"#
+            ));
+            let flying = read(&mut scene);
+            assert!(super::publish(
+                r#"{"moving":false,"from":{"x":100,"y":200},"to":{"x":900,"y":40}}"#
+            ));
+            let landed = read(&mut scene);
+            let landings = scene.get_int("landings");
+            drop(scene);
+            let _ = std::fs::remove_dir_all(&directory);
+            assert_eq!(
+                (flying, landed, landings),
+                ([1, 100, 200, 900, 40], [0, 100, 200, 900, 40], 1),
+                "([moving, from, to] flying, landed, how often it was heard to land)"
+            );
+        });
+    }
+
     /// **A scene sized by its root keeps its own size**: the compositor never
     /// writes the root's width or height, so a binding on them survives a
     /// resize, and a root that sets neither is the default square.

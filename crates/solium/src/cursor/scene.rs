@@ -328,6 +328,15 @@ impl Motion {
         self.last = Some(now);
     }
 
+    /// The pointer was put somewhere rather than moved there (#220): nothing
+    /// before it leads to where it is now, so the next report starts a
+    /// movement of its own, and a jump is never measured as speed.
+    /// `crate::state::tests::real_client::follow::real_motion_after_a_warp_reports_only_its_own_speed`.
+    pub(crate) fn restart(&mut self) {
+        self.last = None;
+        self.span = None;
+    }
+
     /// How fast the pointer moved since the last read, in logical pixels a
     /// second, and the start of the next: zero when it did not move, or moved
     /// only once since a pause, which is a distance with no time to divide it

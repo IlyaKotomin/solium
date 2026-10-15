@@ -174,7 +174,7 @@ impl Solium {
     /// Collected once rather than per pane: [`Self::on_stage`] is asked in a
     /// walk, and re-deriving the screens inside it would make a question about
     /// one pane cost a pass over the outputs.
-    pub(super) fn screens(&self) -> Vec<Rectangle<i32, Logical>> {
+    pub(crate) fn screens(&self) -> Vec<Rectangle<i32, Logical>> {
         self.space
             .outputs()
             .filter_map(|output| self.space.output_geometry(output))

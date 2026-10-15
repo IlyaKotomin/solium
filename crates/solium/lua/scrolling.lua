@@ -22,6 +22,7 @@ local monitors = require("monitors")
 local dialogs = require("dialogs")
 local sizes = require("sizes")
 local direction = require("direction")
+local follow = require("follow")
 
 -- `views` is the arrangement, one strip per desk (see `view_for`), and
 -- `sol.keep` holds it so that it outlives `super+shift+r`: a reload is a change
@@ -52,11 +53,16 @@ for _, view in pairs(scrolling.views) do
     view:configure(config.scrolling)
 end
 
--- Whether the strip closes up the moment a close is asked for, rather than once
--- the application has gone. Read when each event arrives, like `tiling.lua`'s.
--- See `reflow_on_close` in config.lua; anything but "when_gone" is the default.
-local function reflows_at_once()
-    return config.scrolling.reflow_on_close ~= "when_gone"
+-- When the strip closes the gap a window being closed leaves: "immediate",
+-- "when_landed" or "when_gone", read when each event arrives, like
+-- `tiling.lua`'s. See `reflow_on_close` in config.lua; anything else is
+-- "immediate".
+local function reflow_on_close()
+    local said = config.scrolling.reflow_on_close
+    if said == "when_landed" or said == "when_gone" then
+        return said
+    end
+    return "immediate"
 end
 
 -- One strip per workspace per monitor.
@@ -204,10 +210,11 @@ function scrolling.adopt()
         local name = each.monitor.name
         for _, window in ipairs(each.windows) do
             -- A window being closed is already gone to a strip that closes up
-            -- at once, and only `refused` puts it back: neither inserted nor
-            -- present, so the sweep below takes it out of a strip that still
-            -- has it. The same rule, for the same reason, as `tiling.adopt`.
-            if window.leaving and reflows_at_once() then
+            -- before the application has gone, and only `refused` puts it
+            -- back: neither inserted nor present, so the sweep below takes it
+            -- out of a strip that still has it. The same rule, for the same
+            -- reason, as `tiling.adopt`.
+            if window.leaving and reflow_on_close() ~= "when_gone" then
                 -- Nothing: see above.
             -- A dialog is deliberately absent from every strip, so `adopt` --
             -- whose whole job is to put back whatever is missing -- has to be
@@ -288,21 +295,19 @@ end)
 -- rule as `tiling.lua`'s, for the same reason (#128). Which columns move to do
 -- it is exactly what `close` would have moved; `script.rs`'s
 -- `closing_reflows_the_survivors_as_close_would_have` compares the two.
--- `reflow_on_close = "when_gone"` makes these two do nothing and leaves it all
--- to `close`.
+-- `reflow_on_close = "when_landed"` does it from `close_landed`, once the fade
+-- has played, and "when_gone" leaves it all to `close`.
 --
 -- `apply` and not `settle`, as `close` has always been: the keyboard leaves a
--- closing window when its animation lands, which is the compositor's to decide,
--- and a layout handing it to a neighbour now would take it off the window the
--- user is still looking at.
-sol.on("closing", function(id)
-    -- Only while this layout is in charge, for the reason `tiling.lua` gives:
-    -- a strip nobody is using is not on screen, and one rearranged anyway
-    -- comes back with its focus on the refused window -- which
-    -- `scrolling.started` hands the keyboard to when the user switches here.
-    if not scrolling.active or not reflows_at_once() then
-        return
-    end
+-- closing window when its animation lands, which is the compositor's to decide
+-- (`config.focus.after_close`), and a layout handing it to a neighbour now
+-- would take it off the window the user is still looking at.
+--
+-- Only while this layout is in charge, for the reason `tiling.lua` gives: a
+-- strip nobody is using is not on screen, and one rearranged anyway comes back
+-- with its focus on the refused window -- which `scrolling.started` hands the
+-- keyboard to when the user switches here.
+local function take_out(id)
     local kept
     for key, view in pairs(scrolling.views) do
         if view:contains(id) then
@@ -315,8 +320,27 @@ sol.on("closing", function(id)
         end
         view:remove(id)
     end
-    scrolling.leaving[id] = kept
+    -- Only for a window this took out of a strip, so a second `take_out` --
+    -- the setting changed between `closing` and `close_landed` -- does not
+    -- forget where the first found it.
+    if kept then
+        scrolling.leaving[id] = kept
+    end
     scrolling.apply(config.scrolling.snap)
+end
+
+sol.on("closing", function(id)
+    if scrolling.active and reflow_on_close() == "immediate" then
+        take_out(id)
+    end
+end)
+
+-- The close has played and the application is being asked to go: the moment
+-- "when_landed" closes up. `with_reflow_on_close_when_landed_the_grid_waits_for_the_close_to_land`.
+sol.on("close_landed", function(id)
+    if scrolling.active and reflow_on_close() == "when_landed" then
+        take_out(id)
+    end
 end)
 
 -- The strip a window belongs in now, its key and its monitor: its own
@@ -341,9 +365,10 @@ end
 -- refusal is a "save your changes?" dialog that has the keyboard and must keep
 -- it. For the same reason this is not `open`, whose handler settles.
 --
--- Put back by the same rule as `tiling.lua`'s: taken out by `closing`, whatever
--- the setting says now, or missing from a strip that is in charge; beside its
--- old neighbours only if it still belongs in the strip it left.
+-- Put back by the same rule as `tiling.lua`'s: taken out by `closing` or
+-- `close_landed`, whatever the setting says now, or missing from a strip that
+-- is in charge; beside its old neighbours only if it still belongs in the strip
+-- it left.
 sol.on("refused", function(id)
     local kept = scrolling.leaving[id]
     scrolling.leaving[id] = nil
@@ -507,14 +532,25 @@ sol.on("scroll", function(_, dy)
     settle(config.scrolling.snap)
 end)
 
-local function bind(combo, action)
+-- A key the strip handles, on the active monitor's strip. One that `moves`
+-- the focused window -- a column moved, a window pushed out of its column --
+-- keeps the keyboard on it, so no `focus` takes the pointer along: it goes
+-- after the window here instead, as a move by direction does in
+-- `direction.lua`, by `focus.cursor.follows.move` (#220). A key that only
+-- resizes, such as `super+r`, takes it nowhere.
+-- `in_scrolling_a_key_takes_the_pointer_along_only_if_it_moves_the_keyboard_or_its_window`.
+local function bind(combo, action, moves)
     sol.bind(combo, function()
         if not scrolling.active then
             return
         end
         local active = monitors.active()
-        action(view_for(active and active.name), active and active.name)
+        local view = view_for(active and active.name)
+        action(view, active and active.name)
         settle(config.scrolling.snap)
+        if moves then
+            follow.window(view:focused(), "move")
+        end
     end)
 end
 
@@ -523,14 +559,14 @@ sol.bind("super+s", scrolling.toggle)
 -- Move between columns, and within one.
 bind("super+bracketleft", function(view, on) view:focus_sideways(-1, options(on)) end)
 bind("super+bracketright", function(view, on) view:focus_sideways(1, options(on)) end)
-bind("super+ctrl+bracketleft", function(view, on) view:move_column(-1, options(on)) end)
-bind("super+ctrl+bracketright", function(view, on) view:move_column(1, options(on)) end)
+bind("super+ctrl+bracketleft", function(view, on) view:move_column(-1, options(on)) end, true)
+bind("super+ctrl+bracketright", function(view, on) view:move_column(1, options(on)) end, true)
 bind("super+shift+bracketleft", function(view) view:focus_vertically(-1) end)
 bind("super+shift+bracketright", function(view) view:focus_vertically(1) end)
 
 -- Stack a window into this column, or push it back out into its own.
 bind("super+comma", function(view) view:consume() end)
-bind("super+period", function(view, on) view:expel(options(on)) end)
+bind("super+period", function(view, on) view:expel(options(on)) end, true)
 
 -- Cycle the column through the preset widths.
 bind("super+r", function(view, on) view:cycle_width(options(on)) end)

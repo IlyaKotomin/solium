@@ -66,13 +66,25 @@ local tiling = {
     unsized = {},
 }
 
--- Whether the other windows close up the moment a close is asked for, rather
--- than once the application has gone. Read when each event arrives rather than
--- captured when this file loads, so a script that changes the setting while the
--- session runs changes the next close. See `reflow_on_close` in config.lua;
--- anything but "when_gone" is the default.
-local function reflows_at_once()
-    return config.tiling.reflow_on_close ~= "when_gone"
+-- When the other windows close up around a window being closed: the moment the
+-- close is asked for ("immediate"), once its animation has played
+-- ("when_landed"), or once the application has gone ("when_gone"). Read when
+-- each event arrives rather than captured when this file loads, so a script
+-- that changes the setting while the session runs changes the next close. See
+-- `reflow_on_close` in config.lua; anything else is "immediate".
+local function reflow_on_close()
+    local said = config.tiling.reflow_on_close
+    if said == "when_landed" or said == "when_gone" then
+        return said
+    end
+    return "immediate"
+end
+
+-- Whether a window being closed is, to this layout, already out of the
+-- arrangement or about to be: everything but "when_gone", where it keeps its
+-- tile until the application has gone.
+local function reflows_before_gone()
+    return reflow_on_close() ~= "when_gone"
 end
 
 -- A line in the log the first time it is said, and never again this session.
@@ -389,14 +401,18 @@ function tiling.adopt()
     for _, each in ipairs(monitors.each(sol.windows())) do
         local name = each.monitor.name
         for _, window in ipairs(each.windows) do
-            -- A window being closed is, to a layout that reflows at once,
-            -- already gone: `closing` took it out of its tree, and putting it
-            -- back is `refused`'s decision and nobody else's. So it is neither
+            -- A window being closed is, to a layout that reflows before the
+            -- application has gone, already gone: `closing` took it out of
+            -- its tree, or `close_landed` is about to, and putting it back is
+            -- `refused`'s decision and nobody else's. So it is neither
             -- inserted nor counted as present -- the sweep below takes it out
             -- of any tree that still holds it, which is what makes a missed
-            -- `closing` recoverable here like any other missed event. Waiting
-            -- for the client instead, it is an ordinary window until `close`.
-            if window.leaving and reflows_at_once() then
+            -- `closing` recoverable here like any other missed event. Under
+            -- "when_landed" an arrangement during the fade -- a monitor
+            -- change, a reload, tiling switched on -- so closes up a moment
+            -- early, as "immediate" would have. Waiting for the client
+            -- instead, it is an ordinary window until `close`.
+            if window.leaving and reflows_before_gone() then
                 -- Nothing: see above.
             -- A dialog is deliberately absent from every tree, so `adopt` --
             -- whose whole job is to put back whatever is missing -- has to be
@@ -485,10 +501,12 @@ local function open_in(id, monitor, target, cursor)
             end
         elseif step == "workspace" then
             -- A window being closed keeps its workspace when it keeps its
-            -- tile: with "when_gone" its leaf is still in that workspace's
-            -- tree, which the fresh tree below would throw away while the
-            -- window is still drawn there.
-            local index = workspaces.vacant(monitor, id, not reflows_at_once())
+            -- tile: with "when_gone", and "when_landed" while it fades, its
+            -- leaf is still in that workspace's tree, which the fresh tree
+            -- below would throw away while the window is still drawn there.
+            -- "when_landed" keeps the workspace until the application has
+            -- gone, a moment past the landing, rather than ask the trees.
+            local index = workspaces.vacant(monitor, id, reflow_on_close() ~= "immediate")
             if index then
                 workspaces.of[id] = index
                 -- A new tree rather than the one that may be there. Nothing is
@@ -690,18 +708,16 @@ end)
 -- place before its program has started, and a dragged edge is where the hand
 -- is before the client has redrawn -- and a close is the same: the window
 -- fades where it stood while its neighbours grow into the space (#128).
--- `reflow_on_close = "when_gone"` is the old behaviour, and these two handlers
--- then do nothing and `close` does it all.
-sol.on("closing", function(id)
-    -- Only while this layout is in charge. A tree nobody is using is not on
-    -- screen, and a window taken out of it here would be put back at
-    -- `refused` from a centre measured in another mode's geometry, at the
-    -- configured split rather than its own -- a rearrangement of a layout the
-    -- user is not even looking at. `adopt` leaves a window being closed out
-    -- if the user switches to tiling during the close.
-    if not tiling.active or not reflows_at_once() then
-        return
-    end
+-- `reflow_on_close = "when_landed"` does it from `close_landed` instead, once
+-- the fade has played, and "when_gone" leaves it all to `close`.
+--
+-- Only while this layout is in charge. A tree nobody is using is not on
+-- screen, and a window taken out of it here would be put back at `refused`
+-- from a centre measured in another mode's geometry, at the configured split
+-- rather than its own -- a rearrangement of a layout the user is not even
+-- looking at. `adopt` leaves a window being closed out if the user switches
+-- to tiling during the close.
+local function take_out(id)
     local window = dialogs.by_id(id)
     local from
     for key, tree in pairs(tiling.trees) do
@@ -723,6 +739,20 @@ sol.on("closing", function(id)
         }
     end
     tiling.apply()
+end
+
+sol.on("closing", function(id)
+    if tiling.active and reflow_on_close() == "immediate" then
+        take_out(id)
+    end
+end)
+
+-- The close has played and the application is being asked to go: the moment
+-- "when_landed" closes up. `with_reflow_on_close_when_landed_the_grid_waits_for_the_close_to_land`.
+sol.on("close_landed", function(id)
+    if tiling.active and reflow_on_close() == "when_landed" then
+        take_out(id)
+    end
 end)
 
 -- The tree a window belongs in now, and its key: its own workspace's, on the
@@ -755,11 +785,12 @@ end
 -- `tiling.minimum` (#134). See `rejoin`.
 --
 -- **Decided by what happened, not by the setting.** A window is put back if
--- `closing` took it out -- whatever `reflow_on_close` says now, since a script
--- may have changed it in between -- or if it is missing from a layout that is
--- in charge, which is where `adopt` leaves a window being closed. Where it
--- stood is used only if that is still the tree the window belongs in: a
--- monitor unplugged during the close leaves a tree `apply` never walks.
+-- `closing` or `close_landed` took it out -- whatever `reflow_on_close` says
+-- now, since a script may have changed it in between -- or if it is missing
+-- from a layout that is in charge, which is where `adopt` leaves a window
+-- being closed. Where it stood is used only if that is still the tree the
+-- window belongs in: a monitor unplugged during the close leaves a tree
+-- `apply` never walks.
 sol.on("refused", function(id)
     local stood = tiling.leaving[id]
     tiling.leaving[id] = nil
@@ -785,8 +816,8 @@ end)
 
 -- The window is gone. Unchanged by `reflow_on_close`: a window that closed
 -- itself was never `closing`, so this is the one event every layout hears for
--- every window that goes. For one `closing` already took out, the `remove`
--- below finds nothing to remove.
+-- every window that goes. For one `closing` or `close_landed` already took
+-- out, the `remove` below finds nothing to remove.
 sol.on("close", function(id)
     for _, tree in pairs(tiling.trees) do
         tree:remove(id)

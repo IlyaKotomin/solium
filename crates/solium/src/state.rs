@@ -272,6 +272,19 @@ pub(crate) struct Solium {
     /// `tests::real_client::reflow_on_close::hosted::a_closed_window_leaves_no_gap_in_focus_order`.
     pub(crate) focus_history: Vec<u64>,
 
+    /// Where the keyboard goes when the window that has it closes, word by
+    /// word until one finds a window: `config.focus.after_close` for the
+    /// mode in charge, handed over with `sol.focus_mode` (#128). With no
+    /// configuration, [`crate::successor::Successor::UNCONFIGURED`]. See
+    /// [`Self::settle_focus`].
+    pub(crate) after_close: Vec<crate::successor::Successor>,
+
+    /// The window that had the keyboard when it closed, and where it stood:
+    /// what `after_close`'s words are asked about. Set where a closing window
+    /// gives the keyboard up ([`Self::note_keyboard_left`]), taken by
+    /// [`Self::settle_focus`], and dropped by any focus that is not its own.
+    pub(crate) keyboard_left: Option<(crate::pane::PaneId, Rectangle<i32, Logical>)>,
+
     /// Windows that asked for attention where nobody could see them, until
     /// each is focused: `Windows`' `urgent` (Ruling 18).
     /// `tests::real_client::reflow_on_close::keyboard_at_open::a_refused_activation_marks_the_window_urgent_until_it_is_focused`.
@@ -697,6 +710,28 @@ pub(crate) struct Solium {
     /// track this has an invisible pointer — which is indistinguishable, to
     /// whoever is sitting there, from input being broken.
     pub(crate) pointer: crate::cursor::Pointer,
+
+    /// The drawn pointer's flight to where a warp put the pointer (#220):
+    /// the pointer itself went there at once, and only its picture
+    /// travels. `None` at rest. See `crate::input::warp`.
+    pub(crate) flight: Option<crate::cursor::flight::Flight>,
+
+    /// A warp a script asked for, carried out once every command of the
+    /// outermost dispatch has been applied, so a window a layout moved in
+    /// the same handler is warped to where it was moved. The last asked for
+    /// wins. See `Solium::apply`.
+    pub(crate) warp_asked: Option<crate::script::Warp>,
+
+    /// Whether a press is being handled now, from the moment it arrives to
+    /// the moment it is delivered: a warp asked for in between -- a click
+    /// whose focus takes the pointer along -- waits in `warp_after_press`
+    /// until the button is up, so the press goes where it was aimed (#220).
+    /// See `crate::input::warp`.
+    pub(crate) pressing: bool,
+
+    /// The warp that waits for the buttons to come up, and no longer. See
+    /// `pressing`.
+    pub(crate) warp_after_press: Option<crate::script::Warp>,
 
     /// Fragment programs, compiled on first use and kept for the life of the
     /// renderer.
@@ -1173,6 +1208,8 @@ impl Solium {
             surfaces: crate::scripted::Surfaces::default(),
             published: crate::models::Published::default(),
             focus_history: Vec::new(),
+            after_close: crate::successor::Successor::UNCONFIGURED.to_vec(),
+            keyboard_left: None,
             urgent: std::collections::HashSet::new(),
             workspaces: None,
             apps: Vec::new(),
@@ -1216,6 +1253,10 @@ impl Solium {
             socket_name: String::new(),
             decorations: Decorations::default(),
             pointer: crate::cursor::Pointer::default(),
+            flight: None,
+            warp_asked: None,
+            pressing: false,
+            warp_after_press: None,
             programs: crate::pass::Programs::default(),
             timer: None,
             pool: crate::pool::Pool::new(0),
@@ -1846,6 +1887,10 @@ impl Solium {
         // nothing either. Not folded into the loop above: a group is not a
         // pane, and one that has landed has to be released exactly once.
         animating |= self.groups.settle(now);
+        // And the drawn pointer's flight to where a warp put the pointer,
+        // which damages nothing of its own either (#220).
+        // `tests::real_client::follow::where_the_picture_lands_the_pointer_is_given_to_what_is_there`.
+        animating |= self.settle_flight(now);
         // A window that has finished leaving is told to close; until then the
         // session counts as animating so the frames keep coming.
         animating |= self.settle_closing(now);

@@ -311,7 +311,7 @@ pub(crate) struct Snapshot {
 }
 
 /// How a batch of transforms should animate.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct AnimationSpec {
     pub(crate) duration: Duration,
     pub(crate) easing: Curve,
@@ -426,9 +426,17 @@ pub(crate) enum Command {
         opacity: Option<f32>,
         animation: AnimationSpec,
     },
+    /// Give a window the keyboard: `sol.focus`. `source` is what the
+    /// handler that asked was answering, which the `focus` event tells
+    /// (#220), and `warp` a warp to carry out once the window has it.
     Focus {
         id: u64,
+        source: FocusSource,
+        warp: Option<Warp>,
     },
+    /// Take the pointer somewhere: `sol.warp` (#220). Carried out once every
+    /// command of the dispatch has been applied; the last one asked for wins.
+    Warp(Warp),
     /// Send a window fullscreen on the monitor it is on, or bring it back
     /// from fullscreen: what the client itself would ask for, asked on its
     /// behalf. `sol.toggle_fullscreen`, and `super+f` (#150).
@@ -507,6 +515,10 @@ pub(crate) enum Command {
         attempt: u64,
         action: String,
         data: crate::json::Json,
+        /// What the handler that asked was answering, for a verb that
+        /// focuses a window: `windows.focus` from a bar's chip is told as
+        /// `"surface"`.
+        source: FocusSource,
     },
     /// Start a program, connected to this compositor.
     Spawn {
@@ -554,16 +566,25 @@ pub(crate) enum Command {
     /// load, both from `config.focus` (#219).
     ///
     /// Every field is `Option`, and unlike [`Command::Idle`] a missing one is
-    /// not "the default" -- there is no fixed default a mode-aware call could
-    /// fall back to that would still know the machine's own form factor
-    /// (#159, `crate::input::profile::Profile::for_form_factor`). `None`
-    /// here means "leave the input profile's current answer alone", so a
-    /// mode that only has an opinion about `follow` cannot reset `click` out
-    /// from under whatever named it last.
+    /// not a fixed default -- there is none a mode-aware call could fall back
+    /// to that would still know the machine's own form factor (#159,
+    /// `crate::input::profile::Profile::for_form_factor`). **`None` is the
+    /// machine's own answer**, the form factor's, and never what the call
+    /// before it said. It used to mean "leave the current answer alone",
+    /// which made a mode that names nothing inherit the mode before it: the
+    /// shipped floating's click-only, so tiling never followed the pointer
+    /// (#128). `after_close`'s `None` is
+    /// [`crate::successor::Successor::UNCONFIGURED`].
+    /// `a_mode_that_names_nothing_gets_the_machines_own_focus_not_the_last_modes`
+    /// in `state/tests.rs`.
     FocusMode {
         click: Option<bool>,
         follow: Option<bool>,
         clear_on_empty_click: Option<bool>,
+        /// Where the keyboard goes when the window that has it closes, word
+        /// by word (#128): `config.focus.after_close` for the mode. See
+        /// `crate::successor`.
+        after_close: Option<Vec<crate::successor::Successor>>,
     },
     /// Turn one monitor, by name, or every one, on or off. See `power.rs`.
     Power {
@@ -581,6 +602,112 @@ pub(crate) enum Command {
     /// resolved in `cursor::theme::Settings::resolve`, not here, so that it is
     /// in one place and testable without Lua.
     Cursor(crate::cursor::theme::Configured),
+}
+
+/// What moved the keyboard, as the `focus` event tells it and
+/// `sol.focus_source()` answers (#220). A policy hangs off it: the shipped
+/// one takes the pointer along for a key and not for a click
+/// (`lua/follow.lua`).
+///
+/// A `sol.focus` is told with what its handler was answering, and a call
+/// inside the handler can say more: a key binding's handler is `Binding`,
+/// but a `sol.focus` a `sol.focus_direction` asks for while its listeners
+/// run is `Direction`, whatever called it. The compositor's own changes of
+/// focus say what they are.
+/// `tests::the_focus_event_says_what_moved_the_keyboard`,
+/// `state::tests::real_client::follow::the_compositors_own_focus_changes_say_what_they_are`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum FocusSource {
+    /// A key binding's handler.
+    Binding,
+    /// A `sol.focus_direction`'s listeners.
+    Direction,
+    /// A `sol.move_direction`'s listeners.
+    Move,
+    /// A press on a window, or a `click` listener while a script holds
+    /// input.
+    Click,
+    /// A `scroll` listener: the wheel with Super held.
+    Scroll,
+    /// A `drop` listener: a dragged window let go.
+    Drop,
+    /// A touch on a window.
+    Touch,
+    /// The pointer onto a window, with focus following the mouse.
+    Hover,
+    /// A hosted scene's action: a bar's window chip, the dock, the overview.
+    Surface,
+    /// A window opening.
+    Open,
+    /// An application asking for its window to be brought forward.
+    Activate,
+    /// The keyboard finding a window after the one it was on went.
+    Settle,
+    /// `sol.focus` from anything else.
+    #[default]
+    Script,
+}
+
+impl FocusSource {
+    /// The word a script is told.
+    /// `tests::the_focus_event_says_what_moved_the_keyboard`.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Binding => "binding",
+            Self::Direction => "direction",
+            Self::Move => "move",
+            Self::Click => "click",
+            Self::Scroll => "scroll",
+            Self::Drop => "drop",
+            Self::Touch => "touch",
+            Self::Hover => "hover",
+            Self::Surface => "surface",
+            Self::Open => "open",
+            Self::Activate => "activate",
+            Self::Settle => "settle",
+            Self::Script => "script",
+        }
+    }
+}
+
+/// Where a warp takes the pointer, as a script said it (#220).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum WarpTo {
+    /// A point in the global space.
+    Point { x: f64, y: f64 },
+    /// A window, by the id a script holds it as, and where on it as a share
+    /// of its width and height: the centre is `(0.5, 0.5)`. Measured where
+    /// the window is headed once the dispatch's commands are applied, so a
+    /// window a layout moved in the same handler is the place it was moved
+    /// to. See `Solium::warp_target`.
+    Window { id: u64, at: (f64, f64) },
+}
+
+/// A warp: where the pointer goes, how its picture flies there, and where
+/// the mouse carries on from if it moves before the picture lands. The
+/// pointer itself goes at once; with no motion its picture does too.
+/// See `crate::input::warp`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Warp {
+    pub(crate) to: WarpTo,
+    pub(crate) motion: Option<AnimationSpec>,
+    pub(crate) interrupt: Interrupt,
+}
+
+/// Where real motion mid-flight carries on from: a warp's `interrupt`
+/// (#220).
+/// `state::tests::real_client::follow::real_motion_mid_flight_wins_at_once`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Interrupt {
+    /// From where the warp put the pointer, which is what it is over and
+    /// where a press goes: the picture is there at once, and the mouse moves
+    /// on from it. With focus following the mouse, the window the warp went
+    /// to keeps the keyboard.
+    /// `state::tests::real_client::follow::with_focus_following_the_mouse_a_nudge_mid_flight_keeps_the_keyboard_where_the_key_put_it`.
+    #[default]
+    Pointer,
+    /// From where the picture has got to, which is where the user sees it.
+    Picture,
 }
 
 /// What the compositor does with a window whose application has not connected.
@@ -708,6 +835,10 @@ struct Pending {
     /// See `Command::Place::moved`, and
     /// `a_fullscreen_or_maximised_window_moved_to_another_monitor_is_so_on_that_one`.
     moving: Option<u64>,
+    /// What the handler running now is answering: what a `sol.focus` it
+    /// makes is told with, and what `sol.focus_source()` says. See
+    /// [`FocusSource`].
+    source: FocusSource,
 }
 
 /// What a script handed the host to hold while the Lua state is replaced.
@@ -840,6 +971,52 @@ impl Kept {
             Self::Tree(tree) => Value::UserData(lua.create_userdata(TilingTree(tree))?),
             Self::Strip(strip) => Value::UserData(lua.create_userdata(Scrolling(strip))?),
         })
+    }
+}
+
+/// `sol.focus_mode`'s `after_close`: one word of
+/// [`crate::successor::Successor`], or a list of them in order (#128).
+///
+/// A word it does not know is named in the log and left out, and the rest
+/// still count; what is left can be nothing at all, which leaves the keyboard
+/// on nothing when the window that has it closes, as asked. `nil` is `None`,
+/// the compositor's own rule, and anything else is named and read as `nil`.
+/// `sol_focus_mode_reads_after_close_word_by_word`.
+fn after_close_words(value: &Value) -> Option<Vec<crate::successor::Successor>> {
+    let word = |each: &Value| -> Option<crate::successor::Successor> {
+        let parsed = match each {
+            Value::String(text) => text
+                .to_str()
+                .ok()
+                .and_then(|text| crate::successor::Successor::parse(&text)),
+            _ => None,
+        };
+        if parsed.is_none() {
+            tracing::warn!(
+                word = describe(each),
+                known = ?crate::successor::Successor::WORDS,
+                "focus_mode: after_close names something that is not one of its words; \
+                 leaving it out"
+            );
+        }
+        parsed
+    };
+    match value {
+        Value::Nil => None,
+        Value::String(_) => Some(word(value).into_iter().collect()),
+        Value::Table(list) => Some(
+            list.sequence_values::<Value>()
+                .filter_map(Result::ok)
+                .filter_map(|each| word(&each))
+                .collect(),
+        ),
+        other => {
+            tracing::warn!(
+                value = describe(other),
+                "focus_mode: after_close is a word or a list of words; reading it as nil, the compositor's own rule"
+            );
+            None
+        }
     }
 }
 
@@ -1424,7 +1601,7 @@ impl Scripts {
 
     /// Run the handler bound to a key combination.
     pub(crate) fn key(&mut self, combo: &str, snapshot: Snapshot) -> Outcome {
-        self.dispatch(snapshot, |lua, sol| {
+        self.dispatch_as(FocusSource::Binding, snapshot, |lua, sol| {
             let bindings: Table = sol.get("_bindings")?;
             let handler: Value = bindings.get(normalise_combo(combo))?;
             match handler {
@@ -1463,7 +1640,9 @@ impl Scripts {
     /// is a valid answer, and the compositor then uses its own plain animation
     /// rather than leaving a window to pop into existence.
     pub(crate) fn opened(&mut self, id: u64, snapshot: Snapshot) -> Outcome {
-        self.dispatch(snapshot, move |lua, _| call_listeners(lua, "open", id))
+        self.dispatch_as(FocusSource::Open, snapshot, move |lua, _| {
+            call_listeners(lua, "open", id)
+        })
     }
 
     /// A window went fullscreen, or left it: `(id, entering)`.
@@ -1492,7 +1671,9 @@ impl Scripts {
 
     /// Run the handler for a pointer press, while a mode owns input.
     pub(crate) fn click(&mut self, x: f64, y: f64, snapshot: Snapshot) -> Outcome {
-        self.dispatch(snapshot, move |lua, _| call_listeners(lua, "click", (x, y)))
+        self.dispatch_as(FocusSource::Click, snapshot, move |lua, _| {
+            call_listeners(lua, "click", (x, y))
+        })
     }
 
     /// Whatever the configuration asked for while it was being read.
@@ -1518,9 +1699,21 @@ impl Scripts {
         }
     }
 
-    /// Focus moved to a window.
-    pub(crate) fn focused(&mut self, id: u64, snapshot: Snapshot) -> Outcome {
-        self.dispatch(snapshot, move |lua, _| call_listeners(lua, "focus", id))
+    /// Focus moved to a window: `(id, source, changed)`, `source` the word
+    /// for what moved it, and `changed` whether the keyboard came from
+    /// another window or none, `false` for the window that had it focused
+    /// again (#220). `tests::the_focus_event_says_what_moved_the_keyboard`,
+    /// `state::tests::real_client::follow::the_focus_event_says_whether_the_keyboard_moved`.
+    pub(crate) fn focused(
+        &mut self,
+        id: u64,
+        source: FocusSource,
+        changed: bool,
+        snapshot: Snapshot,
+    ) -> Outcome {
+        self.dispatch(snapshot, move |lua, _| {
+            call_listeners(lua, "focus", (id, source.name(), changed))
+        })
     }
 
     /// The keyboard's layout, Caps Lock or Num Lock changed: `(state,
@@ -1564,7 +1757,7 @@ impl Scripts {
     /// and `relaunch::a_genuine_activation_is_told_as_a_request_and_the_view_stays_where_it_is`,
     /// in `state/tests.rs`.
     pub(crate) fn activated(&mut self, id: u64, why: &'static str, snapshot: Snapshot) -> Outcome {
-        self.dispatch(snapshot, move |lua, _| {
+        self.dispatch_as(FocusSource::Activate, snapshot, move |lua, _| {
             call_listeners(lua, "activate", (id, why))
         })
     }
@@ -1641,6 +1834,25 @@ impl Scripts {
         self.dispatch(snapshot, move |lua, _| call_listeners(lua, "closing", id))
     }
 
+    /// A close has landed: its animation has played, the window has faded
+    /// out of sight, and its client has just been asked to go (an X11 one
+    /// that let the last request go unanswered, ended). Between `closing` and
+    /// `close` or `refused`, once per close the compositor asked for; never
+    /// for a window that went, or answered with a dialog, before its close
+    /// landed, nor for one whose client never came.
+    ///
+    /// The moment a layout set to wait for the animation reflows
+    /// (`reflow_on_close = "when_landed"`, #128): later than `closing`, so the
+    /// other windows stay put while the window plays out, and earlier than
+    /// `close`, so they do not wait on the application.
+    /// `with_reflow_on_close_when_landed_the_grid_waits_for_the_close_to_land`
+    /// in `state/tests.rs`.
+    pub(crate) fn close_landed(&mut self, id: u64, snapshot: Snapshot) -> Outcome {
+        self.dispatch(snapshot, move |lua, _| {
+            call_listeners(lua, "close_landed", id)
+        })
+    }
+
     /// A window that was closing is staying: its client declined, and the
     /// window is back on screen.
     ///
@@ -1708,7 +1920,7 @@ impl Scripts {
             Value::Nil
         });
         let (name, action) = (name.to_owned(), action.to_owned());
-        self.dispatch(snapshot, move |lua, _| {
+        self.dispatch_as(FocusSource::Surface, snapshot, move |lua, _| {
             call_listeners(lua, "surface", (name.clone(), action.clone(), data.clone()))
         })
     }
@@ -1782,7 +1994,7 @@ impl Scripts {
     /// tiled layout leaves the window wherever the cursor stopped, because
     /// nothing ever tells the layout to think again.
     pub(crate) fn dropped(&mut self, id: u64, x: f64, y: f64, snapshot: Snapshot) -> Outcome {
-        self.dispatch(snapshot, move |lua, _| {
+        self.dispatch_as(FocusSource::Drop, snapshot, move |lua, _| {
             call_listeners(lua, "drop", (id, x, y))
         })
     }
@@ -1793,7 +2005,7 @@ impl Scripts {
     /// belonging to whatever is under the cursor. A scrolling layout that ate
     /// every wheel event would make every terminal in it unusable.
     pub(crate) fn scrolled(&mut self, dx: f64, dy: f64, snapshot: Snapshot) -> Outcome {
-        self.dispatch(snapshot, move |lua, _| {
+        self.dispatch_as(FocusSource::Scroll, snapshot, move |lua, _| {
             call_listeners(lua, "scroll", (dx, dy))
         })
     }
@@ -1804,8 +2016,23 @@ impl Scripts {
         snapshot: Snapshot,
         call: impl FnOnce(&Lua, &Table) -> mlua::Result<bool>,
     ) -> Outcome {
+        self.dispatch_as(FocusSource::Script, snapshot, call)
+    }
+
+    /// [`Self::dispatch`], for a handler answering `source`: what a
+    /// `sol.focus` it makes is told with (#220).
+    /// `tests::the_focus_event_says_what_moved_the_keyboard`.
+    fn dispatch_as(
+        &mut self,
+        source: FocusSource,
+        snapshot: Snapshot,
+        call: impl FnOnce(&Lua, &Table) -> mlua::Result<bool>,
+    ) -> Outcome {
         self.lua.set_app_data(snapshot);
-        self.lua.set_app_data(Pending::default());
+        self.lua.set_app_data(Pending {
+            source,
+            ..Pending::default()
+        });
         start_clock(&self.lua);
 
         let handled = match self.lua.globals().get::<Table>("sol") {
@@ -3390,12 +3617,12 @@ fn build_api(lua: &Lua) -> mlua::Result<Table> {
     // The input profile's focus policy, overridden from Lua (#219):
     // `config.focus`, which `lua/modes.lua` hands over on every mode change
     // as well as at load, same as `sol.idle` above. Unlike `sol.idle`, a key
-    // left out -- or the whole table left out -- changes nothing rather than
-    // resetting to a fixed default: the profile already answered `click` and
-    // `follow` from the machine's own form factor before any script ran
-    // (`SOLIUM_FORM_FACTOR`, #159), and a mode that only has an opinion about
-    // one of the three must not clobber the other two.
-    // `sol_focus_mode_leaves_out_keys_unchanged`.
+    // left out -- or the whole table left out -- is not a fixed default but
+    // the machine's own answer, from its form factor (`SOLIUM_FORM_FACTOR`,
+    // #159), which the compositor works out when it applies the command. And
+    // never the answer the call before left, which is what a mode naming
+    // nothing used to inherit (#128): see `Command::FocusMode`.
+    // `sol_focus_mode_leaves_a_key_out_to_the_machine`.
     sol.set(
         "focus_mode",
         lua.create_function(|lua, options: Option<mlua::Table>| {
@@ -3421,11 +3648,16 @@ fn build_api(lua: &Lua) -> mlua::Result<Table> {
                 ),
                 None => (None, None, None),
             };
+            let after_close = options
+                .as_ref()
+                .and_then(|options| options.get::<Value>("after_close").ok())
+                .and_then(|value| after_close_words(&value));
             with_pending(lua, |pending| {
                 pending.commands.push(Command::FocusMode {
                     click,
                     follow,
                     clear_on_empty_click,
+                    after_close,
                 });
             })
         })?,
@@ -4127,10 +4359,117 @@ fn build_api(lua: &Lua) -> mlua::Result<Table> {
         })?,
     )?;
 
+    // `sol.focus(id, { warp = ... })`: the window takes the keyboard, and
+    // the pointer goes to it once it has (#220). `warp = true` is the centre
+    // with the picture there at once; a table is `sol.warp`'s options. The
+    // focus is told with what this handler is answering.
+    // `tests::sol_focus_carries_its_source_and_its_warp`.
     sol.set(
         "focus",
-        lua.create_function(|lua, id: u64| {
-            with_pending(lua, |pending| pending.commands.push(Command::Focus { id }))
+        lua.create_function(|lua, (id, options): (u64, Option<Table>)| {
+            let warp = match options.as_ref() {
+                Some(options) => match options.get::<Value>("warp")? {
+                    Value::Nil | Value::Boolean(false) => None,
+                    Value::Boolean(true) => Some(Warp {
+                        to: WarpTo::Window { id, at: CENTRE },
+                        motion: None,
+                        interrupt: Interrupt::default(),
+                    }),
+                    Value::Table(warp) => {
+                        let (at, motion, interrupt) = warp_options(Some(&warp), "sol.focus")?;
+                        Some(Warp {
+                            to: WarpTo::Window {
+                                id,
+                                at: at.unwrap_or(CENTRE),
+                            },
+                            motion,
+                            interrupt,
+                        })
+                    }
+                    other => {
+                        return Err(mlua::Error::runtime(format!(
+                            "sol.focus: warp is true, false or a table, not {}",
+                            other.type_name()
+                        )));
+                    }
+                },
+                None => None,
+            };
+            with_pending(lua, |pending| {
+                pending.commands.push(Command::Focus {
+                    id,
+                    source: pending.source,
+                    warp,
+                });
+            })
+        })?,
+    )?;
+
+    // Take the pointer to a window or a point (#220): the pointer goes at
+    // once, and its picture flies along `motion`, or is there at once with
+    // none. Carried out once every command of this dispatch is applied, so
+    // a window this handler has just moved is warped to where it was moved.
+    // `tests::sol_warp_names_a_window_or_a_point_and_a_bad_one_is_an_error`.
+    sol.set(
+        "warp",
+        lua.create_function(|lua, (target, options): (Value, Option<Table>)| {
+            let (at, motion, interrupt) = warp_options(options.as_ref(), "sol.warp")?;
+            let to = match target {
+                Value::Integer(id) => WarpTo::Window {
+                    id: u64::try_from(id).map_err(|_| {
+                        mlua::Error::runtime(format!("sol.warp: {id} is no window"))
+                    })?,
+                    at: at.unwrap_or(CENTRE),
+                },
+                Value::Table(point) => {
+                    if at.is_some() {
+                        return Err(mlua::Error::runtime(
+                            "sol.warp: `to` is where on a window; a point is already a place",
+                        ));
+                    }
+                    match (
+                        point.get::<Option<f64>>("x")?,
+                        point.get::<Option<f64>>("y")?,
+                    ) {
+                        (Some(x), Some(y)) if x.is_finite() && y.is_finite() => {
+                            WarpTo::Point { x, y }
+                        }
+                        _ => {
+                            return Err(mlua::Error::runtime(
+                                "sol.warp: a point is { x = <number>, y = <number> }",
+                            ));
+                        }
+                    }
+                }
+                other => {
+                    return Err(mlua::Error::runtime(format!(
+                        "sol.warp: a window's id or a point {{ x, y }}, not {}",
+                        other.type_name()
+                    )));
+                }
+            };
+            with_pending(lua, |pending| {
+                pending.commands.push(Command::Warp(Warp {
+                    to,
+                    motion,
+                    interrupt,
+                }));
+            })
+        })?,
+    )?;
+
+    // What the handler running now is answering, in the `focus` event's
+    // words: what a `sol.focus` made here would be told with (#220). For a
+    // policy that acts where no window takes the keyboard, such as a
+    // workspace switch to an empty desk (`lua/workspaces.lua`).
+    // `tests::the_focus_event_says_what_moved_the_keyboard`.
+    sol.set(
+        "focus_source",
+        lua.create_function(|lua, ()| {
+            Ok(lua
+                .app_data_ref::<Pending>()
+                .map_or(FocusSource::Script, |pending| pending.source)
+                .name())
         })?,
     )?;
 
@@ -4186,9 +4525,20 @@ fn build_api(lua: &Lua) -> mlua::Result<Table> {
                     None
                 };
                 let mut outer = None;
+                // And what a `sol.focus` its listeners make is told with: a
+                // direction or a move, whatever called it (#220).
+                // `tests::the_focus_event_says_what_moved_the_keyboard`.
+                let source = if verb == "move" {
+                    FocusSource::Move
+                } else {
+                    FocusSource::Direction
+                };
+                let mut outer_source = FocusSource::Script;
                 with_pending(lua, |pending| {
                     outer = pending.moving;
                     pending.moving = moving.or(outer);
+                    outer_source = pending.source;
+                    pending.source = source;
                 })?;
                 // The clock starts again for each `direction` listener, so
                 // the handler that asked gets its own clock back, and is
@@ -4201,7 +4551,10 @@ fn build_api(lua: &Lua) -> mlua::Result<Table> {
                 let started = deadline_started(lua);
                 let heard = call_listeners(lua, "direction", (verb, dir));
                 set_deadline(lua, started);
-                with_pending(lua, |pending| pending.moving = outer)?;
+                with_pending(lua, |pending| {
+                    pending.moving = outer;
+                    pending.source = outer_source;
+                })?;
                 heard?;
                 if late(lua) {
                     // Stopped at this call, which is where the log says it
@@ -4310,6 +4663,7 @@ fn build_api(lua: &Lua) -> mlua::Result<Table> {
                         attempt,
                         action,
                         data,
+                        source: pending.source,
                     });
                 })?;
                 if let Some(done) = done {
@@ -5357,6 +5711,75 @@ fn motion_from(options: Option<&Table>) -> mlua::Result<(Option<Duration>, Optio
             .map(Duration::from_millis),
         easing_from(options)?,
     ))
+}
+
+/// Where on a window the pointer goes when no `to` says: its centre.
+const CENTRE: (f64, f64) = (0.5, 0.5);
+
+/// A warp's options as [`warp_options`] reads them: where on a window, as a
+/// share of its width and height, the motion its picture flies along, and
+/// where real motion mid-flight carries on from.
+type WarpOptions = (Option<(f64, f64)>, Option<AnimationSpec>, Interrupt);
+
+/// A warp's options (#220): `to`, where on a window, `"center"` or a share
+/// of its width and height `{ x, y }`; `motion`, how the drawn pointer
+/// flies there, `{ duration, easing }`; and `interrupt`, where the mouse
+/// carries on from if it moves before the picture lands, `"pointer"` or
+/// `"picture"`. `to` left out is `None` for the caller to fill in; `motion`
+/// left out is none, and the picture is there at once; `interrupt` left out
+/// is `"pointer"`. A duration left out of a motion is the default 220 ms,
+/// and an easing the default `"outCubic"`, as `sol.animate`'s are.
+/// `tests::sol_warp_names_a_window_or_a_point_and_a_bad_one_is_an_error`.
+fn warp_options(options: Option<&Table>, caller: &str) -> mlua::Result<WarpOptions> {
+    let Some(options) = options else {
+        return Ok((None, None, Interrupt::default()));
+    };
+    let at = match options.get::<Value>("to")? {
+        Value::Nil => None,
+        Value::String(name) if name.to_string_lossy() == "center" => Some(CENTRE),
+        Value::Table(share) => match (
+            share.get::<Option<f64>>("x")?,
+            share.get::<Option<f64>>("y")?,
+        ) {
+            (Some(x), Some(y)) if x.is_finite() && y.is_finite() => Some((x, y)),
+            _ => {
+                return Err(mlua::Error::runtime(format!(
+                    "{caller}: `to` as a share of the window is {{ x = <number>, y = <number> }}"
+                )));
+            }
+        },
+        other => {
+            return Err(mlua::Error::runtime(format!(
+                "{caller}: `to` is \"center\" or {{ x, y }}, not {}",
+                describe(&other)
+            )));
+        }
+    };
+    let motion = match options.get::<Value>("motion")? {
+        Value::Nil => None,
+        Value::Table(motion) => {
+            let (duration, easing) = motion_from(Some(&motion))?;
+            Some(AnimationSpec::default().with(duration, easing))
+        }
+        other => {
+            return Err(mlua::Error::runtime(format!(
+                "{caller}: `motion` is {{ duration, easing }}, not {}",
+                other.type_name()
+            )));
+        }
+    };
+    let interrupt = match options.get::<Value>("interrupt")? {
+        Value::Nil => Interrupt::default(),
+        Value::String(name) if name.to_string_lossy() == "pointer" => Interrupt::Pointer,
+        Value::String(name) if name.to_string_lossy() == "picture" => Interrupt::Picture,
+        other => {
+            return Err(mlua::Error::runtime(format!(
+                "{caller}: `interrupt` is \"pointer\" or \"picture\", not {}",
+                describe(&other)
+            )));
+        }
+    };
+    Ok((at, motion, interrupt))
 }
 
 impl AnimationSpec {
@@ -6944,18 +7367,182 @@ mod tests {
                     click,
                     follow,
                     clear_on_empty_click,
+                    ..
                 } => Some((click, follow, clear_on_empty_click)),
                 _ => None,
             })
             .collect()
     }
 
-    /// **A key `sol.focus_mode` is not given leaves the profile's answer for
-    /// it alone** (#219): unlike `sol.idle`, there is no fixed default to
-    /// fall back to, because a mode calling it knows nothing about the
-    /// machine's own form factor.
+    /// Every `Command::FocusMode`'s `after_close` a run of commands carries,
+    /// in order.
+    fn after_closes(commands: Vec<Command>) -> Vec<Option<Vec<crate::successor::Successor>>> {
+        commands
+            .into_iter()
+            .filter_map(|command| match command {
+                Command::FocusMode { after_close, .. } => Some(after_close),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// **`after_close` is read word by word** (#128): a word, a list in
+    /// order, a word it does not know left out with the rest kept, an empty
+    /// list kept empty -- the keyboard left on nothing -- and `nil` or
+    /// anything else read as `None`, the compositor's own rule.
     #[test]
-    fn sol_focus_mode_leaves_out_keys_unchanged() {
+    fn sol_focus_mode_reads_after_close_word_by_word() {
+        use crate::successor::Successor::{Neighbour, Pointer, Recent, Topmost};
+        let directory = std::env::temp_dir().join("solium-script-test-after-close-words");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("a temporary directory");
+        let config = directory.join("init.lua");
+        std::fs::write(
+            &config,
+            r#"
+            sol.focus_mode({ after_close = { "recent", "neighbor", "pointer", 7 } })
+            sol.focus_mode({ after_close = "topmost" })
+            sol.focus_mode({ after_close = { "neighbour" } })
+            sol.focus_mode({ after_close = {} })
+            sol.focus_mode({})
+            sol.focus_mode({ after_close = 42 })
+            "#,
+        )
+        .expect("writing the test script");
+        let mut scripts = Scripts::load(&config).expect("loading the test script");
+        let words = after_closes(scripts.startup().commands);
+        let _ = std::fs::remove_dir_all(&directory);
+        assert_eq!(
+            words,
+            [
+                Some(vec![Recent, Pointer]),
+                Some(vec![Topmost]),
+                Some(vec![Neighbour]),
+                Some(vec![]),
+                None,
+                None,
+            ]
+        );
+    }
+
+    /// **Each shipped mode hands over its own focus model** (#128): floating
+    /// click-only, tiling and scrolling following the pointer, each with its
+    /// own `focus.after_close` -- floating's at load, tiling's and
+    /// scrolling's as each is switched to. A shipped `"follow"` is handed
+    /// over as `None`, the machine's own answer, so a tablet or a phone,
+    /// with no pointer to hover, keeps its own (#159);
+    /// `on_a_tablet_the_shipped_layouts_leave_hover_to_the_machine` in
+    /// `state/tests.rs` is that half.
+    #[test]
+    fn the_shipped_modes_each_hand_over_their_own_focus_model() {
+        use crate::successor::Successor::{Neighbour, Pointer, Recent, Topmost};
+        let Some((directory, mut scripts)) =
+            shipped_init_with_user("solium-script-test-after-close-shipped", "return {}")
+        else {
+            return;
+        };
+        let commands = [
+            scripts.startup().commands,
+            scripts.key("super+t", empty_snapshot()).commands,
+            scripts.key("super+s", empty_snapshot()).commands,
+        ];
+        let _ = std::fs::remove_dir_all(&directory);
+        let [loaded, tiling, scrolling] =
+            commands.map(|commands| (focus_modes(commands.clone()), after_closes(commands)));
+        assert_eq!(
+            loaded,
+            (
+                vec![(None, Some(false), Some(true))],
+                vec![Some(vec![Recent, Topmost])]
+            ),
+            "floating, at load"
+        );
+        let layout = (
+            vec![(None, None, Some(true))],
+            vec![Some(vec![Pointer, Neighbour, Topmost])],
+        );
+        assert_eq!(tiling, layout, "tiling");
+        assert_eq!(scrolling, layout, "scrolling");
+    }
+
+    /// **Whether the pointer focuses what it moves over is your entry for
+    /// the mode, then your `focus.follow`, then the shipped entry, then the
+    /// machine's own answer** (#128 review, the ranking of 2026-10-14). So
+    /// `focus = { follow = false }` never follows, in any mode, unless you
+    /// also name a mode; merged over the shipped table, the shipped
+    /// `tiling = "follow"` used to win over it. Each mode is switched to in
+    /// turn, `custom` -- a mode no table names -- by a binding of the
+    /// user's own, and the `follow` each hands over is read; `None` is the
+    /// machine's own answer, which a shipped `"follow"` defers to.
+    /// An entry of yours that is neither word counts as none.
+    /// Against the ranking before it -- any entry in `focus.modes`, then
+    /// `focus.follow` -- it fails at `{ follow = false }`: tiling's shipped
+    /// `"follow"` won. With a shipped `"follow"` read as yours it fails at
+    /// the row whose `tiling` is no word, which falls through to the shipped
+    /// entry: tiling handed over `true`, which would override a tablet's own
+    /// answer.
+    #[test]
+    fn your_mode_entry_then_your_focus_follow_then_the_shipped_entry_then_the_machine() {
+        const CUSTOM: &str = r#"bindings = {
+            ["super+alt+F12"] = function()
+                local modes = require("modes")
+                modes.register("custom", {})
+                modes.use("custom")
+            end,
+        }"#;
+        // Floating, tiling, scrolling and `custom`, in the order switched to.
+        for (row, (focus, expected)) in [
+            ("{ follow = false }", [Some(false); 4]),
+            ("{ follow = true }", [Some(true); 4]),
+            (
+                r#"{ follow = false, modes = { tiling = "follow" } }"#,
+                [Some(false), Some(true), Some(false), Some(false)],
+            ),
+            (
+                r#"{ follow = true, modes = { floating = "click" } }"#,
+                [Some(false), Some(true), Some(true), Some(true)],
+            ),
+            (
+                r#"{ modes = { scrolling = "click", custom = "follow", tiling = "hover" } }"#,
+                [Some(false), None, Some(false), Some(true)],
+            ),
+            ("{}", [Some(false), None, None, None]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let Some((directory, mut scripts)) = shipped_init_with_user(
+                &format!("solium-script-test-focus-ranking-{row}"),
+                &format!("return {{ focus = {focus}, {CUSTOM} }}"),
+            ) else {
+                return;
+            };
+            let commands = [
+                scripts.startup().commands,
+                scripts.key("super+t", empty_snapshot()).commands,
+                scripts.key("super+s", empty_snapshot()).commands,
+                scripts.key("super+alt+F12", empty_snapshot()).commands,
+            ];
+            let _ = std::fs::remove_dir_all(&directory);
+            let follows = commands.map(|commands| {
+                let modes = focus_modes(commands);
+                assert_eq!(modes.len(), 1, "focus = {focus}: one hand-over per mode");
+                modes.first().and_then(|(_, follow, _)| *follow)
+            });
+            assert_eq!(
+                follows, expected,
+                "focus = {focus}: floating, tiling, scrolling and a mode no table names"
+            );
+        }
+    }
+
+    /// **A key `sol.focus_mode` is not given is left to the machine** (#219):
+    /// unlike `sol.idle`, there is no fixed default for the script to fill
+    /// in, because a mode calling it knows nothing about the machine's own
+    /// form factor. So the command says `None`, and the compositor reads
+    /// that as the form factor's answer (`Command::FocusMode`).
+    #[test]
+    fn sol_focus_mode_leaves_a_key_out_to_the_machine() {
         let directory = std::env::temp_dir().join("solium-script-test-focus-mode");
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).expect("a temporary directory");
@@ -6974,7 +7561,7 @@ mod tests {
             modes,
             [(None, Some(false), None)],
             "a table naming only `follow` must leave `click` and \
-             `clear_on_empty_click` as `None`, not reset them"
+             `clear_on_empty_click` as `None`, to the machine"
         );
     }
 
@@ -7026,13 +7613,9 @@ mod tests {
     /// for the mode itself: `modes.lua` runs fresh on every load, so without
     /// `sol.keep` this file could not tell a reload from a fresh start, and
     /// `super+shift+r` after switching to tiling would answer `follow =
-    /// false` -- floating's click-only override -- instead of `None`, every
-    /// time. `None` and not tiling's own `Some(true)` is the right answer
-    /// here on purpose: `config.focus.modes` names no entry for `"tiling"`,
-    /// so it defers to the input profile's own `follow` -- which is `true`
-    /// on this (Desktop) profile, but the command must say "ask the
-    /// profile", not bake today's machine's answer in, or a tablet's
-    /// `false` would be overridden back to `true` the moment it tiled.
+    /// false` -- floating's click-only override -- instead of tiling's own
+    /// `follow`, every time. Since #128 `config.focus.modes` names tiling's
+    /// `"follow"`, which as shipped is the machine's own answer: `None`.
     #[test]
     fn a_reload_keeps_the_focus_model_tiling_was_switched_to() {
         let Some((directory, mut scripts)) =
@@ -7049,8 +7632,7 @@ mod tests {
         assert_eq!(
             focus_modes(switched.commands),
             [(None, None, Some(true))],
-            "switching to tiling, which `config.focus.modes` does not name, did not defer to \
-             the input profile's own `follow`"
+            "switching to tiling did not hand over its own `follow`"
         );
 
         let config = directory.join("init.lua");
@@ -7062,7 +7644,7 @@ mod tests {
             modes,
             [(None, None, Some(true))],
             "a reload forgot tiling was in charge and fell back to floating's click-only \
-             override (`follow = false`) instead of leaving `follow` alone"
+             override (`follow = false`)"
         );
     }
 
@@ -8999,6 +9581,7 @@ mod tests {
                     attempt,
                     action,
                     data,
+                    ..
                 } => Some((*attempt, action.clone(), data.render())),
                 _ => None,
             })
@@ -12813,7 +13396,7 @@ mod dialogs {
 
         fn last_focus(commands: &[Command]) -> Option<u64> {
             commands.iter().rev().find_map(|command| match command {
-                Command::Focus { id } => Some(*id),
+                Command::Focus { id, .. } => Some(*id),
                 _ => None,
             })
         }
@@ -13548,42 +14131,46 @@ mod dialogs {
             );
         }
 
-        /// **With `reflow_on_close = "when_gone"`, a window being closed
-        /// still takes its workspace.** That setting keeps a closing window's
-        /// tile until its application has gone, so a workspace whose only
-        /// window is closing is not empty to it: window 3 goes on to workspace
-        /// 3, rather than into a fresh tree on workspace 2 that has it cover
-        /// window 5 while window 5 fades (#134 review). Closing up at once, the
-        /// same workspace is empty -- that half is
-        /// `a_window_being_closed_is_room_for_the_next_one`.
+        /// **With `reflow_on_close = "when_gone"` or `"when_landed"`, a
+        /// window being closed still takes its workspace.** Those settings
+        /// keep a closing window's tile while it fades, and "when_gone" until
+        /// its application has gone, so a workspace whose only window is
+        /// closing is not empty to them: window 3 goes on to workspace 3,
+        /// rather than into a fresh tree on workspace 2 that has it cover
+        /// window 5 while window 5 fades (#134 review). Closing up at once,
+        /// the same workspace is empty -- that half is
+        /// `a_window_being_closed_is_room_for_the_next_one`. Against `0ce2ab8`
+        /// `"when_landed"` fails: it was read as "immediate" (#128).
         #[test]
-        fn with_reflow_when_gone_a_closing_window_still_takes_its_workspace() {
-            let (mut scripts, _) = tiling_with(&format!(
-                "{}\nrequire(\"config\").tiling.reflow_on_close = \"when_gone\"",
-                minimum(1300, 800)
-            ));
-            switched_on(&mut scripts);
-            let _ = scripts.evaluate("require(\"workspaces\").of[5] = 2\nreturn \"\"");
-            let _ = open(&mut scripts, 1, &[5, 1]);
-            let mut windows = vec![
-                window(5, 800.0, 600.0),
-                window(1, 800.0, 600.0),
-                window(3, 800.0, 600.0),
-            ];
-            windows[0].leaving = true;
-            let _ = scripts.opened(
-                3,
-                Snapshot {
-                    cursor: (500.0, 500.0),
-                    ..snapshot(windows)
-                },
-            );
-            assert_eq!(
-                workspace_of(&scripts, 3),
-                "3",
-                "a workspace whose only window keeps its tile while it closes was counted as \
-                 empty"
-            );
+        fn waiting_to_reflow_a_closing_window_still_takes_its_workspace() {
+            for setting in ["when_gone", "when_landed"] {
+                let (mut scripts, _) = tiling_with(&format!(
+                    "{}\nrequire(\"config\").tiling.reflow_on_close = {setting:?}",
+                    minimum(1300, 800)
+                ));
+                switched_on(&mut scripts);
+                let _ = scripts.evaluate("require(\"workspaces\").of[5] = 2\nreturn \"\"");
+                let _ = open(&mut scripts, 1, &[5, 1]);
+                let mut windows = vec![
+                    window(5, 800.0, 600.0),
+                    window(1, 800.0, 600.0),
+                    window(3, 800.0, 600.0),
+                ];
+                windows[0].leaving = true;
+                let _ = scripts.opened(
+                    3,
+                    Snapshot {
+                        cursor: (500.0, 500.0),
+                        ..snapshot(windows)
+                    },
+                );
+                assert_eq!(
+                    workspace_of(&scripts, 3),
+                    "3",
+                    "{setting}: a workspace whose only window keeps its tile while it closes was \
+                 counted as empty"
+                );
+            }
         }
 
         /// **With `follow_overflow` off, each window with no room takes
@@ -14889,7 +15476,11 @@ impl Scripts {
 /// one left it, which is what the compositor hands a script.
 #[cfg(test)]
 mod directions {
-    use super::{Command, Drawn, MonitorInfo, Parentage, Rect, Scripts, Snapshot, WindowInfo};
+    use super::{
+        AnimationSpec, Command, Drawn, FocusSource, Interrupt, MonitorInfo, Parentage, Rect,
+        Scripts, Snapshot, Warp, WarpTo, WindowInfo,
+    };
+    use crate::present::Curve;
     use std::path::PathBuf;
 
     /// A landscape screen at the origin.
@@ -15035,7 +15626,7 @@ mod directions {
         commands
             .iter()
             .filter_map(|command| match command {
-                Command::Focus { id } => Some(*id),
+                Command::Focus { id, .. } => Some(*id),
                 _ => None,
             })
             .collect()
@@ -15157,7 +15748,7 @@ mod directions {
                             }
                         }
                     }
-                    Command::Focus { id } => self.focus(*id),
+                    Command::Focus { id, .. } => self.focus(*id),
                     _ => {}
                 }
             }
@@ -16717,6 +17308,255 @@ mod directions {
         );
     }
 
+    /// The work area #240 was measured on: the nested 1600x900 output.
+    const NESTED: Rect = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: 1600.0,
+        h: 900.0,
+    };
+
+    /// Window `id` opens on `DP-1` before its application has shown a frame
+    /// -- every window `sol.spawn` opens, `super+return`'s terminal among
+    /// them -- and has the keyboard once it is placed.
+    fn open_unshown(desk: &mut Desk, id: u64) {
+        let mut unshown = window(
+            id,
+            "DP-1",
+            Rect {
+                w: 0.0,
+                h: 0.0,
+                ..NESTED
+            },
+        );
+        unshown.shown = false;
+        desk.windows.insert(0, unshown);
+        let outcome = desk.scripts.opened(id, desk.snapshot());
+        desk.apply(&outcome.commands);
+        desk.focus(id);
+    }
+
+    /// Window `id` opens on `DP-1` already `w` by `h`: an application that
+    /// has shown a frame of its own size, which placement keeps.
+    fn open_shown(desk: &mut Desk, id: u64, w: f64, h: f64) {
+        desk.windows
+            .insert(0, window(id, "DP-1", Rect { w, h, ..NESTED }));
+        let outcome = desk.scripts.opened(id, desk.snapshot());
+        desk.apply(&outcome.commands);
+        desk.focus(id);
+    }
+
+    /// Fails unless every window on `desk` is inside `area` and no two share
+    /// a spot: top-left corners nearer than half the shipped `cascade` step
+    /// (16) on both axes, `floating.lua`'s `taken`.
+    fn spread_inside(desk: &Desk, area: Rect, why: &str) {
+        let rects = desk.rects();
+        for (at, (id, rect)) in rects.iter().enumerate() {
+            assert!(
+                inside(*rect, area),
+                "{why}: window {id} is not inside the work area: {rects:?}"
+            );
+            for (other, earlier) in &rects[..at] {
+                assert!(
+                    (rect.x - earlier.x).abs() >= 16.0 || (rect.y - earlier.y).abs() >= 16.0,
+                    "{why}: windows {other} and {id} share a spot: {rects:?}"
+                );
+            }
+        }
+    }
+
+    /// **Desktop mode: ten windows opened before their first frame, as
+    /// `super+return` opens them, land centred and then one `cascade` step
+    /// apart, each `placement.size` of the work area; the seventh, which one
+    /// more step would take past the bottom edge, starts a new diagonal at
+    /// the work area's top-left plus one step (`wrap = "corner"`).** #240,
+    /// measured nested on 1600x900: the second window landed on the work
+    /// area's bottom-right corner, and the third and fourth exactly on top of
+    /// it.
+    #[test]
+    fn desktop_mode_ten_spawned_windows_step_by_cascade_and_wrap_at_the_edge() {
+        let mut desk = Desk::new("", vec![screen("DP-1", NESTED)]);
+        for id in 1..=10 {
+            open_unshown(&mut desk, id);
+        }
+        let wanted = [
+            (320.0, 180.0),
+            (352.0, 212.0),
+            (384.0, 244.0),
+            (416.0, 276.0),
+            (448.0, 308.0),
+            (480.0, 340.0),
+            (32.0, 32.0),
+            (64.0, 64.0),
+            (96.0, 96.0),
+            (128.0, 128.0),
+        ];
+        for (id, (x, y)) in (1..=10).zip(wanted) {
+            let rect = desk.rect(id);
+            assert!(
+                about(rect.x, x)
+                    && about(rect.y, y)
+                    && about(rect.w, 960.0)
+                    && about(rect.h, 540.0),
+                "window {id} is not 960x540 at {x},{y}: {:?}",
+                desk.rects()
+            );
+        }
+    }
+
+    /// **Desktop mode: a spot a window was dragged a few pixels off is still
+    /// taken**: nearer than half a `cascade` step on both axes, the next
+    /// window steps on rather than landing all but on top of it. #240.
+    #[test]
+    fn desktop_mode_a_spot_a_window_was_nudged_off_is_still_taken() {
+        let mut desk = Desk::new("", vec![screen("DP-1", NESTED)]);
+        open_unshown(&mut desk, 1);
+        for each in &mut desk.windows {
+            each.rect.x += 5.0;
+            each.rect.y += 5.0;
+        }
+        open_unshown(&mut desk, 2);
+        let second = desk.rect(2);
+        assert!(
+            about(second.x, 352.0) && about(second.y, 212.0),
+            "window 2 did not step past the centre window 1 was nudged 5 pixels off: {:?}",
+            desk.rects()
+        );
+    }
+
+    /// **Desktop mode: a `cascade` that is not a step of a pixel or more on
+    /// each axis is read as the shipped (32, 32)**, rather than a step of
+    /// nothing that would stack every window on the first. #240.
+    #[test]
+    fn desktop_mode_a_cascade_of_no_step_is_read_as_the_shipped_one() {
+        let mut desk = Desk::new(
+            "local config = require(\"config\")\n\
+             config.floating.placement.cascade = { x = 0, y = \"far\" }\n",
+            vec![screen("DP-1", NESTED)],
+        );
+        open_unshown(&mut desk, 1);
+        open_unshown(&mut desk, 2);
+        let second = desk.rect(2);
+        assert!(
+            about(second.x, 352.0) && about(second.y, 212.0),
+            "a cascade of (0, \"far\") did not step by (32, 32): {:?}",
+            desk.rects()
+        );
+    }
+
+    /// **Desktop mode: with no spot free, a window lands where its policy
+    /// starts, inside the work area**: a window the size of the work area has
+    /// only the one spot, so the second lands on the first rather than the
+    /// walk looking for a spot that is not there. #240.
+    #[test]
+    fn desktop_mode_with_no_free_spot_a_window_lands_where_its_policy_starts() {
+        let mut desk = Desk::new(
+            "local config = require(\"config\")\n\
+             config.floating.placement.size = 1\n",
+            vec![screen("DP-1", NESTED)],
+        );
+        open_unshown(&mut desk, 1);
+        open_unshown(&mut desk, 2);
+        for id in [1, 2] {
+            assert!(
+                same(desk.rect(id), NESTED),
+                "window {id} is not the whole work area: {:?}",
+                desk.rects()
+            );
+        }
+    }
+
+    /// **Desktop mode: windows nearly as tall as the work area still get a
+    /// spot each**: with less room below the first than one `cascade` step,
+    /// the corner diagonals start as far down as the window leaves room for,
+    /// rather than not at all. #240's review: two 1200x880 windows on
+    /// 1600x900 both landed on the centre, since the corner's first spot,
+    /// (32, 32), did not fit and the walk gave up.
+    #[test]
+    fn desktop_mode_windows_nearly_the_work_area_tall_get_spots_of_their_own() {
+        let mut desk = Desk::new("", vec![screen("DP-1", NESTED)]);
+        for id in 1..=4 {
+            open_shown(&mut desk, id, 1200.0, 880.0);
+        }
+        spread_inside(&desk, NESTED, "1200x880, wrap = \"corner\"");
+        let wanted = [(200.0, 10.0), (32.0, 20.0), (64.0, 20.0), (96.0, 20.0)];
+        for (id, (x, y)) in (1..=4).zip(wanted) {
+            let rect = desk.rect(id);
+            assert!(
+                about(rect.x, x) && about(rect.y, y),
+                "window {id} is not at {x},{y}: {:?}",
+                desk.rects()
+            );
+        }
+    }
+
+    /// **Desktop mode: once every diagonal its `wrap` starts is spent, a new
+    /// window takes the first free spot of the `cascade` grid over the work
+    /// area rather than landing on another.** `wrap = "center"` with
+    /// 1200x880 windows on 1600x900 has room for seven diagonals of one spot
+    /// each, (200, 10) to (392, 10); the eighth and ninth windows used to
+    /// land on the first. #240's review.
+    #[test]
+    fn desktop_mode_once_every_diagonal_is_spent_a_window_takes_a_free_spot_of_the_grid() {
+        let mut desk = Desk::new(
+            "local config = require(\"config\")\n\
+             config.floating.placement.wrap = \"center\"\n",
+            vec![screen("DP-1", NESTED)],
+        );
+        for id in 1..=9 {
+            open_shown(&mut desk, id, 1200.0, 880.0);
+        }
+        spread_inside(&desk, NESTED, "1200x880, wrap = \"center\"");
+        let diagonals = [200.0, 232.0, 264.0, 296.0, 328.0, 360.0, 392.0];
+        for (id, x) in (1..=7).zip(diagonals) {
+            let rect = desk.rect(id);
+            assert!(
+                about(rect.x, x) && about(rect.y, 10.0),
+                "window {id} is not at {x},10: {:?}",
+                desk.rects()
+            );
+        }
+        for (id, (x, y)) in [(8, (0.0, 0.0)), (9, (32.0, 0.0))] {
+            let rect = desk.rect(id);
+            assert!(
+                about(rect.x, x) && about(rect.y, y),
+                "window {id} is not at {x},{y}: {:?}",
+                desk.rects()
+            );
+        }
+    }
+
+    /// **Desktop mode: windows nearly as wide as the work area get a spot
+    /// each, whichever `wrap`**: no diagonal has room for even its first
+    /// spot, so each window after the first takes the next free spot of the
+    /// `cascade` grid, down the work area's left edge. #240's review: 1590x400
+    /// windows on 1600x900 all landed on the centre under both wraps.
+    #[test]
+    fn desktop_mode_windows_nearly_the_work_area_wide_get_spots_of_their_own() {
+        for wrap in ["corner", "center"] {
+            let mut desk = Desk::new(
+                &format!(
+                    "local config = require(\"config\")\n\
+                     config.floating.placement.wrap = {wrap:?}\n"
+                ),
+                vec![screen("DP-1", NESTED)],
+            );
+            for id in 1..=4 {
+                open_shown(&mut desk, id, 1590.0, 400.0);
+            }
+            spread_inside(&desk, NESTED, &format!("1590x400, wrap = {wrap:?}"));
+            let wanted = [(5.0, 250.0), (0.0, 0.0), (0.0, 32.0), (0.0, 64.0)];
+            for (id, (x, y)) in (1..=4).zip(wanted) {
+                let rect = desk.rect(id);
+                assert!(
+                    about(rect.x, x) && about(rect.y, y),
+                    "wrap = {wrap:?}: window {id} is not at {x},{y}: {:?}",
+                    desk.rects()
+                );
+            }
+        }
+    }
+
     /// **Tiling keeps the plain arrows for focus by direction, and desktop
     /// mode gets them back the moment nothing else is in charge.** #222's
     /// whole reason for going through `modes.watch` rather than binding the
@@ -16928,6 +17768,608 @@ mod directions {
             same(desk.rect(1), left),
             "restore moved the window with nothing valid to put it back to: {:?}",
             desk.rects()
+        );
+    }
+
+    // ## The pointer follows the keyboard (#220)
+    //
+    // `lua/follow.lua` against the shipped layouts: which focus changes ask
+    // for a warp, to where, and how, by what moved the keyboard, and the
+    // two that tell no `focus` -- a move, and a switch to an empty
+    // workspace. The warp itself is the compositor's, and tested there:
+    // `state::tests::real_client::follow`.
+
+    /// The warps `commands` asked for, in order.
+    fn warps(commands: &[Command]) -> Vec<Warp> {
+        commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::Warp(warp) => Some(*warp),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A warp to window `id`'s `at`, along `motion`, that the mouse carries
+    /// on from where the pointer is.
+    fn to_window(id: u64, at: (f64, f64), motion: Option<AnimationSpec>) -> Warp {
+        Warp {
+            to: WarpTo::Window { id, at },
+            motion,
+            interrupt: Interrupt::Pointer,
+        }
+    }
+
+    /// The shipped `focus.cursor.motion`.
+    fn shipped_motion() -> Option<AnimationSpec> {
+        Some(AnimationSpec {
+            duration: std::time::Duration::from_millis(260),
+            easing: Curve::OutCubic,
+        })
+    }
+
+    const CENTRE: (f64, f64) = (0.5, 0.5);
+
+    impl Desk {
+        /// Press a bound key, and tell `focus` for every window it focused,
+        /// with what it was answering, as the compositor does once the window
+        /// has the keyboard. Everything asked for, in order.
+        ///
+        /// Each `focus` says whether the keyboard came from another window,
+        /// as `Solium::focus_window` does: a layout focusing again the window
+        /// that has it is told `changed = false`.
+        fn press_told(&mut self, combo: &str) -> Vec<Command> {
+            let mut had = self
+                .windows
+                .iter()
+                .find(|window| window.focused)
+                .map(|window| window.id);
+            let mut commands = self.press(combo);
+            let focused: Vec<(u64, FocusSource, bool)> = commands
+                .iter()
+                .filter_map(|command| match command {
+                    Command::Focus { id, source, .. } => {
+                        let changed = had != Some(*id);
+                        had = Some(*id);
+                        Some((*id, *source, changed))
+                    }
+                    _ => None,
+                })
+                .collect();
+            for (id, source, changed) in focused {
+                commands.extend(self.told(id, source, changed));
+            }
+            commands
+        }
+
+        /// Window `id` takes the keyboard, moved by `source`, from another
+        /// window if `changed`, and `focus` is told. What its listeners asked
+        /// for.
+        fn told(&mut self, id: u64, source: FocusSource, changed: bool) -> Vec<Command> {
+            self.focus(id);
+            let commands = self
+                .scripts
+                .focused(id, source, changed, self.snapshot())
+                .commands;
+            self.apply(&commands);
+            commands
+        }
+    }
+
+    /// **The pointer follows a key and not a click**: `super+left` in tiling
+    /// focuses the tile to the left, and its `focus` asks for a warp to that
+    /// window's centre along the shipped motion; any other key binding's
+    /// focus does too; a click, a bar's chip, a script, focus following the
+    /// mouse, a touch, the wheel, a drop, a window opening, an application
+    /// asking and the keyboard settling after a close ask for none.
+    #[test]
+    fn the_pointer_follows_a_key_and_not_a_click() {
+        let mut desk = grid("", one_screen());
+        desk.focus(4);
+        let commands = desk.press_told("super+left");
+        assert_eq!(
+            (focuses(&commands), warps(&commands)),
+            (vec![3], vec![to_window(3, CENTRE, shipped_motion())]),
+            "(focused, warped): {commands:?}"
+        );
+        assert_eq!(
+            warps(&desk.told(1, FocusSource::Binding, true)),
+            vec![to_window(1, CENTRE, shipped_motion())],
+            "a key binding's focus"
+        );
+        for source in [
+            FocusSource::Click,
+            FocusSource::Surface,
+            FocusSource::Script,
+            FocusSource::Hover,
+            FocusSource::Touch,
+            FocusSource::Scroll,
+            FocusSource::Drop,
+            FocusSource::Open,
+            FocusSource::Activate,
+            FocusSource::Settle,
+        ] {
+            assert_eq!(warps(&desk.told(2, source, true)), Vec::new(), "{source:?}");
+        }
+    }
+
+    /// **Which focus changes take the pointer along, where to and how is
+    /// configured**: with `focus.cursor.follows.direction` off and `click`
+    /// on, `super+left` asks for no warp and a click does; `to` is where on
+    /// the window, `motion` how the picture flies, `interrupt` where the
+    /// mouse carries on from mid-flight, and `motion = false` puts it there
+    /// at once.
+    #[test]
+    fn which_focus_changes_take_the_pointer_along_where_to_and_how_is_configured() {
+        let configured = "local cursor = require(\"config\").focus.cursor\n\
+                          cursor.follows.direction = false\n\
+                          cursor.follows.click = true\n\
+                          cursor.to = { x = 0.5, y = 0.25 }\n\
+                          cursor.motion = { duration = 100, easing = \"linear\" }\n\
+                          cursor.interrupt = \"picture\"";
+        let mut desk = grid(configured, one_screen());
+        desk.focus(4);
+        let commands = desk.press_told("super+left");
+        assert_eq!(
+            (focuses(&commands), warps(&commands)),
+            (vec![3], Vec::new()),
+            "direction off: (focused, warped)"
+        );
+        assert_eq!(
+            warps(&desk.told(2, FocusSource::Click, true)),
+            vec![Warp {
+                interrupt: Interrupt::Picture,
+                ..to_window(
+                    2,
+                    (0.5, 0.25),
+                    Some(AnimationSpec {
+                        duration: std::time::Duration::from_millis(100),
+                        easing: Curve::Linear,
+                    }),
+                )
+            }],
+            "click on, to the top quarter, in 100 ms linear, the mouse going on from the picture"
+        );
+
+        let mut desk = grid(
+            "require(\"config\").focus.cursor.motion = false",
+            one_screen(),
+        );
+        desk.focus(4);
+        assert_eq!(
+            warps(&desk.press_told("super+left")),
+            vec![to_window(3, CENTRE, None)],
+            "motion = false: there at once"
+        );
+    }
+
+    /// **A move takes the pointer to where the window went**: no `focus` is
+    /// told for a move, which keeps the keyboard on the window that moved,
+    /// so the `direction` listener asks for the warp to it -- after the
+    /// layout has placed it, so the compositor finds it where it went --
+    /// unless `focus.cursor.follows.move` is off.
+    #[test]
+    fn a_move_takes_the_pointer_to_where_the_window_went() {
+        let mut desk = grid("", one_screen());
+        desk.focus(4);
+        let commands = desk.press_told("super+shift+left");
+        let placed = commands
+            .iter()
+            .rposition(|command| matches!(command, Command::Place { id: 4, .. }));
+        let warped = commands
+            .iter()
+            .position(|command| matches!(command, Command::Warp(_)));
+        assert_eq!(
+            (focuses(&commands), warps(&commands)),
+            (Vec::new(), vec![to_window(4, CENTRE, shipped_motion())]),
+            "(focused, warped): {commands:?}"
+        );
+        assert!(
+            placed.is_some() && warped > placed,
+            "the warp is asked for once the window is placed: {commands:?}"
+        );
+
+        let mut desk = grid(
+            "require(\"config\").focus.cursor.follows.move = false",
+            one_screen(),
+        );
+        desk.focus(4);
+        assert_eq!(
+            warps(&desk.press_told("super+shift+left")),
+            Vec::new(),
+            "follows.move off"
+        );
+    }
+
+    /// **In scrolling, a key takes the pointer along only if it moves the
+    /// keyboard or the window that has it**: every key the strip binds ends
+    /// with the strip focusing its window again, and `focus` says
+    /// `changed = false` for the window that already had the keyboard. From
+    /// the first of three columns, `super+r`, which only widens the column,
+    /// asks for no warp; `super+comma` stacks the next column's window under
+    /// the first and focuses it, which takes the pointer to it;
+    /// `super+period` pushes it back out into a column of its own and
+    /// `super+ctrl+bracketleft` moves a column, and each takes the pointer
+    /// after the window it moved, as a move by direction does, unless
+    /// `focus.cursor.follows.move` is off; `focus.cursor.refocus = true`
+    /// takes the pointer along for `super+r` too.
+    #[test]
+    fn in_scrolling_a_key_takes_the_pointer_along_only_if_it_moves_the_keyboard_or_its_window() {
+        let strip = |before: &str| {
+            let mut desk = Desk::new(before, one_screen());
+            for id in [1, 2, 3] {
+                desk.windows.push(window(
+                    id,
+                    "DP-1",
+                    Rect {
+                        w: 400.0,
+                        h: 300.0,
+                        ..WIDE
+                    },
+                ));
+            }
+            desk.press("super+s");
+            desk.press("super+bracketleft");
+            desk.press("super+bracketleft");
+            let x = |desk: &Desk, id| desk.rect(id).x;
+            assert!(
+                x(&desk, 1) < x(&desk, 2)
+                    && x(&desk, 2) < x(&desk, 3)
+                    && desk
+                        .windows
+                        .iter()
+                        .any(|window| window.id == 1 && window.focused),
+                "the premise: columns 1, 2, 3, and the first has the keyboard: {:?}",
+                desk.rects()
+            );
+            desk
+        };
+        let to = |id| vec![to_window(id, CENTRE, shipped_motion())];
+
+        let mut desk = strip("");
+        let widened = desk.press_told("super+r");
+        assert_eq!(
+            (focuses(&widened), warps(&widened)),
+            (vec![1], Vec::new()),
+            "super+r: (focused again, warped)"
+        );
+        assert_eq!(warps(&desk.press_told("super+comma")), to(2), "super+comma");
+        assert_eq!(
+            warps(&desk.press_told("super+period")),
+            to(2),
+            "super+period"
+        );
+        assert_eq!(
+            warps(&desk.press_told("super+bracketright")),
+            to(3),
+            "super+bracketright"
+        );
+        assert_eq!(
+            warps(&desk.press_told("super+ctrl+bracketleft")),
+            to(3),
+            "super+ctrl+bracketleft"
+        );
+
+        let mut desk = strip("require(\"config\").focus.cursor.follows.move = false");
+        assert_eq!(
+            warps(&desk.press_told("super+comma")),
+            to(2),
+            "move off: super+comma"
+        );
+        assert_eq!(
+            [
+                warps(&desk.press_told("super+period")),
+                warps(&desk.press_told("super+ctrl+bracketleft")),
+            ],
+            [Vec::new(), Vec::new()],
+            "move off: [super+period, super+ctrl+bracketleft]"
+        );
+
+        let mut desk = strip("require(\"config\").focus.cursor.refocus = true");
+        assert_eq!(
+            warps(&desk.press_told("super+r")),
+            to(1),
+            "refocus on: super+r"
+        );
+    }
+
+    /// **A switch to an empty workspace takes the pointer to the middle, or
+    /// leaves it**: `super+2` onto a workspace with no window asks for a warp
+    /// to the middle of the monitor that switched -- the one the pointer is
+    /// on, with two -- and `super+1` back focuses the window the keyboard
+    /// stayed on, and takes the pointer to it although its `focus` says the
+    /// keyboard did not move. `focus.cursor.empty_workspace =
+    /// "stay"` leaves it, and so does a key binding no longer taking it along.
+    #[test]
+    fn a_switch_to_an_empty_workspace_takes_the_pointer_to_the_middle_or_leaves_it() {
+        let middle = |area: Rect| WarpTo::Point {
+            x: area.x + area.w / 2.0,
+            y: area.y + area.h / 2.0,
+        };
+        let mut desk = grid("", one_screen());
+        let commands = desk.press_told("super+2");
+        assert_eq!(
+            (focuses(&commands), warps(&commands)),
+            (
+                Vec::new(),
+                vec![Warp {
+                    to: middle(WIDE),
+                    motion: shipped_motion(),
+                    interrupt: Interrupt::Pointer,
+                }]
+            ),
+            "onto an empty workspace: (focused, warped)"
+        );
+        let commands = desk.press_told("super+1");
+        let back = focuses(&commands);
+        assert_eq!(
+            warps(&commands),
+            back.iter()
+                .map(|id| to_window(*id, CENTRE, shipped_motion()))
+                .collect::<Vec<_>>(),
+            "back: the window focused takes the pointer, {back:?}"
+        );
+        assert_eq!(back.len(), 1, "back: one window focused");
+
+        for configured in [
+            "require(\"config\").focus.cursor.empty_workspace = \"stay\"",
+            "require(\"config\").focus.cursor.follows.binding = false",
+        ] {
+            let mut desk = grid(configured, one_screen());
+            assert_eq!(
+                warps(&desk.press_told("super+2")),
+                Vec::new(),
+                "{configured}"
+            );
+        }
+
+        let mut desk = Desk::new("", two_screens());
+        for monitor in &mut desk.monitors {
+            monitor.focused = monitor.name == "DP-2";
+        }
+        assert_eq!(
+            warps(&desk.press_told("super+2")),
+            vec![Warp {
+                to: middle(TALL),
+                motion: shipped_motion(),
+                interrupt: Interrupt::Pointer,
+            }],
+            "two monitors: the middle of the one the pointer is on"
+        );
+    }
+
+    /// **The `focus` event says what moved the keyboard**, and
+    /// `sol.focus_source()` says the same in the handler: a key binding's
+    /// `sol.focus` is `"binding"`, one in `sol.focus_direction`'s or
+    /// `sol.move_direction`'s listeners `"direction"` or `"move"` -- and the
+    /// binding's again once that returns --, a scene's action `"surface"`, a
+    /// click while a script holds input `"click"`, and the `open`,
+    /// `activate`, `scroll` and `drop` listeners theirs; anything else is
+    /// `"script"`. The compositor's own are told as it says them.
+    #[test]
+    fn the_focus_event_says_what_moved_the_keyboard() {
+        let mut scripts = plain(
+            "focus-source",
+            r#"
+            heard = {}
+            local function note(id) sol.focus(id) heard[#heard + 1] = sol.focus_source() end
+            sol.on("focus", function(id, source) heard[#heard + 1] = id .. " " .. source end)
+            sol.on("direction", function(verb) note(verb == "focus" and 2 or 3) end)
+            sol.bind("super+a", function() note(1) end)
+            sol.bind("super+d", function() sol.focus_direction("left") note(4) end)
+            sol.bind("super+m", function() sol.move_direction("left") end)
+            sol.on("surface", function() note(5) end)
+            sol.on("click", function() note(6) end)
+            sol.on("open", function(id) note(id) end)
+            sol.on("activate", function(id) note(id) end)
+            sol.on("scroll", function() note(8) end)
+            sol.on("drop", function(id) note(id) end)
+            sol.on("layout", function() note(9) end)
+            "#,
+        );
+        let sources = |outcome: super::Outcome| -> Vec<(u64, &'static str)> {
+            outcome
+                .commands
+                .iter()
+                .filter_map(|command| match command {
+                    Command::Focus { id, source, .. } => Some((*id, source.name())),
+                    _ => None,
+                })
+                .collect()
+        };
+        let none = Snapshot::default;
+        assert_eq!(
+            [
+                sources(scripts.key("super+a", none())),
+                sources(scripts.key("super+d", none())),
+                sources(scripts.key("super+m", none())),
+                sources(scripts.surface_action("bar", "go", &crate::json::Json::Null, none())),
+                sources(scripts.click(1.0, 1.0, none())),
+                sources(scripts.opened(7, none())),
+                sources(scripts.activated(7, "request", none())),
+                sources(scripts.scrolled(0.0, 1.0, none())),
+                sources(scripts.dropped(7, 0.0, 0.0, none())),
+                sources(scripts.relayout(none())),
+            ],
+            [
+                vec![(1, "binding")],
+                vec![(2, "direction"), (4, "binding")],
+                vec![(3, "move")],
+                vec![(5, "surface")],
+                vec![(6, "click")],
+                vec![(7, "open")],
+                vec![(7, "activate")],
+                vec![(8, "scroll")],
+                vec![(7, "drop")],
+                vec![(9, "script")],
+            ],
+            "what each `sol.focus` was asked with"
+        );
+        let _ = scripts.focused(7, FocusSource::Hover, true, none());
+        let _ = scripts.focused(7, FocusSource::Settle, false, none());
+        assert_eq!(
+            scripts.evaluate("return table.concat(heard, \",\")"),
+            "binding,direction,binding,move,surface,click,open,activate,scroll,drop,script,\
+             7 hover,7 settle",
+            "what `sol.focus_source()` said in each handler, then two `focus` events"
+        );
+    }
+
+    /// **`sol.focus` carries its source and its warp**: a warp table is
+    /// `sol.warp`'s options aimed at the window focused, `true` is its centre
+    /// at once, none is none, a motion with nothing in it is the default
+    /// one, and a warp of any other kind is an error.
+    #[test]
+    fn sol_focus_carries_its_source_and_its_warp() {
+        let mut scripts = plain(
+            "focus-warp",
+            r#"
+            sol.bind("super+a", function()
+                sol.focus(3, { warp = { to = { x = 0.25, y = 0.75 }, motion = { duration = 300, easing = "linear" } } })
+            end)
+            sol.bind("super+b", function() sol.focus(4, { warp = true }) end)
+            sol.bind("super+c", function() sol.focus(5) end)
+            sol.bind("super+d", function() sol.focus(6, { warp = { motion = {} } }) end)
+            sol.bind("super+e", function()
+                local ok, err = pcall(sol.focus, 7, { warp = "yes" })
+                sol.status(tostring(ok) .. ": " .. tostring(err))
+            end)
+            "#,
+        );
+        let focus = |scripts: &mut Scripts, combo: &str| {
+            scripts
+                .key(combo, Snapshot::default())
+                .commands
+                .into_iter()
+                .filter_map(|command| match command {
+                    Command::Focus { id, source, warp } => Some((id, source, warp)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            [
+                focus(&mut scripts, "super+a"),
+                focus(&mut scripts, "super+b"),
+                focus(&mut scripts, "super+c"),
+                focus(&mut scripts, "super+d"),
+            ],
+            [
+                vec![(
+                    3,
+                    FocusSource::Binding,
+                    Some(to_window(
+                        3,
+                        (0.25, 0.75),
+                        Some(AnimationSpec {
+                            duration: std::time::Duration::from_millis(300),
+                            easing: Curve::Linear,
+                        }),
+                    )),
+                )],
+                vec![(4, FocusSource::Binding, Some(to_window(4, CENTRE, None)))],
+                vec![(5, FocusSource::Binding, None)],
+                vec![(
+                    6,
+                    FocusSource::Binding,
+                    Some(to_window(6, CENTRE, Some(AnimationSpec::default()))),
+                )],
+            ]
+        );
+        let refused = scripts
+            .key("super+e", Snapshot::default())
+            .status
+            .unwrap_or_default();
+        assert!(
+            refused.starts_with("false: ") && refused.contains("warp is true, false or a table"),
+            "{refused:?}"
+        );
+    }
+
+    /// **`sol.warp` names a window or a point, and a bad one is an error**:
+    /// a window's id is its centre unless `to` says, a point is a point with
+    /// a motion's duration and the default easing, a spring is a spring, and
+    /// the mouse carries on from the pointer mid-flight unless `interrupt`
+    /// says `"picture"`; anything but an id or a point, half a point, `to`
+    /// with a point, a `to` that is neither `"center"` nor a share, half a
+    /// share, a motion that is not a table, a negative id and an `interrupt`
+    /// that is neither `"pointer"` nor `"picture"` are errors, and ask for
+    /// nothing.
+    #[test]
+    fn sol_warp_names_a_window_or_a_point_and_a_bad_one_is_an_error() {
+        let mut scripts = plain(
+            "warp",
+            r#"
+            sol.bind("super+a", function() sol.warp(5) end)
+            sol.bind("super+b", function() sol.warp({ x = 10, y = 20 }, { motion = { duration = 100 } }) end)
+            sol.bind("super+c", function() sol.warp(5, { to = "center", motion = { easing = "spring" } }) end)
+            sol.bind("super+d", function()
+                sol.warp(5, { interrupt = "picture" })
+                sol.warp(6, { interrupt = "pointer" })
+            end)
+            sol.bind("super+e", function()
+                local said = {}
+                for _, call in ipairs({
+                    function() sol.warp("five") end,
+                    function() sol.warp({ x = 1 }) end,
+                    function() sol.warp({ x = 1, y = 2 }, { to = "center" }) end,
+                    function() sol.warp(5, { to = "middle" }) end,
+                    function() sol.warp(5, { to = { x = 0.5 } }) end,
+                    function() sol.warp(5, { motion = 3 }) end,
+                    function() sol.warp(-1) end,
+                    function() sol.warp(5, { interrupt = "wherever" }) end,
+                }) do
+                    said[#said + 1] = tostring((pcall(call)))
+                end
+                sol.status(table.concat(said, ","))
+            end)
+            "#,
+        );
+        let warped = |scripts: &mut Scripts, combo: &str| {
+            warps(&scripts.key(combo, Snapshot::default()).commands)
+        };
+        assert_eq!(
+            [
+                warped(&mut scripts, "super+a"),
+                warped(&mut scripts, "super+b"),
+                warped(&mut scripts, "super+c"),
+                warped(&mut scripts, "super+d"),
+            ],
+            [
+                vec![to_window(5, CENTRE, None)],
+                vec![Warp {
+                    to: WarpTo::Point { x: 10.0, y: 20.0 },
+                    motion: Some(AnimationSpec {
+                        duration: std::time::Duration::from_millis(100),
+                        easing: Curve::OutCubic,
+                    }),
+                    interrupt: Interrupt::Pointer,
+                }],
+                vec![to_window(
+                    5,
+                    CENTRE,
+                    Curve::from_name("spring").map(|easing| AnimationSpec {
+                        easing,
+                        ..AnimationSpec::default()
+                    }),
+                )],
+                vec![
+                    Warp {
+                        interrupt: Interrupt::Picture,
+                        ..to_window(5, CENTRE, None)
+                    },
+                    to_window(6, CENTRE, None),
+                ],
+            ]
+        );
+        let outcome = scripts.key("super+e", Snapshot::default());
+        assert_eq!(
+            (outcome.status.unwrap_or_default(), warps(&outcome.commands)),
+            (
+                "false,false,false,false,false,false,false,false".to_owned(),
+                Vec::new()
+            ),
+            "every bad call is an error, and none asks for a warp"
         );
     }
 }

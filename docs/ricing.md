@@ -1097,6 +1097,13 @@ moved over the last frame in logical pixels a second along `x` and `y`,
 zero once it stops, `scale` the scale of the monitor it is on and `size` the
 configured `cursor.size`
 (`models::pointer::tests::the_published_pointer_is_its_buttons_its_motion_its_monitor_and_its_size`).
+When the pointer is taken somewhere -- following the keyboard, or by
+`sol.warp` -- the pointer is there at once and its picture flies: `moving` is
+true while it does, `from` and `to` are where it set off and where it is going
+in the desktop's logical pixels, kept once it lands, and `velocity` is the
+flight's own, so a scene can stretch or trail the picture by it
+(`models::pointer::tests::a_flight_is_published_while_it_flies_and_said_to_have_landed_after`,
+`qml::pointer::tests::a_published_flight_reaches_solium_cursor`).
 It says one thing back, `Solium.cursor.hotspot` on its root: the point of
 its picture that sits on the pointer, its top-left corner unless it says.
 Its size is its root's own `width` and `height`, up to 256 logical pixels
@@ -1382,6 +1389,37 @@ in a grid the opposite key puts both back; `move = "split"` makes it split the
 neighbour's tile instead, as Hyprland's `movewindow` does. [modes.md](modes.md#focus-and-move-by-direction)
 has what each layout does with a direction.
 
+### The pointer follows the keyboard
+
+Moving focus with a key -- `super+arrows`, a workspace key, a move -- takes the
+pointer to the window that took the keyboard, and its picture glides there.
+The pointer itself is there at once, so whatever it is over is the new
+window's from the first instant; moving the mouse while it glides carries on
+from there, or from where you see the picture with `interrupt = "picture"`. A
+key that leaves the keyboard where it was, such as scrolling's `super+r`,
+takes it nowhere. A click, a bar's window chip, a window opening or focus
+following the mouse leaves it where your hand put it. All of it is
+`focus.cursor`, by what moved the keyboard
+([modes.md](modes.md#what-a-mode-is-told) lists every source):
+
+```lua
+return {
+    focus = {
+        cursor = {
+            follows = { binding = false, surface = true }, -- not for workspace keys, but for a bar's chip
+            to = { x = 0.5, y = 0.25 },                    -- a quarter of the way down the window
+            motion = { easing = "spring" },                -- or false, to be there at once
+            interrupt = "picture",                         -- the mouse mid-flight goes on from the picture
+            refocus = true,                                -- super+r in scrolling recentres it too
+            empty_workspace = "stay",                      -- a key onto an empty workspace leaves it
+        },
+    },
+}
+```
+
+`lua/follow.lua` is the whole of the policy, and `sol.warp` the compositor's
+part of it ([modes.md](modes.md#taking-the-pointer-somewhere)). #220.
+
 ### Click, hover and an empty desktop
 
 A press on empty desktop or the wallpaper clears keyboard focus, so a window
@@ -1402,20 +1440,45 @@ Whether moving the pointer over a window focuses it is a per-mode question,
 not a single on/off switch: floating -- the desktop, with no layout in charge
 and windows free to overlap -- focuses on click only by default, because a
 window you are not using sits under the pointer on the way to the one you
-want. Every other mode keeps this machine's own answer (`SOLIUM_FORM_FACTOR`,
-[#159](https://github.com/Lilium-Linux/solium/issues/159)), which on a
-desktop or a laptop is focus-follows-mouse, the same as every tiling
-compositor people arrive from. Name a mode to change its own answer:
+want. Tiling and scrolling follow the pointer, the same as every tiling
+compositor people arrive from: their windows never overlap, so pointing at one
+is choosing it. That shipped "follow" is this machine's own answer, though
+(`SOLIUM_FORM_FACTOR`, [#159](https://github.com/Lilium-Linux/solium/issues/159)):
+a tablet or a phone, with no pointer to hover, stays click-only in them.
+
+Who decides, highest first: your own entry for the mode in `focus.modes`, then
+your own `focus.follow` for every mode at once, then the shipped entries, then
+the machine. So `focus = { follow = false }` turns hover off in every mode,
+and an entry of yours turns it back on for one, on any machine. A mode named
+nowhere gets the machine's answer, never the answer of the mode you switched
+from:
 
 ```lua
 return {
     focus = { modes = { floating = "follow", scrolling = "click" } },
+    -- or: focus = { follow = false, modes = { tiling = "follow" } },
 }
 ```
 
-`lua/modes.lua` is what turns this into `sol.focus_mode`, on every mode
-change as well as at load, so a reload keeps whichever model the session was
-already in.
+When the window you are typing into closes, the keyboard moves on by itself
+as the close lands, and `focus.after_close` says where, per mode, as a list
+tried in order (#128): `"pointer"`, the window under the pointer;
+`"neighbour"`, the window that takes its place -- the tile that grows into
+the space, the column that slides into it -- or the nearest to where it
+stood; `"recent"`, the one you used before it on that monitor; `"topmost"`,
+the topmost window on any screen. Tiling and scrolling are
+`{ "pointer", "neighbour", "topmost" }` and floating is
+`{ "recent", "topmost" }`. An empty list leaves the keyboard on nothing:
+
+```lua
+return {
+    focus = { after_close = { tiling = { "recent", "topmost" } } },
+}
+```
+
+`lua/modes.lua` is what turns all of this into `sol.focus_mode`, on every mode
+change as well as at load, so a mode switch applies at once and a reload
+keeps whichever model the session was already in.
 
 ### Your own mode
 

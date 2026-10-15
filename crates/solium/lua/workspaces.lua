@@ -39,6 +39,7 @@
 local config = require("config")
 local monitors = require("monitors")
 local wallpaper = require("wallpaper")
+local follow = require("follow")
 
 -- The key every monitor shares when workspaces are not per monitor. A name no
 -- connector can have, so it cannot collide with a real one.
@@ -286,9 +287,24 @@ function workspaces.go(index, monitor)
             and workspaces.on_active(window.id, window.monitor)
         then
             sol.focus(window.id)
+            -- A switch away to an empty workspace leaves the keyboard on the
+            -- window it hid, so coming back focuses the window that already
+            -- has it, and its `focus` says the keyboard did not move. The
+            -- view did, so the pointer is taken to it here instead (#220).
+            -- `a_switch_to_an_empty_workspace_takes_the_pointer_to_the_middle_or_leaves_it`.
+            if window.focused then
+                follow.window(window.id, sol.focus_source())
+            end
             return
         end
     end
+
+    -- No window there to take the keyboard, so no `focus` takes the pointer
+    -- along: it may go to the middle of the screen that switched instead,
+    -- `focus.cursor.empty_workspace` (#220).
+    -- `a_switch_to_an_empty_workspace_takes_the_pointer_to_the_middle_or_leaves_it`.
+    local active = monitors.active()
+    follow.monitor(switched or (active and active.name), sol.focus_source())
 end
 
 -- The next workspace after the one `monitor` is showing that has no window on
@@ -303,9 +319,10 @@ end
 --
 -- A window being closed is not counted unless `closing_counts` says so. It is
 -- fading out, and a layout that closes up at once has already given its space
--- away (#128); one that keeps the tile until the application has gone -- tiling
--- with `reflow_on_close = "when_gone"` -- has not, and passes true. See
--- `with_reflow_when_gone_a_closing_window_still_takes_its_workspace`. With
+-- away (#128); one that keeps the tile until the application has gone, or
+-- until the close has landed -- tiling with `reflow_on_close = "when_gone"` or
+-- `"when_landed"` -- has not, and passes true. See
+-- `waiting_to_reflow_a_closing_window_still_takes_its_workspace`. With
 -- workspaces not per monitor a workspace is every screen at once, so a window on
 -- any screen takes it; per monitor, only this screen's windows count.
 --
