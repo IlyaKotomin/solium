@@ -9,7 +9,7 @@ This page carries no status: a row leaves when its gap is closed.
 Written by asking the compositor rather than by remembering: the "have" list
 below is `wayland-info` against a running Solium, and the "missing" list is
 every protocol in `wayland-protocols`, `wayland-protocols-wlr` and
-`wayland-protocols-misc` that is not in it. Twenty-seven globals in, about
+`wayland-protocols-misc` that is not in it. Twenty-nine globals in, about
 forty out; the list below is the count.
 
 Everything here is on the tracker: writing this page found thirty-one gaps
@@ -29,7 +29,8 @@ says otherwise.
 `ext_idle_notifier_v1` · `zwp_idle_inhibit_manager_v1` ·
 `zwlr_output_power_manager_v1` · `wp_presentation` ·
 `wp_viewporter` · `wp_fractional_scale_manager_v1` · `zwp_linux_dmabuf_v1` ·
-`xdg_wm_dialog_v1` · `wp_single_pixel_buffer_manager_v1` ·
+`xdg_wm_dialog_v1` · `zxdg_exporter_v2` · `zxdg_importer_v2` ·
+`wp_single_pixel_buffer_manager_v1` ·
 `zwp_relative_pointer_manager_v1` · `zwp_pointer_constraints_v1` ·
 `zwp_primary_selection_device_manager_v1` · `wp_cursor_shape_manager_v1` ·
 `zwp_text_input_manager_v3`, plus `xwayland_shell_v1` to the X server only.
@@ -57,7 +58,6 @@ Not a whole day lost — one application, or one workflow, that does not work.
 |---|---|
 | [#58](https://github.com/Lilium-Linux/solium/issues/58) `keyboard-shortcuts-inhibit` | a VM, a remote desktop, or a terminal multiplexer that wants `Super` for itself. Without it, those keys are eaten forever |
 | [#59](https://github.com/Lilium-Linux/solium/issues/59) `linux-drm-syncobj` (explicit sync) | modern Vulkan and NVIDIA clients. Its absence is stutter and the occasional torn frame, and it is the single most-reported "your compositor is broken" on other projects |
-| [#67](https://github.com/Lilium-Linux/solium/issues/67) `xdg-foreign-v2` | a file chooser or a screen-share dialog that has to be parented to the window that opened it. Otherwise it lands wherever the layout puts it |
 | [#68](https://github.com/Lilium-Linux/solium/issues/68) `wp-security-context-v1` | how a Flatpak identifies itself. Without it there is no way to treat sandboxed clients differently, ever |
 | [#60](https://github.com/Lilium-Linux/solium/issues/60) `ext-workspace-v1` | Solium *has* workspaces, in `workspaces.lua`, and no client can see or switch them. A shell that is a client cannot show which one you are on; a hosted shell can, through `Workspaces` ([#166](https://github.com/Lilium-Linux/solium/issues/166)) |
 | [#69](https://github.com/Lilium-Linux/solium/issues/69) `zwlr_gamma_control_v1` | night light. `gammastep` and `redshift` speak only this |

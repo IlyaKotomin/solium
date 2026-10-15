@@ -79,6 +79,7 @@ use smithay::{
             },
         },
         shm::{ShmHandler, ShmState},
+        xdg_foreign::{XdgForeignHandler, XdgForeignState},
     },
 };
 use zxdg_toplevel_decoration_v1::Mode;
@@ -207,6 +208,10 @@ pub(crate) struct Solium {
     /// being constructed and discarded in `new`.
     #[allow(dead_code)]
     pub(crate) xdg_dialog_state: XdgDialogState,
+    /// The `zxdg_exporter_v2` and `zxdg_importer_v2` globals, so a window can
+    /// be named as a parent by a client that does not own it (#67). See
+    /// `XdgForeignHandler` in `state/handlers.rs`.
+    pub(crate) xdg_foreign_state: XdgForeignState,
     pub(crate) shm_state: ShmState,
     #[allow(dead_code)]
     pub(crate) output_manager_state: OutputManagerState,
@@ -1146,6 +1151,7 @@ impl Solium {
             compositor_state: CompositorState::new::<Self>(&display_handle),
             xdg_shell_state: XdgShellState::new::<Self>(&display_handle),
             xdg_dialog_state: XdgDialogState::new::<Self>(&display_handle),
+            xdg_foreign_state: XdgForeignState::new::<Self>(&display_handle),
             shm_state: ShmState::new::<Self>(&display_handle, Vec::new()),
             output_manager_state: OutputManagerState::new_with_xdg_output::<Self>(&display_handle),
             data_device_state: DataDeviceState::new::<Self>(&display_handle),

@@ -115,12 +115,14 @@ suite.
   the environment Solium itself was started with, not the settings Qt has
   written into it since, and inherit no descriptor beyond stdio ([#175]).
 - **Protocols.** `xdg-shell`, `xdg-decoration`, `xdg-output`,
-  `xdg-activation`, `xdg-dialog`, `wlr-layer-shell`, `wlr-screencopy`,
-  `wlr-output-power-management`, `ext-session-lock`, `ext-idle-notify`,
-  `idle-inhibit`, `cursor-shape`, `wp-viewporter`, `wp-fractional-scale`,
-  `wp-presentation`, `wp-single-pixel-buffer`, `linux-dmabuf`,
-  `relative-pointer`, `pointer-constraints`, `primary-selection`,
-  `text-input-v3` and `xwayland-shell`. Both selections, copy and paste, cross
+  `xdg-activation`, `xdg-dialog`, `xdg-foreign`, `wlr-layer-shell`,
+  `wlr-screencopy`, `wlr-output-power-management`, `ext-session-lock`,
+  `ext-idle-notify`, `idle-inhibit`, `cursor-shape`, `wp-viewporter`,
+  `wp-fractional-scale`, `wp-presentation`, `wp-single-pixel-buffer`,
+  `linux-dmabuf`, `relative-pointer`, `pointer-constraints`,
+  `primary-selection`, `text-input-v3` and `xwayland-shell`. A dialog another
+  program draws for a window, such as a portal's file chooser, belongs to that
+  window through `xdg-foreign` ([#67]). Both selections, copy and paste, cross
   the X11 boundary. `text-input-v3` tells the compositor where the focused
   text field's caret is; with no input method yet, no text is sent back
   ([#26]).
@@ -129,9 +131,8 @@ suite.
 
 No input method, so no IME and no on-screen keyboard ([#26]); no clipboard
 manager, which wants `data-control` ([#52]); no window rules ([#56]); no night
-light ([#69]); a virtual machine or a remote desktop cannot have Super
-([#58]); and portal dialogs cannot be parented to the window that opened them
-([#67]). Screenshots and recording come from `wlr-screencopy`, so `grim` and
+light ([#69]); and a virtual machine or a remote desktop cannot have Super
+([#58]). Screenshots and recording come from `wlr-screencopy`, so `grim` and
 `wf-recorder` should work, but the portals, screen sharing included, have never
 been tested end to end ([#83]). Nothing the compositor draws reacts to touch
 yet (frame buttons, a hosted shell, the overview, window edges), though touch

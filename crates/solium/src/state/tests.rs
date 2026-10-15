@@ -1677,6 +1677,9 @@ mod real_client {
         xdg_activation_token_v1, xdg_activation_v1,
     };
     use wayland_protocols::xdg::dialog::v1::client::{xdg_dialog_v1, xdg_wm_dialog_v1};
+    use wayland_protocols::xdg::foreign::zv2::client::{
+        zxdg_exported_v2, zxdg_exporter_v2, zxdg_imported_v2, zxdg_importer_v2,
+    };
     use wayland_protocols::xdg::shell::client::{
         xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
     };
@@ -1741,6 +1744,13 @@ mod real_client {
         /// is not a thing the server side can say on a client's behalf --
         /// which is the whole reason this test is in this module.
         dialogs: Option<xdg_wm_dialog_v1::XdgWmDialogV1>,
+        /// The two halves of #67: an application exports a window, and a
+        /// portal imports it to parent a dialog of its own to it.
+        exporter: Option<zxdg_exporter_v2::ZxdgExporterV2>,
+        importer: Option<zxdg_importer_v2::ZxdgImporterV2>,
+        /// Every `zxdg_exported_v2.handle` this client has been sent: the
+        /// string an application passes to a portal.
+        exported_handles: Vec<String>,
         /// For a window that asks to be brought forward with a token, as
         /// an application launched with one does as it opens -- GTK, Qt
         /// and winit all do. A raw client that never sends it cannot see
@@ -2056,6 +2066,8 @@ mod real_client {
                     state.subcompositor = Some(registry.bind(name, 1, qh, ()));
                 }
                 "xdg_wm_dialog_v1" => state.dialogs = Some(registry.bind(name, 1, qh, ())),
+                "zxdg_exporter_v2" => state.exporter = Some(registry.bind(name, 1, qh, ())),
+                "zxdg_importer_v2" => state.importer = Some(registry.bind(name, 1, qh, ())),
                 "xdg_activation_v1" => {
                     state.activation = Some(registry.bind(name, 1, qh, ()));
                 }
@@ -2179,6 +2191,25 @@ mod real_client {
 
     wayland_client::delegate_noop!(Client: ignore xdg_wm_dialog_v1::XdgWmDialogV1);
     wayland_client::delegate_noop!(Client: ignore xdg_dialog_v1::XdgDialogV1);
+    wayland_client::delegate_noop!(Client: ignore zxdg_exporter_v2::ZxdgExporterV2);
+    wayland_client::delegate_noop!(Client: ignore zxdg_importer_v2::ZxdgImporterV2);
+    wayland_client::delegate_noop!(Client: ignore zxdg_imported_v2::ZxdgImportedV2);
+
+    /// See [`Client::exported_handles`].
+    impl Dispatch<zxdg_exported_v2::ZxdgExportedV2, ()> for Client {
+        fn event(
+            state: &mut Self,
+            _exported: &zxdg_exported_v2::ZxdgExportedV2,
+            event: zxdg_exported_v2::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+            if let zxdg_exported_v2::Event::Handle { handle } = event {
+                state.exported_handles.push(handle);
+            }
+        }
+    }
     wayland_client::delegate_noop!(Client: ignore xdg_activation_v1::XdgActivationV1);
     wayland_client::delegate_noop!(Client: ignore wl_compositor::WlCompositor);
     wayland_client::delegate_noop!(Client: ignore wl_surface::WlSurface);
@@ -5910,6 +5941,95 @@ end)"#,
             "the parent was raised over the dialog that is waiting on it: the \
              prompt is now behind the window it is blocking, where it cannot \
              be read or dismissed"
+        );
+    }
+
+    /// **#67: a dialog drawn by another process belongs to the window it is
+    /// for.**
+    ///
+    /// A file chooser opened through the portal is drawn by the portal, not by
+    /// the application that asked for it, so `xdg_toplevel.set_parent` cannot
+    /// name the window it is about: that window is another client's object.
+    /// `xdg-foreign` is the way across. The application exports its toplevel
+    /// and is handed a string, passes the string to the portal, and the portal
+    /// imports it and parents its own window to it.
+    ///
+    /// Two clients, because with one the test could have been passed by
+    /// `set_parent` and would prove nothing about the crossing. The second
+    /// half is the application withdrawing the export: the relationship goes
+    /// with it, and `parent_of` has to come back `None` rather than keep a
+    /// parent the only client entitled to name it has taken back.
+    #[test]
+    fn a_dialog_from_another_client_is_parented_through_an_exported_handle() {
+        let mut display = Display::<Solium>::new().expect("creating a test wayland display");
+        let mut state = Solium::new(display.handle());
+        // See the #99 test: a Qt scene in a process holding a libwayland
+        // connection of its own aborts the whole test binary.
+        state
+            .decorations
+            .set_style(&mut state.panes, Some("none".to_string()));
+
+        let (app_conn, mut app_queue, mut app) = connect(&mut display, &mut state);
+        let app_qh = app_queue.handle();
+        let (portal_conn, portal_queue, portal) = connect(&mut display, &mut state);
+        let portal_qh = portal_queue.handle();
+
+        let (document, _document_toplevel, document_surface) =
+            open_surface(&mut display, &mut state, &app_conn, &app, &app_qh);
+        let (chooser, _chooser_toplevel, chooser_surface) =
+            open_surface(&mut display, &mut state, &portal_conn, &portal, &portal_qh);
+
+        let exporter = app
+            .exporter
+            .clone()
+            .expect("zxdg_exporter_v2 is advertised, so an application can export a window");
+        let exported = exporter.export_toplevel(&document_surface, &app_qh, ());
+        pump(
+            &mut display,
+            &mut state,
+            &app_conn,
+            &app_qh,
+            &mut app_queue,
+            &mut app,
+        );
+        let handle = app
+            .exported_handles
+            .last()
+            .cloned()
+            .expect("the export was answered with a handle");
+
+        let importer = portal
+            .importer
+            .clone()
+            .expect("zxdg_importer_v2 is advertised, so a portal can import one");
+        let imported = importer.import_toplevel(handle, &portal_qh, ());
+        imported.set_parent_of(&chooser_surface);
+        portal_conn.flush().expect("flushing the import");
+        display
+            .dispatch_clients(&mut state)
+            .expect("dispatching the import");
+
+        let document_pane = state
+            .panes
+            .id_of(&document)
+            .expect("the document has a pane");
+        assert_eq!(
+            state.parent_of(&chooser),
+            Parentage::Window(document_pane.get()),
+            "the portal parented its window to the document through the \
+             exported handle, and the compositor does not know whose dialog it is"
+        );
+
+        exported.destroy();
+        app_conn.flush().expect("flushing the withdrawn export");
+        display
+            .dispatch_clients(&mut state)
+            .expect("dispatching the withdrawn export");
+        assert_eq!(
+            state.parent_of(&chooser),
+            Parentage::None,
+            "the application withdrew the export, and the dialog still names \
+             the window as its parent"
         );
     }
 

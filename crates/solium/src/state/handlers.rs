@@ -1593,6 +1593,36 @@ impl XdgDialogHandler for Solium {
     }
 }
 
+/// `xdg-foreign-v2` -- a window named as a parent by a client that does not
+/// own it (#67).
+///
+/// A file chooser opened through the portal, a screen-share prompt and an
+/// authentication dialog are drawn by another process than the application
+/// they are about, so `xdg_toplevel.set_parent` cannot name the window they
+/// belong to. The application exports its toplevel and is handed a string; it
+/// passes the string to the portal, which imports it and parents its own
+/// window to it with `zxdg_imported_v2.set_parent_of`.
+///
+/// **No state of our own, and no second path.** smithay writes the imported
+/// parent into the same `XdgToplevelSurfaceRoleAttributes::parent` that
+/// `set_parent` writes, and calls `XdgShellHandler::parent_changed` -- on the
+/// import, and again when the export or the import is withdrawn and the
+/// relationship goes with it. So `Solium::parent_of`, the layouts' centring on
+/// the parent, a modal's stacking over it and `refused_with_a_dialog` all see
+/// a portal's dialog exactly as they see an application's own. A parent that
+/// is not ours to point at comes back `Parentage::Unknown`, as it does for
+/// `set_parent`.
+///
+/// Nothing to gate. A handle is a random string only the exporting client is
+/// given, so a window can be named by another client only if its own client
+/// chose to hand it out; and importing one lets a client parent *its own*
+/// window, nothing more.
+impl XdgForeignHandler for Solium {
+    fn xdg_foreign_state(&mut self) -> &mut XdgForeignState {
+        &mut self.xdg_foreign_state
+    }
+}
+
 /// `delegate_compositor!`, written out, for every object but `wl_subsurface`:
 /// Solium is asked about one going before smithay's destructor for it runs.
 /// See [`Solium::goes_with`].
@@ -1655,6 +1685,7 @@ delegate_shm!(Solium);
 delegate_xdg_shell!(Solium);
 delegate_xdg_decoration!(Solium);
 smithay::delegate_xdg_dialog!(Solium);
+smithay::delegate_xdg_foreign!(Solium);
 delegate_layer_shell!(Solium);
 delegate_seat!(Solium);
 // Routes `wp_cursor_shape_manager_v1` and the per-pointer device it hands out.
