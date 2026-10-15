@@ -598,6 +598,17 @@ impl<T: Blend> Transform<T> {
 pub(crate) struct Slot {
     transform: RefCell<Option<Transform<Frame>>>,
     shown: std::cell::Cell<bool>,
+    /// The two ends of the last transform [`settle`] retired, and when: what
+    /// [`landed_course`] answers for a while after it.
+    landed: std::cell::Cell<Option<Landed>>,
+}
+
+/// A retired transform's rectangles and the pass it was retired on.
+#[derive(Clone, Copy, Debug)]
+struct Landed {
+    from: Rectangle<f64, Logical>,
+    to: Rectangle<f64, Logical>,
+    at: Duration,
 }
 
 /// Run `f` against a pane's transform, if nothing is already inside it.
@@ -762,6 +773,28 @@ pub(crate) fn course(pane: &Pane) -> Option<(Rectangle<f64, Logical>, Rectangle<
     .flatten()
 }
 
+/// The rectangles the transform [`settle`] last retired ran from and to, for
+/// `within` after the pass it landed on.
+///
+/// What a glide's stationary edges are still read from once it has landed
+/// (#233): a client slower than the glide has not drawn at the new rectangle
+/// yet, and its picture has to stay against the edge it stood against through
+/// the glide, or it jumps to the corner the moment the transform is retired.
+/// `within` is `resizing::PATIENCE`, the time a drag's picture is held past
+/// its release. A transform that is still running is [`course`]'s.
+/// `state::tests::real_client::a_glide_that_lands_before_its_client_answers_keeps_its_picture_where_it_was`.
+pub(crate) fn landed_course(
+    pane: &Pane,
+    now: Duration,
+    within: Duration,
+) -> Option<(Rectangle<f64, Logical>, Rectangle<f64, Logical>)> {
+    pane.drawn()
+        .landed
+        .get()
+        .filter(|landed| now < landed.at + within)
+        .map(|landed| (landed.from, landed.to))
+}
+
 /// Retire finished transforms. Returns whether this window is still animating.
 ///
 /// A releasing transform is dropped when it lands, and so is a held one that
@@ -779,6 +812,11 @@ pub(crate) fn settle(pane: &Pane, real: Rectangle<i32, Logical>, now: Duration) 
         }
         if transform.releases() || transform.target().is_rest_of(real) {
             *slot = None;
+            pane.drawn().landed.set(Some(Landed {
+                from: transform.from.rect,
+                to: transform.to.rect,
+                at: now,
+            }));
         }
         false
     })

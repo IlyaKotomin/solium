@@ -361,15 +361,23 @@ impl Solium {
     /// pointer has hold of, and for a pane merely pushed aside is neither. See
     /// [`crate::resizing::moved_edges`]. Any other pane answers with the edges
     /// its glide does not move, from the glide's two ends (#233,
-    /// [`crate::resizing::pins`]), and a pane at rest with none.
-    /// `a_glide_that_shrinks_a_window_draws_its_answer_at_its_own_size`.
+    /// [`crate::resizing::pins`]) -- and for `resizing::PATIENCE` after the
+    /// glide lands, so a client slower than the glide is not moved to the
+    /// corner the moment it lands ([`crate::present::landed_course`]) -- and a
+    /// pane at rest with none.
+    /// `a_glide_that_shrinks_a_window_draws_its_answer_at_its_own_size`,
+    /// `a_glide_that_lands_before_its_client_answers_keeps_its_picture_where_it_was`.
     pub(crate) fn resize_pins(&self, pane: crate::pane::PaneId) -> (bool, bool) {
         if let Some(hold) = self.held_hold(pane) {
             return hold.pins();
         }
         self.panes
             .get(pane)
-            .and_then(crate::present::course)
+            .and_then(|held| {
+                crate::present::course(held).or_else(|| {
+                    crate::present::landed_course(held, self.clock.now(), crate::resizing::PATIENCE)
+                })
+            })
             .map_or((false, false), |(from, to)| crate::resizing::pins(from, to))
     }
 

@@ -8306,6 +8306,99 @@ end)"#,
         );
     }
 
+    /// **#233: a glide that lands before its client answers keeps the
+    /// picture where it was, against the edge it pinned.**
+    ///
+    /// The full-width window shrunk to the right half again, by a 240 ms
+    /// glide, and a client slower than that: the glide lands with the old,
+    /// full-width picture still the only one. Through the glide it stood
+    /// against the right edge, cut on the left, where the window was moving.
+    /// The transform is retired the pass it lands, and with nothing left to
+    /// say which edge stood still the picture went back to the top-left: the
+    /// whole of the window's contents jumped by half a screen at the moment
+    /// the glide finished. It stays against that edge for
+    /// `resizing::PATIENCE` past the landing, as a drag's picture does past
+    /// the release, and then the client's own picture is drawn as it is.
+    #[test]
+    fn a_glide_that_lands_before_its_client_answers_keeps_its_picture_where_it_was() {
+        tiled_fixture!(display, state, conn, queue, client, qh);
+        let (window, _surface, pane, tile) = filled_tile(
+            &mut display,
+            &mut state,
+            &conn,
+            &qh,
+            &mut queue,
+            &mut client,
+        );
+
+        let right = Rectangle::new(
+            (tile.loc.x + tile.size.w / 2, tile.loc.y).into(),
+            (tile.size.w / 2, tile.size.h).into(),
+        );
+        let start = state.clock.now();
+        glide(
+            &mut state,
+            &window,
+            right,
+            Duration::from_millis(240),
+            present::Curve::Linear,
+            start,
+        );
+        let committed = window.geometry().size;
+        assert_eq!(
+            committed, tile.size,
+            "the premise: the client has not answered"
+        );
+
+        let anchored = |state: &Solium| {
+            let held = state.panes.get(pane).expect("the pane is here");
+            let outer = state.pane_outer(held);
+            let frame = state.drawn_at(held, outer, state.clock.now());
+            let drawn = crate::render::place_client(state, held, &frame, outer.size, committed);
+            (
+                drawn.origin.x + f64::from(committed.w)
+                    - (drawn.client.loc.x + drawn.client.size.w),
+                drawn.origin.x - drawn.client.loc.x,
+            )
+        };
+        state.clock.advance(Duration::from_millis(120));
+        assert!(
+            anchored(&state).0.abs() < 1e-9,
+            "half way, the old picture stands against the right edge"
+        );
+
+        state.clock.advance(Duration::from_millis(140));
+        state.settle(state.clock.now());
+        assert!(
+            state
+                .panes
+                .get(pane)
+                .and_then(crate::present::course)
+                .is_none(),
+            "the premise: the glide has landed and its transform is gone"
+        );
+        assert_eq!(
+            state.resize_pins(pane),
+            (true, false),
+            "landed, the edge the glide pinned is still the one standing still"
+        );
+        assert!(
+            anchored(&state).0.abs() < 1e-9,
+            "and the picture has not moved: {:?}",
+            anchored(&state)
+        );
+
+        state.clock.advance(crate::resizing::PATIENCE);
+        state.settle(state.clock.now());
+        assert_eq!(state.resize_pins(pane), (false, false));
+        assert!(
+            anchored(&state).1.abs() < 1e-9,
+            "once its patience is out, the client's picture is drawn from \
+             the corner, as a window at rest is: {:?}",
+            anchored(&state)
+        );
+    }
+
     /// **And a press on a gliding window lands on the pixel under it.**
     ///
     /// `surface_under` used to map a point through `to_window_space`,
