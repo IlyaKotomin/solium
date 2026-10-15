@@ -1632,14 +1632,19 @@ fn panes(
         // which keeps subsurface offsets correct for free.
         //
         // **The same arithmetic bridges a live resize**, and that is the point
-        // rather than a coincidence: this factor is 1 in ordinary use only
-        // because the drawn rectangle is derived from the client's own size.
-        // Give the pane a rectangle the client has not agreed to yet -- which
-        // is what `pane_geometry` does while an edge is being dragged -- and
-        // this stretches the buffer the client last painted to fill it, with no
-        // second scaling path and nothing new in the element list. When the
-        // client commits the size it was asked for the two sizes are equal
-        // again and the window is pixel-exact. See `crate::resizing`.
+        // rather than a coincidence: the drawn rectangle and the client's own
+        // size agree in ordinary use only because the one is derived from the
+        // other. Give the pane a rectangle the client has not agreed to yet --
+        // which is what `pane_geometry` does while an edge is being dragged,
+        // and what a layout's glide does on every frame between two tiles --
+        // and `resize.fill` decides how the buffer the client last painted
+        // goes into it, with no second path and nothing new in the element
+        // list but the background's strips: at its own size against the edges
+        // standing still by default, cut where it is larger and the rest
+        // `resize.background` (#233), or stretched to fill under `stretch`.
+        // When the client commits the size it was asked for the two sizes are
+        // equal again and the window is pixel-exact. See `crate::resizing`
+        // and [`fit`].
         //
         // **And a tiled client that committed more than its tile is cut to
         // it, not squashed into it (#133).** `pane_geometry` caps the pane at

@@ -1121,17 +1121,18 @@ local defaults = {
         -- it was: from wherever it is drawn, as a window a layout moves
         -- glides, so pressing the key again half way turns it round where it
         -- is. The application is told its new size the moment the key is
-        -- pressed, and its last picture is stretched until it has drawn one
-        -- at that size: through the glide and after it, for a quarter of a
-        -- second past the landing at most, and then the window is shown at
-        -- the size the application has. Once it has answered the window is
-        -- drawn as it is, with nothing in between, so a game or a video can
-        -- be shown directly.
+        -- pressed, and its last picture goes into the new rectangle as
+        -- `resize.fill` above says until it has drawn one at that size:
+        -- through the glide and after it, for a quarter of a second past the
+        -- landing at most, and then the window is shown at the size the
+        -- application has. Once it has answered the window is drawn as it
+        -- is, with nothing in between, so a game or a video can be shown
+        -- directly.
         --
         -- `duration` is in milliseconds and `easing` is a curve, by name or
         -- as four numbers, as for every `motion` here (docs/animation.md).
-        -- `false` makes every change instant -- nothing is moved or
-        -- stretched, and the window is drawn as it is on the next frame --
+        -- `false` makes every change instant -- nothing is moved or held,
+        -- and the window is drawn as it is on the next frame --
         -- and `true` is the motion below again:
         --
         --     fullscreen = { animate = false },

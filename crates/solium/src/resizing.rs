@@ -23,9 +23,12 @@
 //! While a drag is live the pane's **slot** is authoritative for the window's
 //! size, and the client is catching up. The compositor draws the rectangle the
 //! user is dragging, immediately, and bridges the client's last buffer into it
-//! with the scale `render.rs` already applies to every window — see
-//! [`factor`]. When the client commits the size it was asked for the bridge is
-//! exactly 1 again and the window is pixel-exact.
+//! as `resize.fill` says ([`Fill`]): by default at its own size against the
+//! edges the drag is not moving, cut where it is larger and the rest
+//! `resize.background` where it is smaller (#233), or, under `stretch`, with
+//! the scale `render.rs` already applies to every window — see [`factor`].
+//! When the client commits the size it was asked for the two agree again and
+//! the window is pixel-exact.
 //!
 //! This is deliberately *one* of the three places issue #84 names — the
 //! `Space`, the pane's slot, the presentation frame — becoming the authority

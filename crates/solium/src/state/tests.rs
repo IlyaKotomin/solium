@@ -10704,8 +10704,8 @@ end)"#,
     /// character cells and so is a few pixels out on its very first answer
     /// and every one after it — which makes kitty, the ordinary tiled
     /// client, `declined` from the first frame of every seam drag.
-    /// `Fill::Hold` deliberately leaves an uncovered strip while a pane
-    /// grows, so what the user saw in place of their `stretch` was a band
+    /// `Fill::Hold` deliberately left an uncovered strip while a pane
+    /// grew, so what the user saw in place of their `stretch` was a band
     /// of background: a different wrong-looking frame rather than none, on
     /// the drag whose symptom is "frames with the wrong size".
     ///

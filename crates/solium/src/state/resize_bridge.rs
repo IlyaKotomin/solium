@@ -838,8 +838,8 @@ impl Solium {
     /// it was told up to a tenth of a second earlier while the pane is drawn
     /// where the pointer is, and the bridge between them is the whole of that
     /// gap — drag speed times the interval, which on an ordinary seam drag is
-    /// tens of pixels of stretch or, under `Fill::Hold`, tens of pixels of
-    /// uncovered background.
+    /// tens of pixels of uncovered background under `Fill::Anchor`, the
+    /// default since #233, or tens of pixels of stretch under `Fill::Stretch`.
     ///
     /// **Pausing before releasing is what people do**, so this is the ordinary
     /// end of a drag rather than an edge case, and it is held until the pointer

@@ -3994,7 +3994,7 @@ fn build_api(lua: &Lua) -> mlua::Result<Table> {
                         // `scene` is a real setting and its render path is
                         // real, but the only pane that has a scene to draw is
                         // one whose application has not painted yet -- so on
-                        // an ordinary window it is `hold` today, and someone
+                        // an ordinary window it is `anchor` today, and someone
                         // who chose it and saw no difference deserves to be
                         // told why rather than left doubting their config.
                         // `crate::resizing::Fill::Scene` carries the whole of
