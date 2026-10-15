@@ -206,9 +206,9 @@ impl Solium {
     /// Hold a window at the rectangle a fullscreen or maximise change has
     /// just given it -- its slot, which its client has been told -- until the
     /// client answers (#49). `lands` is when the change's glide lands:
-    /// `resizing::PATIENCE` runs from there, as a drag's runs from the
-    /// pointer letting go, so a client is never held for want of an answer
-    /// it had no time to give. A second change replaces the first's hold.
+    /// `resize.patience` runs from there, as a drag's runs from the pointer
+    /// letting go, so a client is never held for want of an answer it had no
+    /// time to give. A second change replaces the first's hold.
     /// `a_slow_client_is_held_at_its_new_rectangle_until_it_answers`,
     /// `a_client_that_never_answers_is_drawn_as_it_is_once_its_patience_runs_out`.
     pub(super) fn hold_for_answer(
@@ -227,6 +227,7 @@ impl Solium {
             slot,
             now,
             Some(lands),
+            self.resizing.patience,
         );
         self.answering.retain(|held| held.pane != pane);
         self.answering.push(crate::resizing::Held {
@@ -237,7 +238,7 @@ impl Solium {
     }
 
     /// Watch every window [`Self::answering`] holds, and end each hold when
-    /// its client answers -- or, answering nothing, `resizing::PATIENCE` after
+    /// its client answers -- or, answering nothing, `resize.patience` after
     /// its glide landed, when the client's own size wins, as it does at the
     /// end of a drag. Returns whether any is still waiting, which keeps the
     /// frames coming until the last has ended.
@@ -361,12 +362,13 @@ impl Solium {
     /// pointer has hold of, and for a pane merely pushed aside is neither. See
     /// [`crate::resizing::moved_edges`]. Any other pane answers with the edges
     /// its glide does not move, from the glide's two ends (#233,
-    /// [`crate::resizing::pins`]) -- and for `resizing::PATIENCE` after the
+    /// [`crate::resizing::pins`]) -- and for `resize.patience` after the
     /// glide lands, so a client slower than the glide is not moved to the
     /// corner the moment it lands ([`crate::present::landed_course`]) -- and a
     /// pane at rest with none.
     /// `a_glide_that_shrinks_a_window_draws_its_answer_at_its_own_size`,
-    /// `a_glide_that_lands_before_its_client_answers_keeps_its_picture_where_it_was`.
+    /// `a_glide_that_lands_before_its_client_answers_keeps_its_picture_where_it_was`,
+    /// `a_longer_patience_keeps_a_landed_glides_picture_where_it_was_for_longer`.
     pub(crate) fn resize_pins(&self, pane: crate::pane::PaneId) -> (bool, bool) {
         if let Some(hold) = self.held_hold(pane) {
             return hold.pins();
@@ -375,7 +377,7 @@ impl Solium {
             .get(pane)
             .and_then(|held| {
                 crate::present::course(held).or_else(|| {
-                    crate::present::landed_course(held, self.clock.now(), crate::resizing::PATIENCE)
+                    crate::present::landed_course(held, self.clock.now(), self.resizing.patience)
                 })
             })
             .map_or((false, false), |(from, to)| crate::resizing::pins(from, to))
@@ -697,7 +699,14 @@ impl Solium {
                     }
                     None => {
                         size_window(&request.window, client);
-                        crate::resizing::Hold::new(request.edges, size, client, now, released)
+                        crate::resizing::Hold::new(
+                            request.edges,
+                            size,
+                            client,
+                            now,
+                            released,
+                            self.resizing.patience,
+                        )
                     }
                 };
                 self.resize_hold = Some(crate::resizing::Held {

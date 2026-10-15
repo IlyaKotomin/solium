@@ -687,11 +687,15 @@ function sol.client_sizes(options) end
 ---resized before its application painted, and is `"anchor"` elsewhere.
 ---`background`: `"#rrggbb"`, `"#rrggbbaa"` or `"none"`, what shows where the
 ---picture does not reach (default `"#1c1c1c"`). Another value is logged and
----the default kept. Each call sets both, a key left out at its default.
----`init.lua` calls this with `config.resize`, and `modes.lua` again with a
----mode's own fill from `config.resize.modes` whenever the mode changes, when
----that table names any mode.
----@param options? { fill?: "anchor"|"crop"|"stretch"|"scene", background?: string }
+---the default kept. `patience`: how long, in milliseconds from 0 to 5000, a
+---picture waits for its application once a change is over -- after a drag's
+---release, a fullscreen or maximise glide's landing, or a layout glide's
+---landing, while it stays against the edges the glide did not move (default
+---250). Each call sets all three, a key left out at its default. `init.lua`
+---calls this with `config.resize`, and `modes.lua` again with a mode's own
+---fill from `config.resize.modes` whenever the mode changes, when that table
+---names any mode.
+---@param options? { fill?: "anchor"|"crop"|"stretch"|"scene", background?: string, patience?: number }
 ---@return nil
 function sol.resize(options) end
 

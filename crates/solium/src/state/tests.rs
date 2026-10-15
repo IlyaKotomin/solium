@@ -8439,6 +8439,62 @@ end)"#,
         );
     }
 
+    /// **#233: a longer `resize.patience` keeps a landed glide's picture
+    /// where it was for longer.** The glide above, landed with its client
+    /// silent, under 600 ms of patience: 400 ms past the landing -- past the
+    /// shipped quarter second -- the picture still stands against the edge
+    /// the glide pinned, and at 600 it goes to the corner.
+    #[test]
+    fn a_longer_patience_keeps_a_landed_glides_picture_where_it_was_for_longer() {
+        tiled_fixture!(display, state, conn, queue, client, qh);
+        let (window, _surface, pane, tile) = filled_tile(
+            &mut display,
+            &mut state,
+            &conn,
+            &qh,
+            &mut queue,
+            &mut client,
+        );
+        state.resizing.patience = Duration::from_millis(600);
+        let right = Rectangle::new(
+            (tile.loc.x + tile.size.w / 2, tile.loc.y).into(),
+            (tile.size.w / 2, tile.size.h).into(),
+        );
+        let start = state.clock.now();
+        glide(
+            &mut state,
+            &window,
+            right,
+            Duration::from_millis(240),
+            present::Curve::Linear,
+            start,
+        );
+        state.clock.advance(Duration::from_millis(260));
+        state.settle(state.clock.now());
+        assert!(
+            state
+                .panes
+                .get(pane)
+                .and_then(crate::present::course)
+                .is_none(),
+            "the premise: the glide has landed and its transform is gone"
+        );
+
+        state.clock.advance(Duration::from_millis(400));
+        assert_eq!(
+            state.resize_pins(pane),
+            (true, false),
+            "400 ms past the landing, within the 600 configured, the edge the \
+             glide pinned is still the one standing still"
+        );
+        state.clock.advance(Duration::from_millis(200));
+        assert_eq!(
+            state.resize_pins(pane),
+            (false, false),
+            "and at 600 the picture goes to the corner"
+        );
+    }
+
     /// **And a press on a gliding window lands on the pixel under it.**
     ///
     /// `surface_under` used to map a point through `to_window_space`,

@@ -145,7 +145,9 @@ use crate::{
 const TELL_EVERY: Duration = Duration::from_millis(100);
 
 /// How long the pane keeps the rectangle the drag ended on, waiting for the
-/// client to answer the last configure.
+/// client to answer the last configure: the shipped `resize.patience`
+/// ([`Settings::patience`]), which a fullscreen or maximise change's hold and
+/// a landed glide's pinned edges wait out as well (#233).
 ///
 /// This is the backstop for a client that answers *nothing*, which is not only
 /// the hung case: asking a client for the size it already has is a configure it
@@ -160,6 +162,12 @@ const TELL_EVERY: Duration = Duration::from_millis(100);
 /// and short enough that a client which really has hung produces one snap
 /// rather than a window stuck at the wrong size.
 pub(crate) const PATIENCE: Duration = Duration::from_millis(250);
+
+/// The most `resize.patience` may be: five seconds, past which a window is
+/// stuck at the wrong size rather than waiting for an answer, and the bound
+/// its value is validated against (0 is the least: the client's own size at
+/// once). `script::tests::the_shipped_resize_setting_reaches_the_compositor`.
+pub(crate) const PATIENCE_MAX: Duration = Duration::from_secs(5);
 
 /// How a client's picture is fitted to a rectangle it has not drawn at (#233).
 ///
@@ -330,6 +338,13 @@ pub(crate) fn background_named(name: &str) -> Option<Background> {
 pub(crate) struct Settings {
     pub(crate) fill: Fill,
     pub(crate) background: Background,
+    /// `resize.patience`: how long a picture is held at the rectangle a
+    /// change gave it, waiting for its client, once the change is over --
+    /// a drag's hold past the release, a fullscreen or maximise change's past
+    /// its landing, and a glide's pinned edges past its landing (#233). Read
+    /// by each when it is made (`Hold::new`) or asked (`Solium::resize_pins`).
+    /// [`PATIENCE`] unless configured, within `0..=PATIENCE_MAX`.
+    pub(crate) patience: Duration,
 }
 
 impl Default for Settings {
@@ -337,6 +352,7 @@ impl Default for Settings {
         Self {
             fill: Fill::default(),
             background: BACKGROUND,
+            patience: PATIENCE,
         }
     }
 }
@@ -409,8 +425,12 @@ pub(crate) struct Hold {
     asked: Rectangle<i32, Logical>,
     /// When it was sent, for [`TELL_EVERY`].
     told: Duration,
-    /// When the pointer let go, if it has. [`PATIENCE`] runs from here.
+    /// When the pointer let go, if it has. [`Self::patience`] runs from here.
     released: Option<Duration>,
+    /// How long it waits past `released` for an answer: `resize.patience`
+    /// when it was made, [`PATIENCE`] unless configured.
+    /// `tests::a_hold_waits_out_the_patience_it_was_given`.
+    patience: Duration,
     /// The last size this client was offered and did not take.
     ///
     /// **One size, and it is not a `min_size`.** The compositor reads a
@@ -564,12 +584,18 @@ impl Hold {
     /// call site that had the bug. A creation site that does not know whether
     /// its gesture is still going cannot compile, so the next one added has to
     /// answer the question rather than inherit `None` by omission.
+    ///
+    /// **`patience` is an argument for the same reason**: every creation site
+    /// says how long its hold waits once released, which outside the tests is
+    /// the configured `resize.patience` (#233), so none can wait out a
+    /// constant the user set otherwise.
     pub(crate) const fn new(
         edges: ResizeEdge,
         client: Size<i32, Logical>,
         asked: Rectangle<i32, Logical>,
         now: Duration,
         released: Option<Duration>,
+        patience: Duration,
     ) -> Self {
         Self {
             edges,
@@ -577,6 +603,7 @@ impl Hold {
             asked,
             told: now,
             released,
+            patience,
             declined: None,
             // **One, not none**, because both callers send the configure this
             // hold is built around — `offers_first_size` returns `told` true
@@ -830,8 +857,9 @@ impl Hold {
             return Settle::Adopt(client);
         }
         // Nothing at all. Give up rather than hold the space and the slot apart
-        // for ever; see [`PATIENCE`].
-        if now.saturating_sub(released) >= PATIENCE {
+        // for ever; see [`PATIENCE`], the default of the patience this hold
+        // was given.
+        if now.saturating_sub(released) >= self.patience {
             return Settle::Adopt(client);
         }
         Settle::Waiting
@@ -1244,7 +1272,7 @@ mod tests {
         asked: Rectangle<i32, Logical>,
         now: std::time::Duration,
     ) -> Hold {
-        Hold::new(edges, client, asked, now, None)
+        Hold::new(edges, client, asked, now, None, PATIENCE)
     }
 
     /// The arithmetic of issue #113, and the bridge that makes the fix
@@ -1782,6 +1810,7 @@ mod tests {
             want(380, 288),
             ms(16),
             Some(ms(12)),
+            PATIENCE,
         );
         // The client answers nothing at all, which is what the deadline is for.
         assert_eq!(hold.settle(size(400, 300), ms(20)), Settle::Waiting);
@@ -1798,6 +1827,40 @@ mod tests {
             Settle::Waiting,
             "a hold that cannot observe its own release is permanent, and a \
              permanent hold is a permanently soft window"
+        );
+    }
+
+    /// **A hold waits out the patience it was given (#233)**, which outside
+    /// these tests is `resize.patience`: given 600 ms it is still waiting
+    /// where the shipped quarter second would have let go, and lets go at
+    /// 600; given none, the client's own size wins at the release.
+    #[test]
+    fn a_hold_waits_out_the_patience_it_was_given() {
+        let released = ms(12);
+        let held = |patience| {
+            Hold::new(
+                ResizeEdge::TopLeft,
+                size(400, 300),
+                want(380, 288),
+                ms(16),
+                Some(released),
+                patience,
+            )
+        };
+        let mut longer = held(ms(600));
+        assert_eq!(
+            longer.settle(size(400, 300), released + PATIENCE),
+            Settle::Waiting,
+            "past the shipped patience, and still within the one it was given"
+        );
+        assert_eq!(
+            longer.settle(size(400, 300), released + ms(600)),
+            Settle::Adopt(size(400, 300))
+        );
+        assert_eq!(
+            held(std::time::Duration::ZERO).settle(size(400, 300), released),
+            Settle::Adopt(size(400, 300)),
+            "no patience: the client's own size at once"
         );
     }
 
@@ -1996,6 +2059,7 @@ mod tests {
             want(200, 400),
             ms(0),
             None,
+            PATIENCE,
         );
         assert_eq!(hold.pins(), (false, false));
         assert_eq!(
@@ -2040,6 +2104,7 @@ mod tests {
             want(320, 200),
             ms(0),
             Some(ms(0)),
+            PATIENCE,
         );
         // Well past the deadline: this hold would adopt on the next look.
         assert_eq!(
@@ -2054,6 +2119,7 @@ mod tests {
             want(320, 200),
             ms(0),
             Some(ms(0)),
+            PATIENCE,
         );
         hold.rearm(None);
         assert_eq!(

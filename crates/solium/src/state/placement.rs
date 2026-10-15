@@ -861,7 +861,14 @@ impl Solium {
             // from the one source that answers for a window the space has let
             // go of as well.
             None => (
-                crate::resizing::Hold::new(edges, committed, client, now, released),
+                crate::resizing::Hold::new(
+                    edges,
+                    committed,
+                    client,
+                    now,
+                    released,
+                    self.resizing.patience,
+                ),
                 true,
             ),
         };

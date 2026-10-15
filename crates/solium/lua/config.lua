@@ -1097,6 +1097,17 @@ local defaults = {
         -- Anything else is named in the log and the default kept.
         background = "#1c1c1c",
 
+        -- How long, in milliseconds, a window's picture waits at the
+        -- rectangle a change gave it for its application to draw at that
+        -- size, once the change is over: after you let go of an edge, after
+        -- a fullscreen or maximise glide lands, and after a layout's glide
+        -- lands -- when the picture stays against the edges the glide did not
+        -- move. Then the window is shown at the size the application has. 0
+        -- (do not wait) to 5000; anything else is named in the log and the
+        -- default kept.
+        -- `a_longer_patience_keeps_a_landed_glides_picture_where_it_was_for_longer`.
+        patience = 250,
+
         -- A fill of its own for a mode (the names `modes.register` uses),
         -- for every size change made while that mode is in charge: its
         -- drags, its glides, and a fullscreen glide begun in it. A mode with

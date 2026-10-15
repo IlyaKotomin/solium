@@ -4029,6 +4029,28 @@ fn build_api(lua: &Lua) -> mlua::Result<Table> {
                     ),
                 }
             }
+            // And how long a picture waits for its client once a change is
+            // over (#233): milliseconds, 0 to `resizing::PATIENCE_MAX`, under
+            // the same contract. `the_shipped_resize_setting_reaches_the_compositor`.
+            match options.get::<Value>("patience") {
+                Ok(Value::Nil) | Err(_) => {}
+                Ok(value) => {
+                    let most = crate::resizing::PATIENCE_MAX.as_secs_f64() * 1000.0;
+                    match number(&value)
+                        .filter(|millis| (0.0..=most).contains(millis))
+                        .and_then(|millis| {
+                            std::time::Duration::try_from_secs_f64(millis / 1000.0).ok()
+                        }) {
+                        Some(patience) => resize.patience = patience,
+                        None => tracing::warn!(
+                            value = describe(&value),
+                            most_ms = most,
+                            "resize.patience is a number of milliseconds from 0 to most_ms; \
+                             keeping the default"
+                        ),
+                    }
+                }
+            }
             with_pending(lua, |pending| {
                 pending.commands.push(Command::Resize(resize));
             })
@@ -9294,16 +9316,22 @@ mod tests {
     /// **The shipped `resize` setting reaches the compositor (#233)**: the
     /// default is `anchor` on `#1c1c1c`, and each key a user changes changes
     /// what the compositor is told -- a name that is not one keeps the
-    /// default, as `fill`'s always did.
+    /// default, as `fill`'s always did. `patience` is milliseconds from 0 to
+    /// `resizing::PATIENCE_MAX`, anything else keeping the quarter second.
     #[test]
     fn the_shipped_resize_setting_reaches_the_compositor() {
-        use crate::resizing::{BACKGROUND, Fill, Settings};
+        use crate::resizing::{BACKGROUND, Fill, PATIENCE, Settings};
+        let waits = |millis| Settings {
+            patience: std::time::Duration::from_millis(millis),
+            ..Settings::default()
+        };
         for (user, wanted) in [
             (
                 "return {}",
                 Settings {
                     fill: Fill::Anchor,
                     background: BACKGROUND,
+                    patience: PATIENCE,
                 },
             ),
             (
@@ -9311,6 +9339,7 @@ mod tests {
                 Settings {
                     fill: Fill::Stretch,
                     background: BACKGROUND,
+                    patience: PATIENCE,
                 },
             ),
             (
@@ -9318,6 +9347,7 @@ mod tests {
                 Settings {
                     fill: Fill::Crop,
                     background: Some([0x10, 0x20, 0x30, 0x80]),
+                    patience: PATIENCE,
                 },
             ),
             (
@@ -9325,6 +9355,7 @@ mod tests {
                 Settings {
                     fill: Fill::Anchor,
                     background: None,
+                    patience: PATIENCE,
                 },
             ),
             (
@@ -9332,8 +9363,15 @@ mod tests {
                 Settings {
                     fill: Fill::Anchor,
                     background: BACKGROUND,
+                    patience: PATIENCE,
                 },
             ),
+            ("return { resize = { patience = 600 } }", waits(600)),
+            ("return { resize = { patience = 0 } }", waits(0)),
+            ("return { resize = { patience = 5000 } }", waits(5000)),
+            ("return { resize = { patience = 5001 } }", waits(250)),
+            ("return { resize = { patience = -1 } }", waits(250)),
+            ("return { resize = { patience = \"long\" } }", waits(250)),
         ] {
             let Some((directory, mut scripts)) =
                 shipped_init_with_user("solium-script-test-resize", user)
@@ -9357,9 +9395,10 @@ mod tests {
     /// **Each mode fits a resize by its own `resize.modes` entry, or by
     /// `resize.fill`, the one for every mode (#233)**, handed over as the
     /// focus model is: once at load for the mode the session opens in, and
-    /// again at each switch, with the background beside it. A mode the table
-    /// does not name takes `fill`; a table naming no mode hands nothing over
-    /// past `init.lua`'s one call, so the shipped configuration says it once.
+    /// again at each switch, with the background and the patience beside it.
+    /// A mode the table does not name takes `fill`; a table naming no mode
+    /// hands nothing over past `init.lua`'s one call, so the shipped
+    /// configuration says it once.
     #[test]
     fn each_mode_fits_a_resize_by_its_own_fill_or_the_one_for_every_mode() {
         use crate::resizing::{BACKGROUND, Fill, Settings};
@@ -9376,6 +9415,14 @@ mod tests {
             Some(Settings {
                 fill,
                 background: BACKGROUND,
+                ..Settings::default()
+            })
+        };
+        let patient = |fill: Fill| {
+            Some(Settings {
+                fill,
+                patience: std::time::Duration::from_millis(600),
+                ..Settings::default()
             })
         };
         // At load (floating), then tiling, then scrolling.
@@ -9394,15 +9441,26 @@ mod tests {
                     Some(Settings {
                         fill: Fill::Anchor,
                         background: None,
+                        ..Settings::default()
                     }),
                     Some(Settings {
                         fill: Fill::Anchor,
                         background: None,
+                        ..Settings::default()
                     }),
                     Some(Settings {
                         fill: Fill::Stretch,
                         background: None,
+                        ..Settings::default()
                     }),
+                ],
+            ),
+            (
+                r#"{ patience = 600, modes = { tiling = "stretch" } }"#,
+                [
+                    patient(Fill::Anchor),
+                    patient(Fill::Stretch),
+                    patient(Fill::Anchor),
                 ],
             ),
             ("{}", [fill(Fill::Anchor), None, None]),

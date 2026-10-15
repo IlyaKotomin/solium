@@ -780,8 +780,8 @@ pub(crate) fn course(pane: &Pane) -> Option<(Rectangle<f64, Logical>, Rectangle<
 /// (#233): a client slower than the glide has not drawn at the new rectangle
 /// yet, and its picture has to stay against the edge it stood against through
 /// the glide, or it jumps to the corner the moment the transform is retired.
-/// `within` is `resizing::PATIENCE`, the time a drag's picture is held past
-/// its release. A transform that is still running is [`course`]'s.
+/// `within` is `resize.patience`, the time a drag's picture is held past its
+/// release. A transform that is still running is [`course`]'s.
 /// `state::tests::real_client::a_glide_that_lands_before_its_client_answers_keeps_its_picture_where_it_was`.
 pub(crate) fn landed_course(
     pane: &Pane,

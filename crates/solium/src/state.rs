@@ -861,8 +861,9 @@ pub(crate) struct Solium {
     /// change rather than by a pointer. Until then the slot is the window's
     /// rectangle, and the client's last picture is fitted into it as
     /// `resize.fill` says (#233), so a client slower than the glide is not
-    /// shown at its old size and place where the glide landed. Ended by the client's answer, or `resizing::PATIENCE`
-    /// after the glide lands, in `Self::settle`. One per pane.
+    /// shown at its old size and place where the glide landed. Ended by the
+    /// client's answer, or `resize.patience` after the glide lands, in
+    /// `Self::settle`. One per pane.
     /// `a_slow_client_is_held_at_its_new_rectangle_until_it_answers`,
     /// `a_client_that_never_answers_is_drawn_as_it_is_once_its_patience_runs_out`.
     answering: Vec<crate::resizing::Held>,
