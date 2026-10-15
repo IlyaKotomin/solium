@@ -12,6 +12,13 @@
 // Edit it like any other scene here. `program` and `waited` are set by the
 // compositor every frame; this one uses only the first.
 //
+// It is laid out at the window's own size and drawn wherever the window is,
+// scaled with it: a window zooming open, gliding to a new tile or fading out
+// draws the picture it has, and only a new size of the window itself asks Qt
+// for a new one (`render::standing_layout`). So this scene is drawn once per
+// size of its window; one whose content changes with `waited` is drawn again
+// each time that does.
+//
 // Do not try to fade this out yourself when the application arrives — the
 // compositor does it, because whether a window is see-through is a
 // presentation transform, like where it is and how big. `loading.fade` is the

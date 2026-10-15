@@ -31,7 +31,7 @@ use smithay::{
             gles::GlesRenderer,
         },
     },
-    utils::{Logical, Point, Rectangle, Transform},
+    utils::{Logical, Point, Rectangle, Size, Transform},
 };
 
 use crate::{
@@ -95,7 +95,29 @@ impl Raster {
     /// `place`, where the element goes. The element keeps `area`'s logical
     /// size, which the target's scale takes to its pixels.
     /// `tests::a_scene_in_an_xray_is_rasterised_at_its_monitors_scale`.
+    #[cfg(test)]
     pub(crate) fn of(self, area: Rectangle<i32, Logical>) -> ((i32, i32), (f64, f64)) {
+        self.over(area.size, area.to_f64())
+    }
+
+    /// [`Self::of`] for a scene laid out at `laid_out` logical pixels and
+    /// drawn over `drawn`: its size in device pixels at `scale`, and the
+    /// drawn corner in the target's physical pixels at `place`.
+    /// `ShellSurface::element_over`.
+    fn over(
+        self,
+        laid_out: Size<i32, Logical>,
+        drawn: Rectangle<f64, Logical>,
+    ) -> ((i32, i32), (f64, f64)) {
+        (
+            self.pixels(laid_out),
+            (drawn.loc.x * self.place, drawn.loc.y * self.place),
+        )
+    }
+
+    /// A scene laid out at `size` logical pixels, in device pixels at
+    /// `scale`, at least one each way: what QML is asked to rasterise.
+    pub(crate) fn pixels(self, size: Size<i32, Logical>) -> (i32, i32) {
         // In device pixels, as `Decoration::frame` does and for the same
         // reason: QML rasterises in pixels, so a scene drawn at its logical
         // size on a 2x screen is drawn at half that screen's resolution and
@@ -105,13 +127,7 @@ impl Raster {
             let scaled = (f64::from(logical) * self.scale).round() as i32;
             scaled.max(1)
         };
-        (
-            (pixels(area.size.w), pixels(area.size.h)),
-            (
-                f64::from(area.loc.x) * self.place,
-                f64::from(area.loc.y) * self.place,
-            ),
-        )
+        (pixels(size.w), pixels(size.h))
     }
 }
 
@@ -470,7 +486,31 @@ impl ShellSurface {
         alpha: f32,
         raster: Raster,
     ) -> Drawn {
-        let (size, position) = raster.of(area);
+        self.element_over(renderer, area.size, area.to_f64(), now, alpha, raster)
+    }
+
+    /// Draw the surface laid out at `laid_out` logical pixels, its picture
+    /// placed over `drawn`, at `alpha`: [`Self::element`] for a scene whose
+    /// own size is not the rectangle it is drawn over this frame. A
+    /// window's standing-in scene is laid out at the window's own size and
+    /// drawn wherever its presentation puts it, scaled with it, as its
+    /// layers are (`Decoration::layer_elements`), so a window zooming open,
+    /// gliding or fading draws the picture it has and asks Qt for no new
+    /// one; a new size is a new picture.
+    /// `render::tests::a_standing_in_scene_is_laid_out_at_its_windows_own_size`.
+    pub(crate) fn element_over(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        laid_out: Size<i32, Logical>,
+        drawn: Rectangle<f64, Logical>,
+        now: Duration,
+        alpha: f32,
+        raster: Raster,
+    ) -> Drawn {
+        let (size, position) = raster.over(laid_out, drawn);
+        #[expect(clippy::cast_possible_truncation, reason = "a scene on this screen")]
+        let drawn_size: Size<i32, Logical> =
+            (drawn.size.w.round() as i32, drawn.size.h.round() as i32).into();
         let scale = raster.scale;
 
         // Before either path, and before anything is bound: a reload builds a
@@ -493,17 +533,26 @@ impl ShellSurface {
                         scale,
                         Placement {
                             position,
-                            size: area.size,
+                            size: drawn_size,
                             alpha,
                             kind: Kind::Unspecified,
                         },
                     )
                     .map(Element::Screen),
                 Backing::Memory { .. } => this
-                    .in_memory(renderer, area, alpha, (scale, position), size)
+                    .in_memory(renderer, drawn_size, alpha, (scale, position), size)
                     .map(Element::Chrome),
             }
         })
+    }
+
+    /// Lay the scene out at `size` device pixels at `scale`, as the
+    /// software path does before it renders: a size it already has changes
+    /// nothing and leaves the scene clean. The GPU path's buffer follows the
+    /// size in `Gpu::sample` instead.
+    /// `render::tests::a_standing_in_scene_is_laid_out_at_its_windows_own_size`.
+    pub(crate) fn lay_out(&mut self, size: (i32, i32), scale: f64) {
+        self.scene.resize(size.0, size.1, scale);
     }
 
     /// The software path, unchanged: Qt rasterises into a `QImage` at
@@ -512,12 +561,12 @@ impl ShellSurface {
     fn in_memory(
         &mut self,
         renderer: &mut GlesRenderer,
-        area: Rectangle<i32, Logical>,
+        drawn: Size<i32, Logical>,
         alpha: f32,
         (scale, position): (f64, (f64, f64)),
         size: (i32, i32),
     ) -> Option<MemoryRenderBufferRenderElement<GlesRenderer>> {
-        self.scene.resize(size.0, size.1, scale);
+        self.lay_out(size, scale);
 
         let rendered = match self.scene.render() {
             Ok(rendered) => rendered,
@@ -566,10 +615,12 @@ impl ShellSurface {
             }
         }
 
-        // `src` is the whole buffer in its own pixels and `size` is the
+        // `src` is the whole buffer in its own pixels and `drawn` is the
         // logical destination, which the target's scale then takes to its
         // pixels: exactly these on a monitor, fewer in an xray cut below
-        // scale 1 (`Raster`). The position is physical, in the target.
+        // scale 1 (`Raster`), and the window's presented size for a scene
+        // standing in for one (`Self::element_over`). The position is
+        // physical, in the target.
         let source = Rectangle::from_size((f64::from(size.0), f64::from(size.1)).into());
         MemoryRenderBufferRenderElement::from_buffer(
             renderer,
@@ -577,7 +628,7 @@ impl ShellSurface {
             buffer,
             Some(alpha),
             Some(source),
-            Some(area.size),
+            Some(drawn),
             Kind::Unspecified,
         )
         .inspect_err(|err| tracing::warn!(?err, "could not upload the shell surface"))

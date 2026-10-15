@@ -4330,16 +4330,20 @@ pub(crate) fn only_layer<T>(
 /// what you are looking at there is no bar over it, and once there is, this is
 /// drawn *over* the bar as it fades. Either way it covers the window, which is
 /// what makes it the window rather than something sitting in one.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the frame's own state, and the pane, its transform and its own size"
+)]
 fn scene(
     state: &mut Solium,
     renderer: &mut GlesRenderer,
     elements: &mut Vec<Element>,
     pane: crate::pane::PaneId,
     frame: present::Frame,
+    outer: Size<i32, Logical>,
     now: std::time::Duration,
     scale: f64,
 ) {
-    let rect = frame.rect;
     let waited = state.panes.get(pane).map_or(0, |held| {
         i32::try_from(held.waited(now).as_millis()).unwrap_or(i32::MAX)
     });
@@ -4353,15 +4357,7 @@ fn scene(
             .panes
             .get(pane)
             .map_or(1.0, |held| held.scene_alpha(now, fade));
-    #[expect(clippy::cast_possible_truncation, reason = "a rect on this screen")]
-    let area = smithay::utils::Rectangle::new(
-        (rect.loc.x.round() as i32, rect.loc.y.round() as i32).into(),
-        (
-            (rect.size.w.round() as i32).max(1),
-            (rect.size.h.round() as i32).max(1),
-        )
-            .into(),
-    );
+    let (laid_out, drawn) = standing_layout(outer, &frame);
     let Some(held) = state.panes.get_mut(pane).and_then(Pane::scene_mut) else {
         return;
     };
@@ -4370,9 +4366,10 @@ fn scene(
     // path and a texture on the GPU one, and which of the two it is is its own
     // business rather than this function's.
     elements.extend(
-        held.element(
+        held.element_over(
             renderer,
-            area,
+            laid_out,
+            drawn,
             now,
             alpha,
             crate::surface::Raster::at(scale),
@@ -4390,6 +4387,25 @@ fn scene(
     // it is waiting for its application or dissolving into one, so this asks
     // for frames for as long as that lasts and not a moment longer.
     state.redraw = true;
+}
+
+/// What a pane's standing-in scene is laid out at, and where its picture is
+/// drawn: the pane's own outer size, and the rectangle its frame presents
+/// this instant, which it is scaled into.
+///
+/// **Its own size and not the presented one**, as the pane's layers are
+/// (`Decoration::layer_elements`): a window zooming open, gliding to a new
+/// tile, or fading out is drawn from the picture it has, and only a new
+/// size of the window itself is a new picture. Laid out at the presented
+/// rectangle, it was a new size on every frame of every such animation, and
+/// on the GPU a new buffer each time: what made `loading/window` the costliest
+/// scene of the 2026-10-15 TTY trace (504 renders, 3.1 ms each).
+/// `tests::a_standing_in_scene_is_laid_out_at_its_windows_own_size`.
+pub(crate) fn standing_layout(
+    outer: Size<i32, Logical>,
+    frame: &present::Frame,
+) -> (Size<i32, Logical>, Rectangle<f64, Logical>) {
+    ((outer.w.max(1), outer.h.max(1)).into(), frame.rect)
 }
 
 /// One picture to draw: which part of the desktop, at what scale, with or
@@ -5210,7 +5226,11 @@ fn panes(
                     );
                 }
                 Piece::Layers(_) | Piece::Slot(..) => (),
-                Piece::Client => scene(state, renderer, elements, pane, frame, now, scale),
+                Piece::Client => {
+                    scene(
+                        state, renderer, elements, pane, frame, outer.size, now, scale,
+                    );
+                }
             });
             continue;
         }
@@ -5229,7 +5249,9 @@ fn panes(
         // underneath is already the window, and this dissolves to reveal it
         // rather than being swapped for it.
         if state.pane_has_scene(pane) {
-            scene(state, renderer, elements, pane, frame, now, scale);
+            scene(
+                state, renderer, elements, pane, frame, outer.size, now, scale,
+            );
         }
 
         let Some(real) = state.real_geometry(&window) else {
@@ -6782,6 +6804,81 @@ pub(crate) fn ratio(drawn: f64, real: i32) -> f64 {
 pub(crate) mod tests {
     use super::{Drawn, Fit, Fitted, Painted, by_depth, fit, fitted, origin_at, ratio};
     use crate::qml::qt_test::on_the_qt_thread;
+
+    /// **A standing-in scene is laid out at its window's own size**: the
+    /// shipped loading scene, told how long it has waited on every frame as
+    /// `render::scene` tells it, is drawn once through a window zooming open
+    /// from 0.88 and once more through a glide that takes the window to a new
+    /// size, and not at all through a fade. Laid out at the presented
+    /// rectangle, as it was, every frame of the zoom and of the glide was a
+    /// new size and a new picture (on the GPU, a new buffer).
+    #[test]
+    fn a_standing_in_scene_is_laid_out_at_its_windows_own_size() {
+        use smithay::utils::{Logical, Rectangle, Size};
+        on_the_qt_thread(|| {
+            if crate::qml::on_gpu() {
+                return;
+            }
+            let mut scene = crate::surface::ShellSurface::new(
+                crate::pane::loading_source(None),
+                r#"{"program":"kitty","waited":0}"#,
+            )
+            .expect("the shipped loading scene builds");
+            let raster = crate::surface::Raster::at(1.0);
+            let mut drawn = 0;
+            let mut waited = 0;
+            // One frame of `render::scene`'s: whether it drew a new picture.
+            let mut frame = |scene: &mut crate::surface::ShellSurface,
+                             outer: Size<i32, Logical>,
+                             rect: Rectangle<f64, Logical>,
+                             opacity: f32| {
+                let mut at = crate::present::Frame::real(Rectangle::from_size(outer));
+                at.rect = rect;
+                at.opacity = opacity;
+                let (laid_out, placed) = super::standing_layout(outer, &at);
+                assert_eq!(placed, rect, "the picture is drawn where the frame is");
+                waited += 16;
+                scene.set_int("waited", waited);
+                scene.lay_out(raster.pixels(laid_out), 1.0);
+                let qt = scene.scene_for_test();
+                let fresh = qt.needs_render();
+                if fresh {
+                    let _ = qt.render();
+                }
+                u32::from(fresh)
+            };
+            let outer: Size<i32, Logical> = (400, 300).into();
+            // Zooming open about its centre, 0.88 to 1, as `open.lua` does.
+            for step in 0..=30 {
+                let zoom = 0.88 + 0.12 * f64::from(step) / 30.0;
+                let (w, h) = (400.0 * zoom, 300.0 * zoom);
+                let rect = Rectangle::new(
+                    (100.0 + (400.0 - w) / 2.0, 80.0 + (300.0 - h) / 2.0).into(),
+                    (w, h).into(),
+                );
+                drawn += frame(&mut scene, outer, rect, 1.0);
+            }
+            assert_eq!(drawn, 1, "drawn through the zoom");
+            // Its tile becomes 600 by 300: the pane has its new size at once,
+            // and the frame glides there from the old rectangle.
+            let wider: Size<i32, Logical> = (600, 300).into();
+            for step in 0..=30 {
+                let t = f64::from(step) / 30.0;
+                let rect = Rectangle::new(
+                    (100.0 - 100.0 * t, 80.0).into(),
+                    (400.0 + 200.0 * t, 300.0).into(),
+                );
+                drawn += frame(&mut scene, wider, rect, 1.0);
+            }
+            assert_eq!(drawn, 2, "drawn through the glide to a new size");
+            // And fading as its application arrives.
+            let rest = Rectangle::new((0.0, 80.0).into(), (600.0, 300.0).into());
+            for step in 0_u8..=10 {
+                drawn += frame(&mut scene, wider, rest, 1.0 - f32::from(step) / 10.0);
+            }
+            assert_eq!(drawn, 2, "drawn through the fade");
+        });
+    }
 
     /// **The shape key moves with the part's box and its radii**, and only
     /// with them: what a `depends = "shape"` state is rebuilt on.
