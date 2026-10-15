@@ -43,6 +43,14 @@
 #             without it, at effects.xray.scale 0.5 too; and a plate there
 #             from the start, its backdrop blurred in the first frame drawn,
 #             after three held to the clear colour by SOLIUM_WARM_INJECT=3
+#   motion    a clear terminal with the wallpaper (bars no two places of
+#             which look alike) blurred behind it, held away from its
+#             layout place, at six moments of a glide, and half way through
+#             a genie: every pixel of the window is the wallpaper blurred
+#             where that pixel is, and the genie with
+#             effects.xray.warped = "rest" fails the same judge; a plain
+#             blur runs no pass while it moves, a chain with a step per part
+#             runs it while it glides and not at rest
 #
 # The player is ffplay's testsrc2, or a kitty printing the time when ffplay is
 # missing.
@@ -239,6 +247,15 @@ translucent_kitty() {
     WAYLAND_DISPLAY="$socket" kitty --config NONE --title "$1" -o "background=#202028" \
         -o background_opacity=0.5 -o cursor_blink_interval=0 -o confirm_os_window_close=0 \
         -o font_size=14 sh -c "printf '\033[?25l$1\n'; exec sleep 600" >/dev/null 2>&1 &
+    echo "$!" >>"$pids"
+}
+
+# clear_kitty <title>: a terminal whose background is fully transparent and
+# which prints nothing, so all of it is what is behind it.
+clear_kitty() {
+    WAYLAND_DISPLAY="$socket" kitty --config NONE --title "$1" -o background_opacity=0 \
+        -o cursor_blink_interval=0 -o confirm_os_window_close=0 \
+        sh -c "printf '\033[?25l'; exec sleep 600" >/dev/null 2>&1 &
     echo "$!" >>"$pids"
 }
 
@@ -562,7 +579,82 @@ section_xray() {
     fi
 }
 
-all=(overlay t0 blur none fail tilt genie xray)
+# motion  a window's backdrop read where it is drawn (Task 54), over bars no
+#         two places of which look alike: held away from its layout place
+#         (super+p), at six moments of a 600 ms glide (800 px, 1.3 px a
+#         millisecond, so a walk drawn even a few milliseconds after its
+#         places were measured is pixels off the bars), and half way
+#         through a genie, every pixel of the window is the wallpaper
+#         blurred where that pixel is (the reference: the wallpaper blurred
+#         everywhere), within 6 for 95 % of them. The genie run again with
+#         warped = rest must fail the same judge. A plain blur runs no
+#         effect pass while it moves; blur-tint's tint, its step per part,
+#         runs while the window glides and not at rest.
+section_motion() {
+    local name
+    local fixtures="$root/crates/solium/tests/fixtures/effects"
+    for name in sharp ref held glide suffix genie genie-rest; do
+        local extra=() trigger="" at=6000 frames=2 interval=100
+        case "$name" in
+            sharp) extra=(NORULE=1) ;;
+            ref) extra=(REF=1) ;;
+            held) trigger=4500:super+p ;;
+            glide) extra=(GLIDE_MS=600) trigger=4500:super+m at=4560 frames=6 interval=80 ;;
+            suffix) extra=(EFFECT=blur-tint) trigger=4500:super+m at=9000 ;;
+            genie) trigger=4500:super+g ;;
+            genie-rest) extra=(WARPED=rest) trigger=4500:super+g ;;
+        esac
+        SECTION_EFFECTS="$root/crates/solium/effects/blur $fixtures/blur-tint $fixtures/kawase $fixtures/tint" \
+            SECTION_QML="$here/bars.qml" \
+            run_scene "motion-$name" motion.lua "${extra[@]}" \
+            SOLIUM_TRACE="$out/motion-$name/trace.jsonl" ${trigger:+SOLIUM_TRIGGER_AT=$trigger} \
+            SOLIUM_CAPTURE_AT="$at" SOLIUM_CAPTURE_FRAMES="$frames" SOLIUM_CAPTURE_INTERVAL="$interval" || return
+        clear_kitty effects-check-clear
+        wait_frames "$frames" || return
+        stop
+    done
+    local sharp ref each
+    sharp="$(ls "$out/motion-sharp"/f-* | head -1)"
+    ref="$(ls "$out/motion-ref"/f-* | head -1)"
+    for each in "$out"/motion-*/f-*; do
+        [[ "$(judge size "$each")" = "1600 900" ]] \
+            || { fail "motion: $each is $(judge size "$each"), not 1600x900, so nothing here can be judged"; return; }
+    done
+    local said
+    said="$(judge live "$sharp" "$(ls "$out/motion-held"/f-* | head -1)" "$ref")" \
+        && pass "motion: held away from its place, the window shows the backdrop where it is drawn ($said)" \
+        || fail "motion: held away from its place, the window shows another place's backdrop ($said)"
+    local frame moments=0
+    for frame in "$out/motion-glide"/f-*; do
+        judge differs "$sharp" "$frame" 0 0 1 1 >/dev/null || continue
+        if said="$(judge live "$sharp" "$frame" "$ref")"; then
+            moments=$((moments + 1))
+            echo "    $(basename "$frame"): $said"
+        else
+            fail "motion: gliding, $(basename "$frame") shows another place's backdrop ($said)"
+        fi
+    done
+    (( moments == 6 )) && pass "motion: gliding, all six moments show the backdrop where the window is" \
+        || fail "motion: gliding, $moments of six moments were right"
+    said="$(judge live "$sharp" "$(ls "$out/motion-genie"/f-* | head -1)" "$ref")" \
+        && pass "motion: half way through a genie, the funnel shows the backdrop under each of its pixels ($said)" \
+        || fail "motion: half way through a genie, the funnel shows another place's backdrop ($said)"
+    said="$(judge live "$sharp" "$(ls "$out/motion-genie-rest"/f-* | head -1)" "$ref")" \
+        && fail "motion: warped = rest passed the judge, so the genie's pass proves nothing ($said)" \
+        || pass "motion: warped = rest bends the resting backdrop, and the judge sees it ($said)"
+    local runs
+    read -r _ runs < <(judge trace "$out/motion-glide/trace.jsonl" effect_runs)
+    runs="${runs:-0}"
+    (( runs == 0 )) && pass "motion: a plain blur ran no effect pass while it moved" \
+        || fail "motion: a plain blur ran $runs effect passes while it moved"
+    read -r _ runs < <(judge trace "$out/motion-suffix/trace.jsonl" effect_runs)
+    runs="${runs:-0}"
+    (( runs >= 30 )) && judge quiet "$out/motion-suffix/trace.jsonl" effect_runs 1000 >/dev/null \
+        && pass "motion: blur-tint's tint re-ran $runs times while it glided, and not at rest" \
+        || fail "motion: blur-tint's tint ran $runs times, or ran at rest"
+}
+
+all=(overlay t0 blur none fail tilt genie xray motion)
 sections=("$@")
 [[ ${#sections[@]} -gt 0 ]] || sections=("${all[@]}")
 

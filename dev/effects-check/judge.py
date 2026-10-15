@@ -37,6 +37,14 @@
                                           only the clear colour (13, 13, 15) a held
                                           first frame draws; nothing when none is
   judge.py size A                         print the frame's width and height
+  judge.py live SHARP FRAME REF           of the pixels where FRAME differs from
+                                          SHARP (the wallpaper with no rule) by more
+                                          than 40 on a channel, so inside a blurred
+                                          window, print how many are within 6 of REF
+                                          (the wallpaper blurred everywhere) on every
+                                          channel; exit 0 when at least 95 % of at
+                                          least 20000 are: the window shows the
+                                          backdrop blurred where each pixel is
 
 A region number is a fraction of the frame (0..1), so a check does not depend
 on the nested window's size, or pixels when it ends in `px` (`408px`), for a
@@ -168,6 +176,18 @@ def main(argv):
                 print(path)
                 return 0
         return 1
+    if what == "live":
+        sharp, frame, ref = read(argv[2]), read(argv[3]), read(argv[4])
+        box = region(frame[0], frame[1], "0", "0", "1", "1")
+        inside = matched = 0
+        for rs, rf, rr in zip(pixels(sharp, box), pixels(frame, box), pixels(ref, box)):
+            for at in range(0, len(rf), 3):
+                if max(abs(rf[at + c] - rs[at + c]) for c in range(3)) > 40:
+                    inside += 1
+                    if max(abs(rf[at + c] - rr[at + c]) for c in range(3)) <= 6:
+                        matched += 1
+        print(f"{matched} of {inside} window pixels are the wallpaper blurred where they are")
+        return 0 if inside >= 20000 and matched * 100 >= inside * 95 else 1
     if what == "size":
         width, height, _data = read(argv[2])
         print(width, height)
