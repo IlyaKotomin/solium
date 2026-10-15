@@ -1,8 +1,8 @@
 // A 64 px black and white checker filling its surface: a wallpaper whose
-// blur is measured by its edges (judge.py edges). With `animated` set, as
-// `SOLIUM_CHECKER_PHASE=1` sets it in an FX3 section's .lua, it moves 8 px a
-// second to the left, for an animated wallpaper; the loop is two cells
-// long, so it starts again where it began.
+// blur is measured by its gradient energy (judge.py sharpness). With
+// `animated` set, as `SOLIUM_CHECKER_PHASE=1` sets it in an FX3 section's
+// .lua, it moves 8 px a second to the left, for an animated wallpaper; the
+// loop is two cells long, so it starts again where it began.
 import QtQuick
 
 Item {

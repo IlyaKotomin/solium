@@ -4215,8 +4215,12 @@ pub(crate) fn elements(
 /// script's surface is rasterised at `raster.scale`, its monitor's own
 /// even inside an xray cut (`surface::Raster`).
 /// `state::tests::real_client::reflow_on_close::stacking`'s tests show
-/// `elements` unchanged; `offscreen::xray_job` draws a cut through it
-/// (`state::tests::real_client::the_xray_rasterises_its_scenes_at_the_monitors_scale`).
+/// `elements` unchanged; `offscreen::xray_job` draws a cut through it.
+/// `state::tests::real_client::the_xray_rasterises_its_scenes_at_the_monitors_scale`
+/// pins the raster a cut hands in, not this draw, which needs a renderer:
+/// `dev/effects-check.sh xray`'s `xray-half` and `xray-half-anim` do, a
+/// scene drawn at the cut's own size rendering up to three times a pass and
+/// its still cut rebuilt on every pass.
 #[expect(
     clippy::too_many_arguments,
     reason = "the frame's own state, handed down from `elements` or an xray's job"

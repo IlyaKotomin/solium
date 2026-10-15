@@ -451,7 +451,11 @@ pub(crate) fn xray_job(
 /// hosted scene in it rasterised at the monitor's own scale, the picture the
 /// `scenes` phase rendered for the frame this pass, and only its element
 /// placed at the cut's (`surface::Raster`).
-/// `state::tests::real_client::the_xray_rasterises_its_scenes_at_the_monitors_scale`.
+/// `state::tests::real_client::the_xray_rasterises_its_scenes_at_the_monitors_scale`
+/// pins this answer; its use by `xray_job`, `render::stacked_elements` and
+/// `ShellSurface::element` needs a renderer, and `dev/effects-check.sh
+/// xray`'s `xray-half` and `xray-half-anim` pin it there (one render a pass,
+/// a still cut built once).
 pub(crate) fn xray_raster(
     state: &Solium,
     output: &smithay::output::Output,
