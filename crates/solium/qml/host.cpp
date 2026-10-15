@@ -2722,6 +2722,21 @@ extern "C" int solium_qml_scene_get_bool(const SoliumQmlScene *scene, const char
     return QQmlProperty(scene->object, QString::fromUtf8(name)).read().toBool() ? 1 : 0;
 }
 
+extern "C" double solium_qml_scene_get_real(const SoliumQmlScene *scene, const char *name,
+                                            double fallback)
+{
+    if (scene == nullptr || scene->object == nullptr || name == nullptr) {
+        return fallback;
+    }
+    const QQmlProperty property(scene->object, QString::fromUtf8(name));
+    if (!property.isValid()) {
+        return fallback;
+    }
+    bool ok = false;
+    const double value = property.read().toDouble(&ok);
+    return ok ? value : fallback;
+}
+
 /* The Layer children of a PaneStyle, in declaration order.
  *
  * `default property list<Item> layers` becomes a QQmlListProperty in the

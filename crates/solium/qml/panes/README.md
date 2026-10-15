@@ -101,6 +101,7 @@ that; one already left bare stays bare until it is opened again.
 | `source` | a QML file in this folder, when the content is not inline |
 | `name` | for diagnostics: which layer a warning is about |
 | `dormant` | `true` while the layer has nothing to draw. False unless bound. Read on an inline layer's `Layer`; a layer with `source:` declares `property bool dormant` on its own file's root instead, and one written on its `Layer` is ignored. See "What it costs" |
+| `layerOpacity` | how opaque the compositor draws the layer's picture, from 0 to 1, over the window's own opacity; 1 when not declared. Applied as the layer is composited, so animating it draws no new picture: a fade by it is one blend per frame and nothing of Qt's, where a fade of an item's `opacity` draws the whole layer again on every frame of it. An inline layer binds it on its `Layer`; a delegated layer declares `property real layerOpacity` on its own root |
 
 Content is written inline or delegated with `source:`, and the syntax does not
 change between the two. Each layer is rasterised into a scene of its own and

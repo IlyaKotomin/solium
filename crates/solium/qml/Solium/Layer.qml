@@ -67,4 +67,13 @@ Item {
     // `property bool dormant` on its own file's root instead, as it declares
     // `onButton`.
     property bool dormant: false
+
+    // How opaque the compositor draws this layer's picture, from 0 to 1:
+    // applied as it composites the picture, over the window's own opacity,
+    // so animating it draws no new picture -- a fade by it costs a blend at
+    // another alpha per frame, and nothing of Qt's. 1 unless bound. A
+    // delegated layer declares `property real layerOpacity` on its own root
+    // instead, as it declares `dormant`.
+    // `decoration::tests::a_layer_fading_by_its_opacity_draws_no_new_picture`.
+    property real layerOpacity: 1
 }

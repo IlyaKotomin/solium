@@ -154,6 +154,11 @@ mod ffi {
             value: c_int,
         );
         pub(super) fn solium_qml_scene_get_bool(scene: *const Scene, name: *const c_char) -> c_int;
+        pub(super) fn solium_qml_scene_get_real(
+            scene: *const Scene,
+            name: *const c_char,
+            fallback: f64,
+        ) -> f64;
         pub(super) fn solium_qml_scene_layer_count(scene: *const Scene) -> c_int;
         pub(super) fn solium_qml_scene_layer_field(
             scene: *const Scene,
@@ -1659,6 +1664,18 @@ impl Scene {
         };
         // SAFETY: `name` outlives the call.
         unsafe { ffi::solium_qml_scene_get_bool(self.scene, name.as_ptr()) != 0 }
+    }
+
+    /// Read a number property QML owns, or `fallback` when the scene has no
+    /// property by that path. Path-aware, as [`Self::get_int`] is.
+    /// `decoration::tests::a_layers_opacity_is_its_roots_and_one_when_it_has_none`.
+    #[expect(unsafe_code, reason = "calling into the Qt host")]
+    pub(crate) fn get_real(&self, name: &str, fallback: f64) -> f64 {
+        let Ok(name) = CString::new(name) else {
+            return fallback;
+        };
+        // SAFETY: `name` outlives the call.
+        unsafe { ffi::solium_qml_scene_get_real(self.scene, name.as_ptr(), fallback) }
     }
 
     /// Watch `fd` from inside Qt, with a `QSocketNotifier` this scene owns:

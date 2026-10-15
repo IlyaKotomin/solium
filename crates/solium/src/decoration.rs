@@ -821,7 +821,11 @@ impl Decoration {
                     spread.drawn.loc.y * drawing.scale,
                 ),
                 size: drawn_size,
-                alpha: drawing.alpha,
+                // The window's opacity, and the layer's own on top of it,
+                // applied here rather than drawn by Qt: a layer fading by
+                // `layerOpacity` is blended at a new alpha and not drawn again
+                // (`tests::a_layer_fading_by_its_opacity_draws_no_new_picture`).
+                alpha: drawing.alpha * layer.opacity(),
                 kind: Kind::Unspecified,
             };
             let drawn = layer.element(renderer, insets, size, placement, drawing.scale);
@@ -1136,6 +1140,15 @@ impl Decoration {
         self.tell(look, width, height);
     }
 
+    /// Every layer's `layerOpacity` now, by name: how opaque the next frame
+    /// composites its picture ([`LayerScene::opacity`]).
+    pub(crate) fn layer_opacities(&self) -> Vec<(String, f32)> {
+        self.layers
+            .iter()
+            .map(|layer| (layer.name.clone(), layer.opacity()))
+            .collect()
+    }
+
     /// The name of every layer whose scene says it is `dormant` now: what
     /// [`awake_at`] would leave out of the next frame.
     pub(crate) fn dormant_layers(&self) -> Vec<String> {
@@ -1387,6 +1400,24 @@ impl LayerScene {
             buffer_size: (0, 0),
             asleep: false,
         })
+    }
+
+    /// How opaque the compositor draws this layer's picture: its root's
+    /// `layerOpacity`, 0 to 1, and 1 for a root that declares none. Applied
+    /// as the layer is composited, over the window's own opacity, so a layer
+    /// that fades by it draws no new picture while it fades: the picture Qt
+    /// drew last is blended at another alpha. Read every frame, as `dormant`
+    /// is; a number out of range is clamped, and one that is not a number
+    /// reads 1. `tests::a_layers_opacity_is_its_roots_and_one_when_it_has_none`,
+    /// `tests::a_layer_fading_by_its_opacity_draws_no_new_picture`.
+    fn opacity(&self) -> f32 {
+        let read = self.scene.get_real("layerOpacity", 1.0);
+        if read.is_nan() {
+            return 1.0;
+        }
+        #[expect(clippy::cast_possible_truncation, reason = "an alpha, clamped to 0..1")]
+        let alpha = read.clamp(0.0, 1.0) as f32;
+        alpha
     }
 
     /// Whether this layer has nothing to draw this frame, as its root's
@@ -5256,6 +5287,167 @@ mod tests {
                     "{name}: a piece is no longer bound to the room it has"
                 );
             }
+        });
+    }
+
+    /// Run QML's clock `ms` on from a moment of this test's own, a frame at a
+    /// time, as a compositor's frames run it (`scenario`'s player does the
+    /// same).
+    fn run_qml_clock(clock: &mut std::time::Duration, ms: u64) {
+        use std::time::Duration;
+        let until = *clock + Duration::from_millis(ms);
+        while *clock < until {
+            std::thread::sleep(Duration::from_millis(16));
+            *clock += Duration::from_millis(16);
+            crate::qml::tick(*clock);
+        }
+    }
+
+    /// What `Decoration::tell` is handed by a frame, focused or not.
+    fn look_with(values: &Values, focused: bool) -> Look<'_> {
+        Look {
+            title: "terminal",
+            app_id: "",
+            focused,
+            pointer_inside: false,
+            caret: None,
+            values,
+        }
+    }
+
+    /// **A layer's opacity is its root's `layerOpacity`, and 1 when it has
+    /// none**: a delegated layer's own, an inline layer's through
+    /// `PaneStyle`, clamped to 0..1, and 1 for a root that never says.
+    #[test]
+    fn a_layers_opacity_is_its_roots_and_one_when_it_has_none() {
+        on_the_qt_thread(|| {
+            let dir = fixture(
+                "layer-opacity",
+                &[
+                    (
+                        "Pane.qml",
+                        r#"
+                        import QtQuick
+                        import Solium
+
+                        PaneStyle {
+                            Layer { depth: "frame"; name: "quarter"; source: "Quarter.qml" }
+                            Layer { depth: "above"; name: "half"; layerOpacity: 0.5; Item {} }
+                            Layer { depth: "above"; name: "over"; layerOpacity: 2; Item {} }
+                            Layer { depth: "behind"; name: "plain"; source: "Plain.qml" }
+                        }
+                        "#,
+                    ),
+                    (
+                        "Quarter.qml",
+                        "import QtQuick\nItem { property real layerOpacity: 0.25 }\n",
+                    ),
+                    ("Plain.qml", "import QtQuick\nItem {}\n"),
+                ],
+            );
+            let style = crate::style::load(&dir).expect("the fixture loads");
+            let decoration = Decoration::from_style(&style, 60, 88).expect("four scenes");
+            let seen: Vec<(String, f32)> = decoration.layer_opacities();
+            assert_eq!(
+                seen,
+                [
+                    ("quarter".to_owned(), 0.25),
+                    ("half".to_owned(), 0.5),
+                    ("over".to_owned(), 1.0),
+                    ("plain".to_owned(), 1.0),
+                ]
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// **A layer fading by its opacity draws no new picture**: while a
+    /// `Behavior` takes `layerOpacity` from 1 to 0 the scene is never dirty,
+    /// though it animates and its opacity falls on every frame, so the
+    /// compositor blends the picture it has at each new alpha. The control,
+    /// the same fade on its `Item.opacity`, is dirty on its frames: what
+    /// this would read if the fade were drawn by Qt.
+    #[test]
+    fn a_layer_fading_by_its_opacity_draws_no_new_picture() {
+        on_the_qt_thread(|| {
+            if crate::qml::on_gpu() {
+                return;
+            }
+            const BY_LAYER: &str = r##"
+                import QtQuick
+
+                Item {
+                    property bool focused: false
+                    property real layerOpacity: focused ? 0 : 1
+                    Behavior on layerOpacity { NumberAnimation { duration: 160 } }
+                    Rectangle { anchors.fill: parent; color: "#ff0000" }
+                }
+            "##;
+            const BY_ITEM: &str = r##"
+                import QtQuick
+
+                Item {
+                    property bool focused: false
+                    opacity: focused ? 0 : 1
+                    Behavior on opacity { NumberAnimation { duration: 160 } }
+                    Rectangle { anchors.fill: parent; color: "#ff0000" }
+                }
+            "##;
+            let dir = fixture(
+                "layer-opacity-fade",
+                &[
+                    (
+                        "Pane.qml",
+                        r#"
+                        import QtQuick
+                        import Solium
+
+                        PaneStyle {
+                            Layer { depth: "above"; name: "layer"; source: "ByLayer.qml" }
+                            Layer { depth: "above"; name: "item"; source: "ByItem.qml" }
+                        }
+                        "#,
+                    ),
+                    ("ByLayer.qml", BY_LAYER),
+                    ("ByItem.qml", BY_ITEM),
+                ],
+            );
+            let style = crate::style::load(&dir).expect("the fixture loads");
+            let mut decoration = Decoration::from_style(&style, 60, 88).expect("two scenes");
+            let values = Values::default();
+            let mut clock = std::time::Duration::from_secs(5_000_000);
+            for layer in &mut decoration.layers {
+                let _ = layer.scene.render();
+            }
+            decoration.tell(&look_with(&values, true), 60, 88);
+            let (mut drawn_layer, mut drawn_item, mut seen) = (0, 0, Vec::new());
+            for _ in 0..16 {
+                run_qml_clock(&mut clock, 16);
+                let [layer, item] = &mut decoration.layers[..] else {
+                    panic!("two layers")
+                };
+                if layer.scene.needs_render() {
+                    drawn_layer += 1;
+                    let _ = layer.scene.render();
+                }
+                if item.scene.needs_render() {
+                    drawn_item += 1;
+                    let _ = item.scene.render();
+                }
+                seen.push(layer.opacity());
+            }
+            assert_eq!(drawn_layer, 0, "a fade by layerOpacity drew a new picture");
+            assert!(
+                drawn_item >= 4,
+                "the control drew {drawn_item}: the count reads nothing"
+            );
+            assert!(
+                seen.iter().any(|alpha| *alpha > 0.05 && *alpha < 0.95)
+                    && seen.windows(2).all(|pair| pair[1] <= pair[0])
+                    && seen.last().is_some_and(|alpha| *alpha == 0.0),
+                "the opacity did not fall from 1 to 0 through the frames: {seen:?}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
         });
     }
 }

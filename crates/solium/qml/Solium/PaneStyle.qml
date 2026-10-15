@@ -227,6 +227,16 @@ Item {
         && style.layerIndex < style.layers.length
         && style.layers[style.layerIndex].dormant === true
 
+    // The `layerOpacity` of the inline layer this scene draws, at the root
+    // where the compositor reads it: how opaque it draws the layer's
+    // picture, applied as it composites it, so a fade by it draws no new
+    // picture (`Layer.qml`). 1 in a manifest.
+    // `decoration::tests::a_layers_opacity_is_its_roots_and_one_when_it_has_none`.
+    readonly property real layerOpacity: style.layerIndex >= 0
+        && style.layerIndex < style.layers.length
+        && typeof style.layers[style.layerIndex].layerOpacity === "number"
+        ? style.layers[style.layerIndex].layerOpacity : 1
+
     Component.onCompleted: style.showOneLayer()
     onLayerIndexChanged: style.showOneLayer()
 

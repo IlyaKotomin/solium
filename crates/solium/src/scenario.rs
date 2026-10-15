@@ -60,7 +60,9 @@
 //! would report: `key`, and the `meant` it suggests); or, on the Qt thread,
 //! `pixel(layer, x, y)`, the frame's layer of that name rendered, answering
 //! `r, g, b, a` -- the scene is the layer `"scene"` -- and `dormant`, `true`
-//! by the name of each of the frame's layers that says it is dormant now.
+//! by the name of each of the frame's layers that says it is dormant now, and
+//! `opacity`, each layer's `layerOpacity` by its name: how opaque the next
+//! frame composites the picture `pixel` reads.
 //! `tests::every_scenario_with_a_client_passes`,
 //! `tests::every_scenario_on_the_qt_thread_passes`.
 
@@ -528,9 +530,18 @@ fn on_the_qt_thread(path: &Path) {
                     Ok((read[2], read[1], read[0], read[3]))
                 })
                 .expect("pixel");
+            let opacity = lua.create_table().expect("a table");
+            for (name, alpha) in decoration
+                .as_ref()
+                .map(|(built, _)| built.layer_opacities())
+                .unwrap_or_default()
+            {
+                opacity.set(name, alpha).expect("a layer's opacity");
+            }
             let world = lua.create_table().expect("a table");
             world.set("pixel", pixel).expect("pixel");
             world.set("dormant", dormant).expect("dormant");
+            world.set("opacity", opacity).expect("opacity");
             expect(path, index, &check, world);
         } else {
             panic!(
