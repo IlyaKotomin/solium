@@ -167,6 +167,11 @@ pub(crate) struct Programs {
     masked: Option<GlesTexProgram>,
     /// As `warp_failed`, for the masked program.
     masked_failed: bool,
+    /// What a backdrop beneath a warped pane and its capture's hole are
+    /// drawn with (`warp/gl.rs`, Ruling F37), on the same terms as `warp`.
+    beneath: Option<crate::warp::BeneathProgram>,
+    /// As `warp_failed`, for the beneath program.
+    beneath_failed: bool,
     /// Set once an effect this renderer cannot run has been named, for the
     /// same reason and on the same terms. See [`Programs::refuse`].
     refused: bool,
@@ -259,6 +264,61 @@ impl Programs {
     /// `render::elements`, which must never compile (this module's doc).
     pub(crate) fn masked_compiled(&self) -> Option<&GlesTexProgram> {
         self.masked.as_ref()
+    }
+
+    /// The beneath program (Ruling F37, amended 2026-10-14, live under
+    /// motion and warps), compiled on first use between frames and latched
+    /// (`tests::a_program_that_will_not_compile_is_tried_once`), while an
+    /// effect is wanted (`render::prepare`'s compile phase). `None` keeps a
+    /// warped pane's behind slots in its capture at rest
+    /// ([`Programs::beneath_refused`]); wirecheck's case 13i compiles and
+    /// draws it.
+    #[expect(unsafe_code, reason = "compiling the beneath program's GL")]
+    pub(crate) fn beneath(
+        &mut self,
+        renderer: &mut GlesRenderer,
+    ) -> Option<crate::warp::BeneathProgram> {
+        once(&mut self.beneath, &mut self.beneath_failed, || {
+            // SAFETY: `with_context` makes the renderer's context current, and
+            // this runs between frames (`render::prepare`).
+            match renderer.with_context(|gl| unsafe { crate::warp::BeneathProgram::compile(gl) }) {
+                Ok(Ok(program)) => Some(program),
+                Ok(Err(why)) => {
+                    tracing::warn!(
+                        why,
+                        "the beneath program did not compile; a warped window's backdrop is read where it rests"
+                    );
+                    None
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        "no context to compile the beneath program in; a warped window's backdrop is read where it rests"
+                    );
+                    None
+                }
+            }
+        })
+        .copied()
+    }
+
+    /// The beneath program if [`Programs::beneath`] has compiled it, for
+    /// `render::elements` and the captures' walk, which never compile.
+    pub(crate) fn beneath_compiled(&self) -> Option<crate::warp::BeneathProgram> {
+        self.beneath
+    }
+
+    /// Whether the warp's program failed to compile, for good: a warped
+    /// pane is then drawn flat, so nothing is placed beneath it
+    /// (`render::measured`).
+    pub(crate) fn warp_refused(&self) -> bool {
+        self.warp_failed
+    }
+
+    /// Whether the beneath program failed to compile, for good: every
+    /// warped slot then stays in its capture at rest (`render::measured`).
+    pub(crate) fn beneath_refused(&self) -> bool {
+        self.beneath_failed
     }
 
     /// Say, once, that a style declares an effect this renderer cannot run.

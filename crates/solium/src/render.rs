@@ -100,6 +100,13 @@ render_elements! {
     /// An effect's result in its slot, cut by its part's mask. See
     /// `crate::effect::element`.
     Effect = crate::effect::element::EffectElement,
+    /// A slot's backdrop drawn beneath a warped pane through its mesh, each
+    /// fragment reading it where it is on the monitor (Ruling F37). See
+    /// `crate::effect::beneath`.
+    Beneath = crate::effect::beneath::Beneath,
+    /// The hole a warped pane's capture keeps where a slot is drawn beneath
+    /// the warp. See `crate::effect::beneath`.
+    Hole = crate::effect::beneath::Hole,
 }
 
 /// The two questions that together mean "will a later frame differ from this
@@ -278,6 +285,11 @@ pub(crate) struct Prepared {
     /// `SOLIUM_WARM_INJECT=3`, finds its first three frames only the clear
     /// colour and the fourth drawn, the plate's backdrop already blurred.
     pub(crate) held: bool,
+    /// The pass's one instant ([`Presented::at`]), which [`elements`] walks
+    /// at, so every output and screencopy draws where the T2 places were
+    /// measured (amended 2026-10-14, live under motion and warps).
+    /// `tests::the_walk_draws_at_the_passs_instant`.
+    pub(crate) now: Option<std::time::Duration>,
 }
 
 /// One warp `prepare` made: the capture drawn through it, the program, the id
@@ -294,6 +306,9 @@ pub(crate) struct Warped {
     commit: CommitCounter,
     part: crate::warp::UnitRect,
     grid: Option<crate::warp::Grid>,
+    /// The slots drawn beneath it, on every monitor, in its capture's
+    /// order ([`unders`]); none for its popups' warp.
+    under: Vec<crate::effect::beneath::Under>,
 }
 
 /// What a warp's mesh is a function of, in global space, so one comparison
@@ -455,8 +470,9 @@ pub(crate) fn plan_warp(
     pane: crate::pane::PaneId,
     outer: Rectangle<i32, Logical>,
     scale: f64,
+    now: std::time::Duration,
 ) -> Planned {
-    let Some((frame, aimed)) = warp_of(state, pane, outer) else {
+    let Some((frame, aimed)) = warp_of(state, pane, outer, now) else {
         return Planned::Flat;
     };
     let Some(aimed) = aimed else {
@@ -665,14 +681,15 @@ pub(crate) fn route(warped: bool, program: bool) -> Route {
 /// The anchor is resolved here, and not merely tested for presence: a deform
 /// aimed at a pane that has closed draws flat, and capturing a texture for it
 /// would be a megabyte a frame spent on a warp that `elements` has already
-/// decided not to do.
+/// decided not to do. At `now`, the pass's one instant ([`plan_warps`]).
 /// `state::tests::real_client::a_fullscreen_window_with_no_rule_takes_todays_path`.
 pub(crate) fn warp_of(
     state: &Solium,
     pane: crate::pane::PaneId,
     outer: Rectangle<i32, Logical>,
+    now: std::time::Duration,
 ) -> Option<(present::Frame, Option<present::Aimed>)> {
-    let frame = state.drawn(pane, outer);
+    let frame = state.drawn_id_at(pane, outer, now);
     let aimed = state.aimed_at_for(pane, frame.deform);
     (!frame.matrix.is_identity() || aimed.is_some()).then_some((frame, aimed))
 }
@@ -690,7 +707,83 @@ pub(crate) fn wants_warp(state: &Solium, pane: crate::pane::PaneId) -> bool {
         .get(pane)
         .and_then(crate::pane::Pane::client)
         .and_then(|window| state.outer_geometry(window))
-        .is_some_and(|outer| warp_of(state, pane, outer).is_some())
+        .is_some_and(|outer| warp_of(state, pane, outer, state.clock.now()).is_some())
+}
+
+/// The pass's warp plans, one per pane on screen and shown, made once in
+/// `resolve` before `record_boxes` ([`plan_warps`]), so a warped pane's
+/// behind slots are placed on the mesh it is drawn through this pass; the
+/// `warps` phase takes each one instead of planning again (Ruling F31,
+/// amended 2026-10-14, live under motion and warps).
+/// `state::tests::real_client::a_warped_panes_behind_slot_is_drawn_beneath_its_warp`.
+#[derive(Debug, Default)]
+pub(crate) struct Presented {
+    planned: std::collections::HashMap<crate::pane::PaneId, Planned>,
+    /// The pass's one instant, read once at the top of [`plan_warps`]: what
+    /// the warps, the T2 places and the walk are all measured at (amended
+    /// 2026-10-14, live under motion and warps).
+    /// `state::tests::real_client::a_gliding_windows_t2_place_is_measured_at_the_passs_instant`.
+    at: Option<std::time::Duration>,
+}
+
+impl Presented {
+    /// `state::tests::real_client::a_warped_panes_behind_slot_is_drawn_beneath_its_warp`.
+    pub(crate) fn get(&self, pane: crate::pane::PaneId) -> Option<&Planned> {
+        self.planned.get(&pane)
+    }
+
+    /// The plan the `warps` phase draws: taken, made once a pass.
+    pub(crate) fn take(&mut self, pane: crate::pane::PaneId) -> Option<Planned> {
+        self.planned.remove(&pane)
+    }
+
+    /// `state::tests::real_client::a_gliding_windows_t2_place_is_measured_at_the_passs_instant`.
+    pub(crate) fn at(&self) -> Option<std::time::Duration> {
+        self.at
+    }
+}
+
+/// The instant this pass is measured at: the one [`plan_warps`] read, or
+/// the clock for a caller before any pass (a test calling a phase alone).
+pub(crate) fn pass_now(state: &Solium) -> std::time::Duration {
+    state.presented.at().unwrap_or_else(|| state.clock.now())
+}
+
+/// The instant the walk draws at: the pass's, when `prepare` made the
+/// `Prepared` it is handed, else the clock.
+/// `tests::the_walk_draws_at_the_passs_instant`.
+pub(crate) fn walk_instant(
+    pass: Option<std::time::Duration>,
+    clock: std::time::Duration,
+) -> std::time::Duration {
+    pass.unwrap_or(clock)
+}
+
+/// Plan every warp of the pass, as `warps` planned them: the same panes
+/// (on screen, with a client and an outer rectangle, `shown`), the same
+/// rectangle and scale, the same `plan_warp`, once each, all at the one
+/// instant read here. A refusal is still said once and counted once a pass
+/// (`state::tests::real_client::a_present_refused_for_its_popups_alone_is_said_once`).
+/// `state::tests::real_client::a_warped_panes_behind_slot_is_drawn_beneath_its_warp`,
+/// `state::tests::real_client::a_gliding_windows_t2_place_is_measured_at_the_passs_instant`.
+pub(crate) fn plan_warps(state: &mut Solium) {
+    let now = state.clock.now();
+    let mut planned = std::collections::HashMap::new();
+    for (pane, window) in state.on_screen() {
+        let Some(window) = window else { continue };
+        let Some(outer) = state.outer_geometry(&window) else {
+            continue;
+        };
+        if !shown(state, pane) {
+            continue;
+        }
+        let scale = state.scale_of(outer);
+        planned.insert(pane, plan_warp(state, pane, outer, scale, now));
+    }
+    state.presented = Presented {
+        planned,
+        at: Some(now),
+    };
 }
 
 impl Prepared {
@@ -736,13 +829,15 @@ pub(crate) fn note_formats(state: &mut Solium, found: crate::pool::Formats) {
 /// (`tests::a_style_with_a_radius_is_drawn_inline`).
 ///
 /// Must run before the backend binds its own buffer; see [`Prepared`].
-/// Note on the clock: this walk calls [`Solium::drawn`], which samples the
-/// clock per pane — the very thing that function's own doc now tells a
-/// multi-pane caller not to do. It is left as it was, deliberately: `prepare`
-/// decides what to **capture**, and a capture is keyed on a window and a size,
-/// neither of which a few microseconds of skew can change. `elements` was the
-/// caller where the skew was visible, and that is the one that was fixed. A
-/// drive-by change here would be churn.
+/// Note on the clock: the pass reads it **once**, at the top of `resolve`
+/// ([`plan_warps`]), and everything of the pass is measured at that instant:
+/// the warps' plans, the T2 places ([`measured`]) and the walk, which
+/// `elements` makes at [`Prepared::now`] however much later it runs
+/// (amended 2026-10-14, live under motion and warps). A T2 place measured
+/// at one instant and walked at another would leave a gliding window's
+/// backdrop behind it by its speed times `prepare`'s own time.
+/// `state::tests::real_client::a_gliding_windows_t2_place_is_measured_at_the_passs_instant`,
+/// `tests::the_walk_draws_at_the_passs_instant`.
 pub(crate) fn prepare(state: &mut Solium, renderer: &mut GlesRenderer) -> Prepared {
     // Everything here is the compositor's own work, ahead of any output, apart
     // from the tick below — which is entirely Qt's and is measured separately
@@ -816,6 +911,7 @@ pub(crate) fn prepare(state: &mut Solium, renderer: &mut GlesRenderer) -> Prepar
         hidden,
         slots,
         held,
+        now: state.presented.at(),
     }
 }
 
@@ -849,9 +945,10 @@ pub(crate) trait Phases {
     /// Compile what the host was asked for, probe the formats, compile
     /// `Programs::masked` when an effect is wanted (Ruling 7, spec C14).
     fn compile(&mut self);
-    /// Resolve the slots once this pass ([`build_slots`] over the panes a
-    /// monitor shows), record their boxes and T2 places ([`record_boxes`]),
-    /// and want each T2 place's cut and memos ([`want_t2`]).
+    /// Plan the pass's warps at its one instant ([`plan_warps`]), resolve
+    /// the slots once this pass ([`build_slots`] over the panes a monitor
+    /// shows), record their boxes and T2 places ([`record_boxes`], on the
+    /// warps' meshes), and want each T2 place's cut and memos ([`want_t2`]).
     fn resolve(&mut self) -> Slots;
     /// Render every hosted scene instance this pass needs as pixels before
     /// `elements`, at the size and scale `elements` will ask for, so
@@ -948,10 +1045,21 @@ impl Phases for Gpu<'_> {
         // nothing with none (spec §8.4,
         // `effect::host::tests::an_empty_host_touches_no_gl`).
         let _ = state.programs.masked(renderer);
+        // And what a warped pane and a slot beneath its warp are drawn with,
+        // so a slot is never placed beneath a warp that cannot be drawn
+        // (`measured` reads their refusals; Ruling F37).
+        let _ = state.programs.warp(renderer);
+        let _ = state.programs.beneath(renderer);
     }
 
     fn resolve(&mut self) -> Slots {
         let state = &mut *self.state;
+        // The pass's warps, planned once at its one instant, first: a warped
+        // pane's behind slot is placed on the mesh it is drawn through this
+        // pass (Ruling F31, amended 2026-10-14). With no effects it is the
+        // plan `warps` made before, made earlier.
+        // `state::tests::real_client::a_warped_panes_behind_slot_is_drawn_beneath_its_warp`.
+        plan_warps(state);
         // Every rule resolved once, after the effects compiled and before any
         // job is built; nothing, and no fact gathered, with no rules (spec §8.4,
         // `state::tests::real_client::with_no_rules_no_slot_is_wanted_and_no_fact_is_gathered`).
@@ -1249,7 +1357,14 @@ impl Phases for Gpu<'_> {
             // instead of being captured for a warp that cannot be drawn:
             // `tests::a_window_whose_warp_has_no_program_is_drawn_flat`.
             let scale = state.scale_of(outer);
-            let (warp, grid) = match plan_warp(state, pane, outer, scale) {
+            // `resolve`'s plan, made at the pass's instant; planned here only
+            // for a caller with no `resolve` before it.
+            let now = pass_now(state);
+            let planned = match state.presented.take(pane) {
+                Some(planned) => planned,
+                None => plan_warp(state, pane, outer, scale, now),
+            };
+            let (warp, grid) = match planned {
                 Planned::Hidden => {
                     self.hidden.push(window);
                     release(state);
@@ -1319,11 +1434,15 @@ impl Phases for Gpu<'_> {
                     held.captures_mut().keep(kinds, pool);
                 }
                 if let Some(job) = job {
+                    // The slots its capture holes, drawn beneath its warp
+                    // (Ruling F37), read before the job is drawn or kept.
+                    let holes = holes_in(&job.elements);
                     // Already drawn from exactly this: no frame (`offscreen::kept`,
                     // `state::tests::real_client::a_capture_whose_surface_tree_has_not_committed_is_not_drawn_again`).
                     if let Some((texture, id, _commit)) = crate::offscreen::kept(state, &job) {
                         let commit =
                             warp_commit(state, pane, crate::keyed::Kind::Pane, shape, false);
+                        let under = unders(state, slots, &holes, scale, commit);
                         self.warps.push(Warped {
                             window: window.clone(),
                             texture,
@@ -1332,9 +1451,13 @@ impl Phases for Gpu<'_> {
                             commit,
                             part: crate::warp::UnitRect::WHOLE,
                             grid,
+                            under,
                         });
                     } else {
-                        jobs.push((job, Then::Warp(window.clone(), program, pane, shape, grid)));
+                        jobs.push((
+                            job,
+                            Then::Warp(window.clone(), program, pane, shape, grid, (holes, scale)),
+                        ));
                     }
                 }
                 if let Some((job, part, grid)) = over {
@@ -1349,6 +1472,7 @@ impl Phases for Gpu<'_> {
                             commit,
                             part,
                             grid,
+                            under: Vec::new(),
                         });
                     } else {
                         jobs.push((job, Then::Over(window, program, pane, shape, part, grid)));
@@ -1364,8 +1488,9 @@ impl Phases for Gpu<'_> {
         // (`tests::prepare_compiles_first_and_builds_the_warps_after_the_chains`).
         for (then, texture, id, _commit) in crate::offscreen::draw(state, renderer, jobs) {
             match then {
-                Then::Warp(window, program, pane, shape, grid) => {
+                Then::Warp(window, program, pane, shape, grid, (holes, scale)) => {
                     let commit = warp_commit(state, pane, crate::keyed::Kind::Pane, shape, true);
+                    let under = unders(state, slots, &holes, scale, commit);
                     self.warps.push(Warped {
                         window,
                         texture,
@@ -1374,6 +1499,7 @@ impl Phases for Gpu<'_> {
                         commit,
                         part: crate::warp::UnitRect::WHOLE,
                         grid,
+                        under,
                     });
                 }
                 Then::Over(window, program, pane, shape, part, grid) => {
@@ -1386,6 +1512,7 @@ impl Phases for Gpu<'_> {
                         commit,
                         part,
                         grid,
+                        under: Vec::new(),
                     });
                 }
             }
@@ -1433,13 +1560,15 @@ fn shown(state: &Solium, pane: crate::pane::PaneId) -> bool {
 /// the part of the pane they cover as well.
 #[derive(Debug)]
 enum Then {
-    /// The pane's own warp, and its grid.
+    /// The pane's own warp, its grid, and the slots its capture holes with
+    /// the capture's scale (Ruling F37).
     Warp(
         Window,
         crate::warp::Program,
         crate::pane::PaneId,
         Shape,
         Option<crate::warp::Grid>,
+        (Vec<(crate::effect::plan::Owner, Slot)>, f64),
     ),
     /// Its popups', over their part, and its grid.
     Over(
@@ -1468,6 +1597,74 @@ fn warp_commit(
         .get_mut(pane)
         .map(|held| held.captures_mut().warp_commit_for(kind, shape, redrawn))
         .unwrap_or_default()
+}
+
+/// The slots a pane's capture holes, topmost first: each `Hole` among the
+/// elements its job is drawn from (Ruling F37).
+fn holes_in(elements: &[Element]) -> Vec<(crate::effect::plan::Owner, Slot)> {
+    elements
+        .iter()
+        .filter_map(|element| match element {
+            Element::Hole(hole) => {
+                let (owner, slot) = hole.owner();
+                Some((owner.clone(), slot))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A warped pane's beneath slots on every monitor, in its capture's order:
+/// each hole's slot with its T2 texture there (`Slots::screened`), its
+/// shape in the capture's pixels at `scale`, the T2 result's per-monitor
+/// id, and a commit that moves with the warp's or a re-run
+/// (`effect::store::tests::an_unders_commit_moves_with_its_warp_or_its_rerun`).
+/// What `dev/effects-check.sh motion`'s `genie` draws beneath its funnel.
+fn unders(
+    state: &mut Solium,
+    slots: &Slots,
+    holes: &[(crate::effect::plan::Owner, Slot)],
+    scale: f64,
+    warp: CommitCounter,
+) -> Vec<crate::effect::beneath::Under> {
+    let mut unders = Vec::new();
+    for (owner, slot) in holes {
+        let crate::effect::plan::Owner::Pane(pane, _) = owner else {
+            continue;
+        };
+        let (Some(outer), Some((found, _)), Some(key), Some(boxed)) = (
+            state.pane_outer_of(*pane),
+            part_of(state, owner),
+            slots.key(owner, *slot),
+            slots.boxed(owner, *slot),
+        ) else {
+            continue;
+        };
+        let Some(rest) = part_rect(state, &found) else {
+            continue;
+        };
+        let mask = crate::effect::beneath::BeneathMask::Shape(
+            crate::effect::beneath::beneath_mask(rest, outer, boxed.radii, scale),
+        );
+        for place in slots.places(owner, *slot) {
+            let Some(screened) = slots.screened(owner, *slot, &place.monitor) else {
+                continue;
+            };
+            let t2 = state
+                .store
+                .slot_mut(owner, *slot, key)
+                .t2_mut(&place.monitor);
+            unders.push(crate::effect::beneath::Under {
+                monitor: place.monitor.clone(),
+                texture: screened.texture.clone(),
+                over: screened.over,
+                mask: mask.clone(),
+                id: t2.id.clone(),
+                commit: t2.under_commit(warp, screened.rerun),
+            });
+        }
+    }
+    unders
 }
 
 /// The effects a pane's style declares, copied out so nothing borrows the
@@ -1859,12 +2056,23 @@ pub(crate) fn record_boxes(state: &Solium, slots: &mut Slots) {
             continue;
         };
         // A T2 slot's places, one per monitor its padded box overlaps
-        // (Ruling F30), each logged as `effect slot` for the nested checks:
-        // `state::tests::real_client::a_window_across_two_monitors_has_a_t2_place_on_each`.
+        // (Ruling F30), measured where the part is drawn this pass (Ruling
+        // F37: `measured`), each logged as `effect slot` for the nested
+        // checks:
+        // `state::tests::real_client::a_window_across_two_monitors_has_a_t2_place_on_each`,
+        // `state::tests::real_client::a_gliding_windows_t2_place_follows_its_drawn_rectangle`.
         if chain.tier == crate::effect::rules::Tier::Xray
             && let Some(cut) = t2_cut(state, &owner, chain)
         {
-            let places = t2_places(state, &owner, &found, cut, scale, pad);
+            let measured = measured(state, &owner, slot, &found);
+            // Drawn beneath its pane's warp, out of the pane's capture:
+            // `state::tests::real_client::a_warped_panes_behind_slot_is_drawn_beneath_its_warp`.
+            if matches!(measured, Some(Measured::Beneath(_))) {
+                slots.set_beneath(owner.clone(), slot);
+            }
+            let places = measured.map_or_else(Vec::new, |measured| {
+                t2_places(state, &owner, &found, (cut, scale, pad), &measured, part)
+            });
             for place in &places {
                 let at = place.screen;
                 tracing::debug!(
@@ -2186,7 +2394,7 @@ pub(crate) fn run_slots(
         // (Ruling F30;
         // `state::tests::real_client::a_window_across_two_monitors_has_a_t2_place_on_each`).
         if chain.tier == Tier::Xray {
-            if run_t2(cx, pool, runner, slots, &owner, slot, key, part, &mut began) {
+            if run_t2(cx, pool, runner, slots, &owner, slot, key, &mut began) {
                 let _ = cx.chains.refuse_once(
                     key,
                     "an effect's chain failed; its part is drawn without it",
@@ -2296,11 +2504,15 @@ pub(crate) fn run_slots(
 /// its memo placed with no pass (`T2Work::Crop`), else its suffix or, over
 /// `effects.memo.budget_mib`, its whole plan run at the part's own size,
 /// reading the cut through the place's `BoxMap`, only when its `T2Key`
-/// moved and otherwise its last result placed again. A place whose cut or
-/// memo has no picture yet draws nothing this pass. Whether a run failed.
+/// moved and otherwise its last result placed again. Each place reads its
+/// own `part`, the drawn part's box where it moves (Ruling F37). A place
+/// whose cut or memo has no picture yet draws nothing this pass. A slot
+/// drawn beneath its pane's warp also leaves each place's texture for the
+/// warp's `Under`s (`Slots::set_screened`). Whether a run failed.
 /// `tests::an_empty_suffix_is_a_crop_and_a_suffix_runs`,
 /// `state::tests::real_client::a_t2_slot_with_memo_false_reruns_when_its_xray_is_redrawn`;
-/// what it draws is wirecheck 13a and 13b's (Task 45).
+/// what it draws is wirecheck 13a and 13b's (Task 45), and beneath a warp
+/// 13i's.
 #[expect(
     clippy::too_many_arguments,
     reason = "`run_slots`' own context, and the one slot it is on"
@@ -2313,7 +2525,6 @@ fn run_t2(
     owner: &crate::effect::plan::Owner,
     slot: Slot,
     rule: crate::effect::rules::RuleKey,
-    part: crate::effect::plan::PartBox,
     began: &mut bool,
 ) -> bool {
     use crate::effect::memo::MemoKey;
@@ -2339,6 +2550,7 @@ fn run_t2(
             continue;
         };
         let work = t2_work(memo, slots.shared_on(owner, slot, &place.monitor));
+        let part = place.part;
         let now = t2_key(
             cx.memos,
             cx.xrays,
@@ -2462,6 +2674,25 @@ fn run_t2(
                 }
             }
         };
+        if slots.is_beneath(owner, slot) {
+            // Drawn beneath the warp, sampled where each fragment is: a
+            // crop's whole memo spans the monitor, a run's result its box
+            // (Ruling F37). `tests::a_beneath_slot_is_a_hole_only_inside_a_capture`.
+            slots.set_screened(
+                owner.clone(),
+                slot,
+                &place.monitor,
+                crate::effect::beneath::Screened {
+                    texture: texture.clone(),
+                    over: if crop.is_some() {
+                        crate::effect::beneath::Over::Monitor
+                    } else {
+                        crate::effect::beneath::Over::Box(place.screen)
+                    },
+                    rerun,
+                },
+            );
+        }
         if let Some(ready) = t2_ready(t2, cx.masked.as_ref(), texture, rerun, part, crop) {
             slots.set_ready_on(owner.clone(), slot, &place.monitor, ready);
         }
@@ -2759,16 +2990,22 @@ fn part_rect(state: &Solium, found: &Found) -> Option<Rectangle<i32, Logical>> {
     }
 }
 
-/// The monitor a part is its own on: a pane's by its centre, a scripted
-/// surface's instance's, a layer surface's map's. What
-/// `effects.xray.straddle = "own"` keeps.
+/// The monitor a part is its own on: a pane's by its centre (where it is
+/// drawn while it moves, `moved`), a scripted surface's instance's, a layer
+/// surface's map's. What `effects.xray.straddle = "own"` keeps.
 /// `state::tests::real_client::a_window_across_two_monitors_has_a_t2_place_on_each`.
 fn own_monitor(
     state: &Solium,
     owner: &crate::effect::plan::Owner,
     found: &Found,
+    moved: Option<Rectangle<f64, Logical>>,
 ) -> Option<String> {
     use crate::effect::plan::Owner as Whose;
+    if let (Whose::Pane(..), Some(moved)) = (owner, moved) {
+        return state
+            .output_of(moved.to_i32_round())
+            .map(|output| output.name());
+    }
     match (owner, found) {
         (Whose::Surface(_, name), _) => Some(name.clone()),
         (_, Found::LayerShell(surface)) => state
@@ -2788,36 +3025,41 @@ fn own_monitor(
     }
 }
 
-/// A T2 slot's places: one per monitor its padded box (the part at rest
-/// grown by `pad` physical pixels at `scale`, its own monitor's) overlaps,
-/// or only its own monitor's under `effects.xray.straddle = "own"`. Each
-/// holds its box in the xray's pixels and in the monitor's own, which the
-/// T2 key reads.
+/// A T2 slot's places: one per monitor its padded box (the part where it
+/// is `measured`, grown by `pad` physical pixels at `scale`, its own
+/// monitor's) overlaps, or only its own monitor's under
+/// `effects.xray.straddle = "own"`. Each holds its box in the xray's pixels
+/// and in the monitor's own, which the T2 key reads, and what its run reads
+/// there: `part`, the slot's own box, at rest; anywhere else the drawn
+/// part's own pixels on that monitor, padded as the slot is, its radii
+/// scaled with the picture (Ruling F37, amended 2026-10-14).
 /// `state::tests::real_client::a_window_across_two_monitors_has_a_t2_place_on_each`,
-/// `state::tests::real_client::a_drag_finer_than_an_xray_pixel_moves_the_t2_key_at_half_scale`.
+/// `state::tests::real_client::a_drag_finer_than_an_xray_pixel_moves_the_t2_key_at_half_scale`,
+/// `state::tests::real_client::a_gliding_windows_t2_place_follows_its_drawn_rectangle`.
 fn t2_places(
     state: &Solium,
     owner: &crate::effect::plan::Owner,
     found: &Found,
-    cut: crate::effect::xray::Cut,
-    scale: f64,
-    pad: i32,
+    (cut, scale, pad): (crate::effect::xray::Cut, f64, i32),
+    measured: &Measured,
+    part: crate::effect::plan::PartBox,
 ) -> Vec<crate::effect::plan::T2Place> {
-    let Some(rect) = part_rect(state, found) else {
-        return Vec::new();
+    let (rect, zoom) = match measured {
+        Measured::Drawn(rect, zoom) => (*rect, *zoom),
+        Measured::Rest(rect) => (rect.to_f64(), 1.0),
+        Measured::Beneath(rect) => (*rect, 1.0),
     };
+    let at_rest = matches!(measured, Measured::Rest(_));
     let grow = f64::from(pad) / scale.max(f64::EPSILON);
     let padded = Rectangle::<f64, Logical>::new(
-        (f64::from(rect.loc.x) - grow, f64::from(rect.loc.y) - grow).into(),
-        (
-            f64::from(rect.size.w) + 2.0 * grow,
-            f64::from(rect.size.h) + 2.0 * grow,
-        )
-            .into(),
+        (rect.loc.x - grow, rect.loc.y - grow).into(),
+        (rect.size.w + 2.0 * grow, rect.size.h + 2.0 * grow).into(),
     );
     let only = match state.effect_settings.xray.straddle {
         crate::effect::xray::Straddle::Each => None,
-        crate::effect::xray::Straddle::Own => Some(own_monitor(state, owner, found)),
+        crate::effect::xray::Straddle::Own => {
+            Some(own_monitor(state, owner, found, (!at_rest).then_some(rect)))
+        }
     };
     let mut places = Vec::new();
     for output in state.space.outputs() {
@@ -2837,6 +3079,19 @@ fn t2_places(
         let at = output.current_scale().fractional_scale();
         let xray = crate::offscreen::xray_size(state, output);
         let (px, map, own) = crate::effect::plan::place_on(padded, geometry, at, xray);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a zoom near 1, given to GL"
+        )]
+        let read = if at_rest {
+            part
+        } else {
+            crate::effect::plan::PartBox::around(
+                rect.size.to_physical_precise_round(at),
+                pad,
+                part.radii.map(|radius| radius * zoom as f32),
+            )
+        };
         places.push(crate::effect::plan::T2Place {
             monitor,
             cut,
@@ -2844,10 +3099,202 @@ fn t2_places(
             screen: crate::effect::plan::screen_box(padded, geometry, at),
             map,
             own,
+            part: read,
         });
     }
     places.sort_by(|a, b| a.monitor.cmp(&b.monitor));
     places
+}
+
+/// Where a T2 slot's places are measured from this pass (Ruling F37,
+/// amended 2026-10-14, live under motion and warps).
+/// `state::tests::real_client::a_gliding_windows_t2_place_follows_its_drawn_rectangle`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Measured {
+    /// Where the walk draws a pane part away from its rest without a mesh,
+    /// and the zoom its picture is drawn at: through a glide, a drag, an
+    /// open, a `sol.present` rectangle.
+    Drawn(Rectangle<f64, Logical>, f64),
+    /// Where it rests ([`part_rect`], from `pane_outer`), today's place: a
+    /// part that is not a pane's, a pane drawn at rest, a warped pane's
+    /// slot kept in its capture, every warped slot under `"rest"`.
+    Rest(Rectangle<i32, Logical>),
+    /// A warped pane's behind slot drawn beneath its warp: the bounds of
+    /// the part's cells of the mesh, global logical.
+    Beneath(Rectangle<f64, Logical>),
+}
+
+/// A part's rest rectangle carried into the frame's rectangle: its offset
+/// in the pane and its size scaled by the frame's size over the pane's.
+/// `tests::a_glided_parts_box_is_where_it_is_drawn`.
+pub(crate) fn within(
+    part: Rectangle<i32, Logical>,
+    outer: Rectangle<i32, Logical>,
+    drawn: Rectangle<f64, Logical>,
+) -> Rectangle<f64, Logical> {
+    let across = drawn.size.w / f64::from(outer.size.w.max(1));
+    let down = drawn.size.h / f64::from(outer.size.h.max(1));
+    Rectangle::new(
+        (
+            drawn.loc.x + f64::from(part.loc.x - outer.loc.x) * across,
+            drawn.loc.y + f64::from(part.loc.y - outer.loc.y) * down,
+        )
+            .into(),
+        (
+            f64::from(part.size.w) * across,
+            f64::from(part.size.h) * down,
+        )
+            .into(),
+    )
+}
+
+/// Where a wanted T2 slot's places are measured: a surface or a layer
+/// surface where it is; a pane part under a warp beneath it (a behind slot
+/// under `effects.xray.warped = "drawn"`, with neither program refused by
+/// the driver, and under `straddle = "own"` only on one monitor) or at rest
+/// (any other slot, or `"rest"`); a pane part without a warp where the walk
+/// draws it ([`presented_part`]), which at rest is where it rests.
+/// `state::tests::real_client::a_gliding_windows_t2_place_follows_its_drawn_rectangle`,
+/// `state::tests::real_client::a_warped_panes_behind_slot_is_drawn_beneath_its_warp`,
+/// `state::tests::real_client::a_warped_slot_across_two_monitors_under_own_stays_in_its_capture`.
+pub(crate) fn measured(
+    state: &Solium,
+    owner: &crate::effect::plan::Owner,
+    slot: Slot,
+    found: &Found,
+) -> Option<Measured> {
+    let rest = part_rect(state, found)?;
+    let crate::effect::plan::Owner::Pane(pane, part) = owner else {
+        return Some(Measured::Rest(rest));
+    };
+    match state.presented.get(*pane) {
+        Some(Planned::Warp { frame, grid, .. }) => {
+            let beneath = state.effect_settings.xray.warped == crate::effect::xray::Warped::Drawn
+                && slot == Slot::Behind
+                && *part != PaneSlot::Popups
+                && !state.programs.warp_refused()
+                && !state.programs.beneath_refused();
+            if !beneath {
+                return Some(Measured::Rest(rest));
+            }
+            let outer = state.pane_outer_of(*pane)?;
+            let (w, h) = (
+                f64::from(outer.size.w.max(1)),
+                f64::from(outer.size.h.max(1)),
+            );
+            let unit = crate::warp::UnitRect {
+                u0: f64::from(rest.loc.x - outer.loc.x) / w,
+                v0: f64::from(rest.loc.y - outer.loc.y) / h,
+                u1: f64::from(rest.loc.x - outer.loc.x + rest.size.w) / w,
+                v1: f64::from(rest.loc.y - outer.loc.y + rest.size.h) / h,
+            };
+            let bounds = beneath_bounds(frame, grid.as_ref(), unit)?;
+            // One place cannot feed the draw beneath a second monitor, whose
+            // hole would show the screen below: under "own" a warp across
+            // monitors keeps the slot in its capture, the cheaper rule that
+            // setting asks for (amended 2026-10-14, live under motion and warps).
+            // `state::tests::real_client::a_warped_slot_across_two_monitors_under_own_stays_in_its_capture`.
+            if state.effect_settings.xray.straddle == crate::effect::xray::Straddle::Own
+                && monitors_overlapped(state, bounds) > 1
+            {
+                return Some(Measured::Rest(rest));
+            }
+            Some(Measured::Beneath(bounds))
+        }
+        _ => presented_part(state, *pane, *part, rest),
+    }
+}
+
+/// How many monitors a rectangle overlaps with a positive area, as
+/// [`t2_places`] asks of each.
+fn monitors_overlapped(state: &Solium, rect: Rectangle<f64, Logical>) -> usize {
+    state
+        .space
+        .outputs()
+        .filter_map(|output| state.space.output_geometry(output))
+        .filter(|geometry| rect.overlaps(geometry.to_f64()))
+        .count()
+}
+
+/// A pane part's bounds under a warp, global logical: with a grid (a
+/// geometry folder's mesh, a present deform) the bounds of the part's
+/// cells of it; with a matrix alone (a tilt, an open or close that warps:
+/// one cell, the pane's corners) the part's own quad, projected exactly as
+/// `warp::mesh_part` projects a part, so a titlebar's bounds are its own
+/// band and not the whole pane's box (amended 2026-10-14, live under motion
+/// and warps).
+/// `tests::a_tilted_parts_beneath_bounds_are_its_own_band`,
+/// `warp::tests::a_parts_bounds_on_a_mesh_are_its_cells`.
+pub(crate) fn beneath_bounds(
+    frame: &present::Frame,
+    grid: Option<&crate::warp::Grid>,
+    unit: crate::warp::UnitRect,
+) -> Option<Rectangle<f64, Logical>> {
+    // Global logical: a "screen" at the origin, at scale 1.
+    let origin = Rectangle::from_size((1, 1).into());
+    let bounds = match grid {
+        Some(grid) => warp_mesh_on(origin, frame, Some(grid), crate::warp::UnitRect::WHOLE, 1.0)?
+            .part_bounds(unit)?,
+        // The part's own mesh: its texture runs 0 to 1 across the part, so
+        // every one of its triangles is the part's.
+        None => warp_mesh_on(origin, frame, None, unit, 1.0)?
+            .part_bounds(crate::warp::UnitRect::WHOLE)?,
+    };
+    Some(Rectangle::new(
+        (bounds.loc.x, bounds.loc.y).into(),
+        (bounds.size.w, bounds.size.h).into(),
+    ))
+}
+
+/// A pane part where the walk draws it this pass without a mesh, from the
+/// frame `elements` draws the pane with (`state.drawn_id_at` over
+/// `pane_outer_of` at the pass's instant, the call `stacked` makes): the
+/// client and its popups through the walk's own [`place_client`], every
+/// other part carried by the frame's rectangle ([`within`]); and the zoom
+/// (the client's fit, else the frame's width over the pane's), which
+/// scales the part's radii. At rest, today's place exactly.
+/// `state::tests::real_client::a_gliding_windows_t2_place_follows_its_drawn_rectangle`,
+/// `state::tests::real_client::a_gliding_windows_t2_place_is_measured_at_the_passs_instant`.
+fn presented_part(
+    state: &Solium,
+    pane: crate::pane::PaneId,
+    part: PaneSlot,
+    rest: Rectangle<i32, Logical>,
+) -> Option<Measured> {
+    let held = state.panes.get(pane)?;
+    let outer = state.pane_outer_of(pane)?;
+    let frame = state.drawn_id_at(pane, outer, pass_now(state));
+    if frame.rect == outer.to_f64() {
+        return Some(Measured::Rest(rest));
+    }
+    let zoom = frame.rect.size.w / f64::from(outer.size.w.max(1));
+    match part {
+        PaneSlot::Client | PaneSlot::Popups => {
+            let window = held.client()?;
+            let real = state.real_geometry(window)?;
+            let placed = place_client(state, held, &frame, outer.size, real.size);
+            let rect = match part {
+                PaneSlot::Popups => {
+                    let covered = popups_covered(window)?;
+                    Rectangle::new(
+                        (
+                            placed.origin.x + f64::from(covered.loc.x) * placed.fit.factor.x,
+                            placed.origin.y + f64::from(covered.loc.y) * placed.fit.factor.y,
+                        )
+                            .into(),
+                        (
+                            f64::from(covered.size.w) * placed.fit.factor.x,
+                            f64::from(covered.size.h) * placed.fit.factor.y,
+                        )
+                            .into(),
+                    )
+                }
+                _ => placed.client,
+            };
+            Some(Measured::Drawn(rect, placed.fit.factor.x))
+        }
+        _ => Some(Measured::Drawn(within(rest, outer, frame.rect), zoom)),
+    }
 }
 
 /// After [`record_boxes`]: each T2 place's cut wanted, and its memos judged
@@ -3486,13 +3933,55 @@ fn corners_times(radii: Corners, by: f64) -> Corners {
     }
 }
 
+/// Which walk a slot is placed in: the frame's own, or a pane's capture.
+/// `tests::a_beneath_slot_is_a_hole_only_inside_a_capture`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Within {
+    Screen,
+    Capture,
+}
+
+/// What a ready slot draws in a walk.
+/// `tests::a_beneath_slot_is_a_hole_only_inside_a_capture`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SlotDraw {
+    /// Its result, over its part.
+    Result,
+    /// A hole in its part's shape: the slot is drawn beneath the pane's
+    /// warp, and what the pane's lower layers drew there is taken out.
+    Hole,
+    /// Nothing: a beneath slot with no texture on some monitor this pass
+    /// (its memo pending, its run failed), drawn as the flat path draws a
+    /// slot not ready there, the pane's lower layers showing, and never a
+    /// hole with nothing beneath it (amended 2026-10-14, live under motion
+    /// and warps).
+    Skip,
+}
+
+/// A beneath slot is a hole inside its pane's capture and nowhere else,
+/// and only while every one of its places has its texture this pass
+/// (`Slots::screened_all`): the capture is one picture for every monitor
+/// the warp is drawn on, so a monitor without its `Under` would show the
+/// screen below through the hole. Both captures of a pane are inside: the
+/// warp's, and a whole pane's self or mask capture, whose result lies over
+/// the client's hole in the warp's capture (Ruling F37).
+/// `tests::a_beneath_slot_is_a_hole_only_inside_a_capture`.
+pub(crate) fn slot_draw(within: Within, beneath: bool, screened: bool) -> SlotDraw {
+    match (within, beneath, screened) {
+        (Within::Capture, true, true) => SlotDraw::Hole,
+        (Within::Capture, true, false) => SlotDraw::Skip,
+        _ => SlotDraw::Result,
+    }
+}
+
 /// A ready slot's result placed over its part, `part` being the part's
 /// mask on this output in logical pixels (`effect::mask`), cut by it as
 /// [`cut_by_shape`] says, at `alpha`; nothing for a slot with no result on
-/// `monitor`, the output it is drawn on.
+/// `monitor`, the output it is drawn on. In a capture, a slot drawn beneath
+/// its pane's warp is a hole, or nothing ([`slot_draw`]).
 #[expect(
     clippy::too_many_arguments,
-    reason = "one slot placed: whose, which, over what, on which monitor, at what scale and alpha"
+    reason = "one slot placed: whose, which, over what, on which monitor and in which walk, at what scale and alpha"
 )]
 fn slot_element(
     state: &Solium,
@@ -3502,8 +3991,31 @@ fn slot_element(
     part: Mask,
     scale: f64,
     alpha: f32,
-    monitor: Option<&str>,
+    (monitor, within): (Option<&str>, Within),
 ) -> Option<Element> {
+    match slot_draw(
+        within,
+        slots.is_beneath(owner, slot),
+        slots.screened_all(owner, slot),
+    ) {
+        SlotDraw::Result => {}
+        SlotDraw::Skip => return None,
+        SlotDraw::Hole => {
+            let Mask::Rect { rect, radii } = part else {
+                return None;
+            };
+            let program = state.programs.beneath_compiled()?;
+            let id = state.store.get(owner, slot)?.hole.clone();
+            return Some(Element::Hole(crate::effect::beneath::Hole::new(
+                owner.clone(),
+                slot,
+                id,
+                rect.to_physical(scale),
+                radii_of(corners_times(radii, scale)),
+                program,
+            )));
+        }
+    }
     // On `monitor`, its own result there (a T2 slot's) or the slot's one
     // (`effect::plan::tests::a_monitors_own_result_wins_over_the_slots_one`).
     let ready = match monitor {
@@ -3551,7 +4063,7 @@ fn slot_element(
 fn layer_slots(
     state: &Solium,
     slots: &Slots,
-    monitor: Option<&str>,
+    (monitor, within): (Option<&str>, Within),
     pane: crate::pane::PaneId,
     depth: Depth,
     drawing: crate::decoration::Drawing,
@@ -3619,7 +4131,7 @@ fn layer_slots(
                     mask,
                     drawing.scale,
                     drawing.alpha,
-                    monitor,
+                    (monitor, within),
                 )
             }) {
                 placed.push((index, around, Some(element)));
@@ -3653,7 +4165,7 @@ fn chrome(
     renderer: &mut GlesRenderer,
     elements: &mut Vec<Element>,
     slots: Option<&Slots>,
-    monitor: Option<&str>,
+    monitor: (Option<&str>, Within),
     pane: crate::pane::PaneId,
     depth: Depth,
     drawing: crate::decoration::Drawing,
@@ -4040,7 +4552,10 @@ pub(crate) fn elements(
         scale,
         cursor: with_cursor,
     } = picture;
-    let now = state.clock.now();
+    // At the pass's one instant, the one its T2 places were measured at,
+    // however late this runs (amended 2026-10-14, live under motion and
+    // warps): `tests::the_walk_draws_at_the_passs_instant`.
+    let now = walk_instant(prepared.now, state.clock.now());
     let output_scale = Scale::from(scale);
     let mut elements = Vec::new();
     // From global coordinates into this output's own, as a float offset so a
@@ -4186,7 +4701,7 @@ pub(crate) fn elements(
                 part,
                 scale,
                 alpha,
-                monitor.as_deref(),
+                (monitor.as_deref(), Within::Screen),
             ));
         }
     };
@@ -4649,7 +5164,16 @@ fn panes(
             let mut client = Some(remains_elements(state, pane, &frame, outer.size, scale));
             pane_pieces(elements, |elements, piece| match piece {
                 Piece::Layers(depth) => {
-                    chrome(state, renderer, elements, None, None, pane, depth, drawing);
+                    chrome(
+                        state,
+                        renderer,
+                        elements,
+                        None,
+                        (None, Within::Screen),
+                        pane,
+                        depth,
+                        drawing,
+                    );
                 }
                 Piece::Client => elements.extend(client.take().into_iter().flatten()),
                 Piece::Slot(..) => {}
@@ -4670,7 +5194,16 @@ fn panes(
             // cover the client, and the handover does not restack anything.
             pane_pieces(elements, |elements, piece| match piece {
                 Piece::Layers(depth) if state.loading.decorated => {
-                    chrome(state, renderer, elements, None, None, pane, depth, drawing);
+                    chrome(
+                        state,
+                        renderer,
+                        elements,
+                        None,
+                        (None, Within::Screen),
+                        pane,
+                        depth,
+                        drawing,
+                    );
                 }
                 Piece::Layers(_) | Piece::Slot(..) => (),
                 Piece::Client => scene(state, renderer, elements, pane, frame, now, scale),
@@ -4772,10 +5305,41 @@ fn panes(
                                 id,
                                 commit,
                                 texture,
-                                mesh,
+                                mesh.clone(),
                                 frame.opacity,
                                 program,
                             )));
+                            // Beneath the warp, in its capture's order, through
+                            // its mesh, each fragment reading the backdrop where
+                            // it is on this monitor (Ruling F37, amended
+                            // 2026-10-14): `dev/effects-check.sh motion`'s
+                            // `genie`, and wirecheck case 13i.
+                            if let Some(beneath) = state.programs.beneath_compiled() {
+                                for each in warped.under.iter().filter(|each| {
+                                    monitor.as_deref() == Some(each.monitor.as_str())
+                                }) {
+                                    let map = match each.over {
+                                        crate::effect::beneath::Over::Monitor => {
+                                            crate::effect::beneath::ScreenMap::monitor(
+                                                screen.size,
+                                                scale,
+                                            )
+                                        }
+                                        crate::effect::beneath::Over::Box(screen_box) => {
+                                            crate::effect::beneath::ScreenMap::of_box(screen_box)
+                                        }
+                                    };
+                                    elements.push(Element::Beneath(
+                                        crate::effect::beneath::Beneath::new(
+                                            each,
+                                            mesh.clone(),
+                                            map,
+                                            frame.opacity,
+                                            beneath,
+                                        ),
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
@@ -4913,7 +5477,7 @@ fn panes(
                         part,
                         scale,
                         frame.opacity,
-                        monitor.as_deref(),
+                        (monitor.as_deref(), Within::Screen),
                     )
                 })),
                 // Scaled with the window and not cut to its tile: a menu has
@@ -4961,7 +5525,7 @@ fn panes(
                 renderer,
                 elements,
                 Some(&prepared.slots),
-                monitor.as_deref(),
+                (monitor.as_deref(), Within::Screen),
                 pane,
                 depth,
                 drawing,
@@ -4986,7 +5550,7 @@ fn panes(
                     mask,
                     scale,
                     frame.opacity,
-                    monitor.as_deref(),
+                    (monitor.as_deref(), Within::Screen),
                 ));
             }
             Piece::Client => {
@@ -5517,6 +6081,8 @@ fn flat_pane(
     // its `above` layer underneath its client.
     for &piece in pieces {
         match piece {
+            // Inside a capture, where a slot drawn beneath the pane's warp
+            // is its hole (`slot_draw`; Ruling F37).
             Piece::Layers(depth) => {
                 if let Some(pane) = pane {
                     chrome(
@@ -5524,7 +6090,7 @@ fn flat_pane(
                         renderer,
                         &mut elements,
                         Some(slots),
-                        monitor.as_deref(),
+                        (monitor.as_deref(), Within::Capture),
                         pane,
                         depth,
                         drawing,
@@ -5563,7 +6129,7 @@ fn flat_pane(
                     mask,
                     scale,
                     1.0,
-                    monitor.as_deref(),
+                    (monitor.as_deref(), Within::Capture),
                 ));
             }
             // A style's rounding, drawn here as on the flat path, so a deformed
@@ -8540,6 +9106,7 @@ pub(crate) mod tests {
                 scale: [0.1, 0.1],
             },
             own: (200, 100).into(),
+            part: crate::effect::plan::PartBox::around((100, 60).into(), 0, [0.0; 4]),
         }
     }
 
@@ -8659,5 +9226,101 @@ pub(crate) mod tests {
             "the whole-pane phase binds a carrier to run nothing"
         );
         let _ = std::fs::remove_dir_all(place);
+    }
+
+    /// **A glided part's box is where it is drawn**: its place in the pane
+    /// carried by the frame's rectangle, not the layout's (Ruling F37,
+    /// amended 2026-10-14, live under motion and warps).
+    #[test]
+    fn a_glided_parts_box_is_where_it_is_drawn() {
+        use smithay::utils::{Logical, Rectangle};
+        let outer = Rectangle::<i32, Logical>::new((1000, 100).into(), (400, 300).into());
+        let titlebar = Rectangle::<i32, Logical>::new((1000, 100).into(), (400, 28).into());
+        // Half way through a glide from (200, 100) to the layout's (1000, 100).
+        let gliding = Rectangle::<f64, Logical>::new((600.0, 100.0).into(), (400.0, 300.0).into());
+        assert_eq!(
+            super::within(titlebar, outer, gliding),
+            Rectangle::new((600.0, 100.0).into(), (400.0, 28.0).into())
+        );
+        // An open at half size about the pane's centre: the band halved with it.
+        let opening = Rectangle::<f64, Logical>::new((1100.0, 175.0).into(), (200.0, 150.0).into());
+        assert_eq!(
+            super::within(titlebar, outer, opening),
+            Rectangle::new((1100.0, 175.0).into(), (200.0, 14.0).into())
+        );
+        // At rest, the part itself.
+        assert_eq!(
+            super::within(titlebar, outer, outer.to_f64()),
+            titlebar.to_f64()
+        );
+    }
+
+    /// **A tilted part's beneath bounds are its own band**: under a matrix
+    /// alone (one cell, the pane's corners) a titlebar's bounds are its
+    /// band turned with the pane, not the whole pane's box, which a tint
+    /// would cover and a `glass-rect` bezel bend through (amended
+    /// 2026-10-14, live under motion and warps). Turned 0.17 rad about its
+    /// centre, a 400×300 pane is 400·sin + 300·cos ≈ 363.3 tall, its 28 px
+    /// titlebar 400·sin + 28·cos ≈ 95.3, both from the same top corner.
+    #[test]
+    fn a_tilted_parts_beneath_bounds_are_its_own_band() {
+        let mut frame = crate::present::Frame::real(smithay::utils::Rectangle::new(
+            (0, 0).into(),
+            (400, 300).into(),
+        ));
+        frame.matrix = crate::mat4::Mat4::rotate_z(0.17);
+        let titlebar = crate::warp::UnitRect {
+            u0: 0.0,
+            v0: 0.0,
+            u1: 1.0,
+            v1: 28.0 / 300.0,
+        };
+        let band = super::beneath_bounds(&frame, None, titlebar).expect("bounds");
+        let whole =
+            super::beneath_bounds(&frame, None, crate::warp::UnitRect::WHOLE).expect("bounds");
+        assert!(
+            (whole.size.h - 363.3).abs() < 1.0,
+            "the pane's bounds are {} tall",
+            whole.size.h
+        );
+        assert!(
+            (band.size.h - 95.3).abs() < 1.0,
+            "the titlebar's bounds are {} tall, not its band",
+            band.size.h
+        );
+        assert!(
+            (band.loc.y - whole.loc.y).abs() < 1.0,
+            "the band does not start at the pane's top corner"
+        );
+    }
+
+    /// **Inside a capture a beneath slot is a hole; on screen it never is**
+    /// (amended 2026-10-14): a hole on screen would erase the frame's own
+    /// pixels and draw black where the backdrop is. Both captures of a pane
+    /// are inside (the warp's and a whole pane's self or mask capture), and
+    /// with a place lacking its texture the slot is skipped, not holed.
+    #[test]
+    fn a_beneath_slot_is_a_hole_only_inside_a_capture() {
+        use super::{SlotDraw, Within, slot_draw};
+        assert_eq!(slot_draw(Within::Capture, true, true), SlotDraw::Hole);
+        assert_eq!(slot_draw(Within::Capture, false, true), SlotDraw::Result);
+        assert_eq!(slot_draw(Within::Screen, true, true), SlotDraw::Result);
+        assert_eq!(slot_draw(Within::Screen, false, true), SlotDraw::Result);
+        // A monitor with no texture beneath: no hole, which would show the
+        // screen below there (amended 2026-10-14).
+        assert_eq!(slot_draw(Within::Capture, true, false), SlotDraw::Skip);
+    }
+
+    /// **The walk draws at the pass's instant**, the one its T2 places were
+    /// measured at, however late `elements` runs; outside a pass, at the
+    /// clock (amended 2026-10-14, live under motion and warps).
+    #[test]
+    fn the_walk_draws_at_the_passs_instant() {
+        let (pass, later) = (
+            std::time::Duration::from_millis(1000),
+            std::time::Duration::from_millis(1004),
+        );
+        assert_eq!(super::walk_instant(Some(pass), later), pass);
+        assert_eq!(super::walk_instant(None, later), later);
     }
 }

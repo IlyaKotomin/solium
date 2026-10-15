@@ -375,9 +375,13 @@ fn uv(part: i32, whole: i32) -> f32 {
 /// (`screen`, what `memo::T2Key` keys on, so a drag finer than an xray
 /// pixel still re-runs the suffix, Ruling F37), as a `BoxMap` into the
 /// monitor-sized textures, and its own size at the monitor's scale, which
-/// the suffix runs at whatever the xray's resolution (`own`).
+/// the suffix runs at whatever the xray's resolution (`own`); and what the
+/// run reads there (`part`): the slot's own box at rest, else the drawn
+/// part's own pixels on that monitor, padded as the slot is (Ruling F37,
+/// amended 2026-10-14, live under motion and warps).
 /// `tests::a_parts_place_in_a_monitors_xray_is_its_box_in_xray_pixels`,
-/// `tests::a_parts_box_on_a_monitor_is_in_its_physical_pixels`.
+/// `tests::a_parts_box_on_a_monitor_is_in_its_physical_pixels`,
+/// `state::tests::real_client::a_gliding_windows_t2_place_follows_its_drawn_rectangle`.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct T2Place {
     pub(crate) monitor: String,
@@ -386,6 +390,7 @@ pub(crate) struct T2Place {
     pub(crate) screen: Rectangle<i32, Physical>,
     pub(crate) map: BoxMap,
     pub(crate) own: Size<i32, Physical>,
+    pub(crate) part: PartBox,
 }
 
 /// Where a T2 slot's padded box lies in one monitor's xray: in its pixels,
@@ -465,6 +470,12 @@ pub(crate) struct Slots {
     /// Every memo a place reads this pass, each once, in order: what the
     /// `xray` phase runs when its xray was redrawn (`render::want_t2`).
     memos: Vec<MemoKey>,
+    /// The T2 slots drawn beneath their pane's warp this pass, out of its
+    /// capture (`render::record_boxes`, Ruling F37).
+    beneath: HashSet<(Owner, Slot)>,
+    /// A beneath slot's texture on each monitor, as its run left it
+    /// (`render::run_t2`), for the warp's `Under`s.
+    screened: HashMap<(Owner, Slot, String), crate::effect::beneath::Screened>,
     reach: HashMap<PaneId, i32>,
     facts: u32,
 }
@@ -619,6 +630,55 @@ impl Slots {
     /// `state::tests::real_client::two_windows_with_one_blur_want_one_memo`.
     pub(crate) fn memos(&self) -> &[MemoKey] {
         &self.memos
+    }
+
+    /// A T2 slot drawn beneath its pane's warp this pass
+    /// (`render::record_boxes`).
+    /// `state::tests::real_client::a_warped_panes_behind_slot_is_drawn_beneath_its_warp`.
+    pub(crate) fn set_beneath(&mut self, owner: Owner, slot: Slot) {
+        self.beneath.insert((owner, slot));
+    }
+
+    /// `state::tests::real_client::a_warped_panes_behind_slot_is_drawn_beneath_its_warp`.
+    pub(crate) fn is_beneath(&self, owner: &Owner, slot: Slot) -> bool {
+        self.beneath.contains(&(owner.clone(), slot))
+    }
+
+    /// A beneath slot's texture on `monitor` this pass (`render::run_t2`).
+    /// `render::tests::a_beneath_slot_is_a_hole_only_inside_a_capture`.
+    pub(crate) fn set_screened(
+        &mut self,
+        owner: Owner,
+        slot: Slot,
+        monitor: &str,
+        screened: crate::effect::beneath::Screened,
+    ) {
+        self.screened
+            .insert((owner, slot, monitor.to_owned()), screened);
+    }
+
+    /// A beneath slot's texture on `monitor`, if its run left one.
+    pub(crate) fn screened(
+        &self,
+        owner: &Owner,
+        slot: Slot,
+        monitor: &str,
+    ) -> Option<&crate::effect::beneath::Screened> {
+        self.screened
+            .get(&(owner.clone(), slot, monitor.to_owned()))
+    }
+
+    /// Whether every place of the slot has its texture this pass: what the
+    /// one capture of a warped pane may hole the part for, since a monitor
+    /// with nothing beneath would show the screen below through the hole
+    /// (`render::slot_draw`).
+    /// `render::tests::a_beneath_slot_is_a_hole_only_inside_a_capture`.
+    pub(crate) fn screened_all(&self, owner: &Owner, slot: Slot) -> bool {
+        let places = self.places(owner, slot);
+        !places.is_empty()
+            && places
+                .iter()
+                .all(|place| self.screened(owner, slot, &place.monitor).is_some())
     }
 
     /// A slot made ready with no texture, so the walk's order is testable

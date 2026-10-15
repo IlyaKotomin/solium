@@ -113,6 +113,25 @@ T2 result on each, each from that monitor's xray, with a seam at the edge
 session is locked no rule's slot is wanted at all: nothing of the session is
 captured, run or read behind the lock.
 
+### Moving and warped parts
+
+A T2 part reads the backdrop where it is drawn, on every pass. Through a
+glide or a drag (a relayout, `sol.place`, `sol.present` with a rectangle) a
+plain blur only moves its crop of the shared result and runs nothing, and a
+chain with steps of its own per part runs them again on each pass its box
+moves, and not at rest. Under a warp (a tilt, a genie, an open or close that
+warps) the part's `behind` slot is drawn beneath the warp, through the same
+mesh, each pixel reading the backdrop under it on the screen, and the
+window's own picture keeps a hole in the part's shape there, so what is
+behind the window shows through it as it does at rest. A chain whose steps
+per part read the part's shape (a refraction) runs them over the warp's
+bounding box, not the bent outline. A `front` or `replace` T2 slot, and every
+T0 and T1 slot, stays in the window's picture at rest and bends with it; a T1
+slot is live already, since its capture is drawn again on every commit.
+`effects.xray.warped = "rest"` keeps every warped slot in the window's
+picture, reading the backdrop where the window rests: cheaper, and bent with
+it.
+
 ### The memo
 
 A T2 chain is split when the rules are applied: its start, as far as it reads

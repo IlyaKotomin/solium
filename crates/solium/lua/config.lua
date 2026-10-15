@@ -1407,9 +1407,11 @@ local defaults = {
         -- picture nothing reads is kept `keep_ms` (0 to 60000) before it is
         -- given back. A window across two monitors reads each monitor's
         -- picture (`straddle = "each"`, a seam at the edge) or its own
-        -- monitor's ("own"). A tilted or genied window reads it where it
-        -- rests (`warped = "rest"`) or where it is drawn ("drawn").
-        xray = { layers = { "background" }, scale = 1, keep_ms = 2000, straddle = "each", warped = "rest" },
+        -- monitor's ("own"). A tilted or genied window shows the backdrop
+        -- where each of its pixels is drawn (`warped = "drawn"`), or,
+        -- cheaper, the backdrop where it rests, bent with it ("rest"). A
+        -- window that glides or is dragged always reads it where it is drawn.
+        xray = { layers = { "background" }, scale = 1, keep_ms = 2000, straddle = "each", warped = "drawn" },
         -- The part of an effect that reads only the backdrop (a blur) runs
         -- once per monitor and is shared: `split = "resize"` shares it up to
         -- its last pass that changes size (a tint after it stays per

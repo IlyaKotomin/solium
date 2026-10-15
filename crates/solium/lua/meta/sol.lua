@@ -500,7 +500,7 @@ function sol.problems() end
 ---@field scale? number The picture's resolution as a share of the monitor's, 0.25 to 1. Default 1.
 ---@field keep_ms? integer How long a picture nothing reads is kept, 0 to 60000 ms. Default 2000.
 ---@field straddle? "each"|"own" A part across two monitors reads each monitor's picture, or only its own monitor's. Default `"each"`.
----@field warped? "rest"|"drawn" A warped window reads the picture where it rests, or where it is drawn. Default `"rest"`.
+---@field warped? "drawn"|"rest" A warped window's behind effect reads the backdrop where each of its pixels is drawn, or where the window rests, bent with it. A window that glides or is dragged always reads it where it is drawn. Default `"drawn"`.
 
 ---How the part of a chain that reads only the backdrop is shared, `sol.effects`'
 ---`memo`: run once per monitor and read by every part whose chain begins the

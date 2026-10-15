@@ -10283,7 +10283,8 @@ end)"#,
     /// What `prepare` would do with a pane this pass.
     fn planned(fixture: &mut Fixture, pane: crate::pane::PaneId) -> crate::render::Planned {
         let outer = fixture.state.pane_outer_of(pane).expect("a pane on screen");
-        crate::render::plan_warp(&mut fixture.state, pane, outer, 1.0)
+        let now = fixture.state.clock.now();
+        crate::render::plan_warp(&mut fixture.state, pane, outer, 1.0, now)
     }
 
     /// `{ x = .., y = .., w = 64, h = 32 }` well below a pane's middle, as
@@ -10780,7 +10781,8 @@ end)"#,
                     "{failed}, pass {pass}: the pane's own grid was refused"
                 );
                 let (frame, aimed) =
-                    crate::render::warp_of(&fixture.state, pane, outer).expect("warped");
+                    crate::render::warp_of(&fixture.state, pane, outer, fixture.state.clock.now())
+                        .expect("warped");
                 let aimed = aimed.expect("aimed");
                 let over = crate::render::over_grid(
                     &mut fixture.state,
@@ -11551,10 +11553,12 @@ end)"#,
         assert!(fixture.state.lock.is_none(), "the session did not unlock");
     }
 
-    /// One pass's resolve: the slots, their boxes and places, and the T2
-    /// cuts and memos wanted, in the store's next pass.
+    /// One pass's resolve: the pass's warps planned first, as `Gpu::resolve`
+    /// plans them, then the slots, their boxes and places, and the T2 cuts
+    /// and memos wanted, in the store's next pass.
     fn resolved(fixture: &mut Fixture) -> crate::effect::plan::Slots {
         let pass = fixture.state.store.next_pass();
+        crate::render::plan_warps(&mut fixture.state);
         let mut slots = crate::render::build_slots(&mut fixture.state);
         crate::render::record_boxes(&fixture.state, &mut slots);
         crate::render::want_t2(&mut fixture.state, &mut slots, pass);
@@ -11570,7 +11574,7 @@ end)"#,
     ) -> Option<crate::effect::memo::T2Key> {
         let slots = resolved(fixture);
         let place = slots.places(&owner, slot).first()?.clone();
-        let part = slots.boxed(&owner, slot)?;
+        let part = place.part;
         let chain = fixture.state.chains.get(slots.key(&owner, slot)?)?;
         let work =
             crate::render::t2_work(chain.memo()?, slots.shared_on(&owner, slot, &place.monitor));
@@ -12160,6 +12164,393 @@ end)"#,
         assert_eq!(
             finer, 1,
             "the premise: one of two 1 px drags stays inside an xray pixel"
+        );
+    }
+
+    /// `window` placed at `to`, gliding there for `duration` from now on a
+    /// straight line, as `tiling.apply` places a window (`Solium::place`,
+    /// the call [`glide`] makes).
+    fn glide_to(
+        fixture: &mut Fixture,
+        window: &Window,
+        to: Rectangle<i32, Logical>,
+        duration: Duration,
+    ) {
+        let start = fixture.state.clock.now();
+        glide(
+            &mut fixture.state,
+            window,
+            to,
+            duration,
+            present::Curve::Linear,
+            start,
+        );
+        pump_all(fixture);
+    }
+
+    /// `window` moved by `by` at once, as one step of a drag's `sol.place`.
+    fn place_by(fixture: &mut Fixture, window: &Window, by: (i32, i32)) {
+        let pane = fixture.state.panes.id_of(window).expect("a pane");
+        let at = fixture.state.pane_outer_of(pane).expect("on screen");
+        glide_to(
+            fixture,
+            window,
+            Rectangle::new(at.loc + Point::from(by), at.size),
+            Duration::ZERO,
+        );
+    }
+
+    /// One pass's resolve and the slot's T2 places.
+    fn places_of(
+        fixture: &mut Fixture,
+        owner: crate::effect::plan::Owner,
+        slot: crate::effect::rules::Slot,
+    ) -> Vec<crate::effect::plan::T2Place> {
+        resolved(fixture).places(&owner, slot).to_vec()
+    }
+
+    /// `{ effect = "genie", progress = 0.5, … }` toward a strip below the
+    /// pane: a genie held half way, as `effects-check genie` holds one.
+    fn genie_half(fixture: &Fixture, pane: crate::pane::PaneId) -> String {
+        format!(
+            r#"{{ effect = "genie", progress = 0.5, axis = "down", to = {} }}"#,
+            below(fixture, pane)
+        )
+    }
+
+    /// **A gliding window's T2 place follows where it is drawn**, pass by
+    /// pass, not the place it glides to (Ruling F37, amended 2026-10-14,
+    /// live under motion and warps: the maintainer's capture of a blur
+    /// showing its destination's backdrop half way through a relayout).
+    #[test]
+    fn a_gliding_windows_t2_place_follows_its_drawn_rectangle() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Slot;
+        fx2_fixture!(fixture, "glide-place");
+        let (pane, window) = translucent_window(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur" } }"#,
+        );
+        let owner = Owner::Pane(pane, PaneSlot::Client);
+        let from = fixture.state.pane_outer_of(pane).expect("on screen");
+        let scale = fixture.state.scale_of(from);
+        let rest = places_of(&mut fixture, owner.clone(), Slot::Behind)[0].screen;
+        glide_to(
+            &mut fixture,
+            &window,
+            Rectangle::new(from.loc + Point::from((600, 0)), from.size),
+            Duration::from_millis(1000),
+        );
+        for step in 1..=4 {
+            fixture.state.clock.advance(Duration::from_millis(200));
+            let outer = fixture.state.pane_outer_of(pane).expect("on screen");
+            let along = fixture.state.drawn(pane, outer).rect.loc.x - f64::from(from.loc.x);
+            assert!(
+                along > 1.0 && along < 599.0,
+                "pass {step}: the glide is not under way, so nothing was tested"
+            );
+            let at = places_of(&mut fixture, owner.clone(), Slot::Behind)[0].screen;
+            assert!(
+                (f64::from(at.loc.x - rest.loc.x) - along * scale).abs() <= 1.0,
+                "pass {step}: the place is {} px along where the window is drawn {along} logical px along",
+                at.loc.x - rest.loc.x
+            );
+            assert_eq!(
+                at.size, rest.size,
+                "pass {step}: a glide from rest resized the place"
+            );
+        }
+        fixture.state.clock.advance(Duration::from_millis(400));
+        let landed = places_of(&mut fixture, owner, Slot::Behind)[0].screen;
+        assert!(
+            (f64::from(landed.loc.x - rest.loc.x) - 600.0 * scale).abs() <= 1.0,
+            "at rest the place is where the layout put it"
+        );
+    }
+
+    /// **A gliding window's T2 place is measured at the pass's one
+    /// instant**, the one the walk draws at, not at whatever the clock says
+    /// later in `prepare` (amended 2026-10-14, live under motion and warps:
+    /// a fast relayout's blur lagged its window by its speed times the
+    /// pass's own time). 600 px in 100 ms, 4 ms of `prepare` between the
+    /// warps' plan and the places: 24 px apart.
+    #[test]
+    fn a_gliding_windows_t2_place_is_measured_at_the_passs_instant() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Slot;
+        fx2_fixture!(fixture, "glide-instant");
+        let (pane, window) = translucent_window(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur" } }"#,
+        );
+        let owner = Owner::Pane(pane, PaneSlot::Client);
+        let from = fixture.state.pane_outer_of(pane).expect("on screen");
+        let scale = fixture.state.scale_of(from);
+        let rest = places_of(&mut fixture, owner.clone(), Slot::Behind)[0].screen;
+        glide_to(
+            &mut fixture,
+            &window,
+            Rectangle::new(from.loc + Point::from((600, 0)), from.size),
+            Duration::from_millis(100),
+        );
+        fixture.state.clock.advance(Duration::from_millis(30));
+        let _ = fixture.state.store.next_pass();
+        crate::render::plan_warps(&mut fixture.state);
+        let at = fixture.state.presented.at().expect("the pass's instant");
+        fixture.state.clock.advance(Duration::from_millis(4));
+        let mut slots = crate::render::build_slots(&mut fixture.state);
+        crate::render::record_boxes(&fixture.state, &mut slots);
+        let outer = fixture.state.pane_outer_of(pane).expect("on screen");
+        let walked = fixture.state.drawn_id_at(pane, outer, at).rect.loc.x - f64::from(from.loc.x);
+        let later = fixture.state.drawn(pane, outer).rect.loc.x - f64::from(from.loc.x);
+        assert!(
+            later - walked > 10.0,
+            "the clock did not move the glide, so nothing was tested"
+        );
+        let placed = slots.places(&owner, Slot::Behind)[0].screen;
+        assert!(
+            (f64::from(placed.loc.x - rest.loc.x) - walked * scale).abs() <= 1.0,
+            "the place is {} px along where the walk draws the window {walked} logical px along",
+            placed.loc.x - rest.loc.x
+        );
+    }
+
+    /// **A plain blur on a gliding window moves its crop and runs
+    /// nothing**: its key's box moves every pass, its memo and xray do not,
+    /// and its crop of the memo moves with the window (amended 2026-10-14).
+    #[test]
+    fn a_plain_blur_on_a_gliding_window_moves_its_crop_and_runs_nothing() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Slot;
+        fx2_fixture!(fixture, "glide-crop");
+        let (pane, window) = translucent_window(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur" } }"#,
+        );
+        let owner = Owner::Pane(pane, PaneSlot::Client);
+        assert!(matches!(
+            crate::render::t2_work(only_user_chain(&fixture.state).memo().expect("T2"), true),
+            crate::render::T2Work::Crop(_)
+        ));
+        let from = fixture.state.pane_outer_of(pane).expect("on screen");
+        glide_to(
+            &mut fixture,
+            &window,
+            Rectangle::new(from.loc + Point::from((600, 0)), from.size),
+            Duration::from_millis(1000),
+        );
+        fixture.state.clock.advance(Duration::from_millis(300));
+        let one = t2_key_of(&mut fixture, owner.clone(), Slot::Behind).expect("a key");
+        let crop_one = places_of(&mut fixture, owner.clone(), Slot::Behind)[0].map;
+        fixture.state.clock.advance(Duration::from_millis(300));
+        let two = t2_key_of(&mut fixture, owner.clone(), Slot::Behind).expect("a key");
+        let crop_two = places_of(&mut fixture, owner, Slot::Behind)[0].map;
+        assert_ne!(
+            one.padded, two.padded,
+            "the box did not move with the glide"
+        );
+        assert_eq!(
+            (one.memo, one.xray),
+            (two.memo, two.xray),
+            "a glide moved the memo or the xray"
+        );
+        assert!(
+            crop_two.offset[0] > crop_one.offset[0],
+            "the crop did not move with the window"
+        );
+    }
+
+    /// **A suffix re-runs while its window glides, and not at rest**
+    /// (`blur-tint`: the blur is the memo, the tint the suffix; amended
+    /// 2026-10-14).
+    #[test]
+    fn a_suffix_reruns_while_gliding_and_not_at_rest() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Slot;
+        fx2_fixture!(fixture, "glide-suffix");
+        let (pane, window) = translucent_window(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur-tint" } }"#,
+        );
+        let owner = Owner::Pane(pane, PaneSlot::Client);
+        assert_eq!(
+            crate::render::t2_work(only_user_chain(&fixture.state).memo().expect("T2"), true),
+            crate::render::T2Work::Suffix
+        );
+        let from = fixture.state.pane_outer_of(pane).expect("on screen");
+        glide_to(
+            &mut fixture,
+            &window,
+            Rectangle::new(from.loc + Point::from((600, 0)), from.size),
+            Duration::from_millis(1000),
+        );
+        let mut t2 = crate::effect::store::T2State::default();
+        for step in 1..=4 {
+            fixture.state.clock.advance(Duration::from_millis(200));
+            let key = t2_key_of(&mut fixture, owner.clone(), Slot::Behind).expect("a key");
+            assert!(
+                t2.needs_run(key),
+                "pass {step}: the suffix did not re-run while its window glided"
+            );
+            t2.key = Some(key);
+        }
+        fixture.state.clock.advance(Duration::from_millis(400));
+        t2.key = t2_key_of(&mut fixture, owner.clone(), Slot::Behind);
+        fixture.state.clock.advance(Duration::from_millis(100));
+        let still = t2_key_of(&mut fixture, owner, Slot::Behind).expect("a key");
+        assert!(!t2.needs_run(still), "the suffix re-ran at rest");
+    }
+
+    /// **A dragged window re-runs its suffix and not its memo**: its box in
+    /// the monitor moved, the xray under it did not.
+    #[test]
+    fn a_dragged_windows_suffix_reruns_and_its_memo_does_not() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Slot;
+        fx2_fixture!(fixture, "drag-suffix");
+        let (pane, window) = translucent_window(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur-tint" } }"#,
+        );
+        let owner = Owner::Pane(pane, PaneSlot::Client);
+        let before = t2_key_of(&mut fixture, owner.clone(), Slot::Behind).expect("a key");
+        place_by(&mut fixture, &window, (40, 0));
+        let after = t2_key_of(&mut fixture, owner, Slot::Behind).expect("a key");
+        assert_ne!(
+            after.padded, before.padded,
+            "the suffix's key did not move with the window"
+        );
+        assert_eq!(after.memo, before.memo, "the memo moved with a window");
+        assert_eq!(after.xray, before.xray, "the xray moved with a window");
+    }
+
+    /// **A self effect is kept while its window moves without drawing**,
+    /// and re-runs on every commit while it moves (R4: live content); the
+    /// self capture is the same for any `source = "self"` chain (amended
+    /// 2026-10-14).
+    #[test]
+    fn a_self_effect_is_kept_while_moved_and_reruns_on_every_commit() {
+        fx2_fixture!(fixture, "drag-self");
+        let (_pane, window) = translucent_window(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "replace", effect = { "blur", source = "self" } } }"#,
+        );
+        let mut capture = crate::keyed::Capture::<u32>::default();
+        capture.drawn(1, self_key(&mut fixture, &window, 64));
+        place_by(&mut fixture, &window, (40, 0));
+        assert!(
+            !capture.stale(&self_key(&mut fixture, &window, 64)),
+            "a move without a commit recaptured"
+        );
+        for _ in 0..3 {
+            commit_again(&mut fixture, &window);
+            place_by(&mut fixture, &window, (10, 0));
+            assert!(
+                capture.stale(&self_key(&mut fixture, &window, 64)),
+                "a commit while moving was not recaptured"
+            );
+            capture.drawn(1, self_key(&mut fixture, &window, 64));
+        }
+    }
+
+    /// **A warped pane's behind slot is drawn beneath its warp, live**
+    /// (Ruling F37, amended 2026-10-14, live under motion and warps): held
+    /// half way through a genie, its client's behind slot is beneath, and
+    /// its place is the bounds of the client's cells of the genie's mesh,
+    /// reaching below the pane, not the pane at rest; its front slot stays
+    /// in the capture at rest; and with `effects.xray.warped = "rest"`
+    /// nothing is beneath and the place is at rest, the first draft's
+    /// behaviour ([16] decision 3).
+    #[test]
+    fn a_warped_panes_behind_slot_is_drawn_beneath_its_warp() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Slot;
+        fx2_fixture!(fixture, "warp-beneath");
+        let (pane, _window) = translucent_window(&mut fixture);
+        apply_rules(
+            &mut fixture,
+            r#"{
+                { match = "*", part = "client", slot = "behind", effect = "blur" },
+                { match = "*", part = "client", slot = "front", effect = "blur-tint" },
+            }"#,
+        );
+        let owner = Owner::Pane(pane, PaneSlot::Client);
+        let flat_behind = places_of(&mut fixture, owner.clone(), Slot::Behind)[0].screen;
+        let flat_front = places_of(&mut fixture, owner.clone(), Slot::Front)[0].screen;
+        let genie = genie_half(&fixture, pane);
+        present_deform(&mut fixture, pane, &genie);
+        let slots = resolved(&mut fixture);
+        assert!(
+            matches!(
+                fixture.state.presented.get(pane),
+                Some(crate::render::Planned::Warp { .. })
+            ),
+            "the genie is not planned, so nothing was tested"
+        );
+        assert!(
+            slots.is_beneath(&owner, Slot::Behind),
+            "a genied pane's behind slot stayed in its capture"
+        );
+        assert!(
+            !slots.is_beneath(&owner, Slot::Front),
+            "a front slot left the capture"
+        );
+        let bent = slots.places(&owner, Slot::Behind)[0].screen;
+        assert!(
+            bent.loc.y + bent.size.h > flat_behind.loc.y + flat_behind.size.h,
+            "the behind slot reads the backdrop where the pane rests, not down the funnel"
+        );
+        assert_eq!(
+            slots.places(&owner, Slot::Front)[0].screen,
+            flat_front,
+            "a front slot left its rest"
+        );
+        fixture.state.effect_settings.xray.warped = crate::effect::xray::Warped::Rest;
+        let slots = resolved(&mut fixture);
+        assert!(
+            !slots.is_beneath(&owner, Slot::Behind),
+            "warped = rest drew the slot beneath"
+        );
+        assert_eq!(
+            slots.places(&owner, Slot::Behind)[0].screen,
+            flat_behind,
+            "warped = rest moved the place"
+        );
+    }
+
+    /// **Under `straddle = "own"` a warped slot across two monitors stays
+    /// in its capture**: its one place cannot feed the beneath draw on the
+    /// other monitor, where the capture's hole would show the screen below
+    /// (amended 2026-10-14, live under motion and warps).
+    #[test]
+    fn a_warped_slot_across_two_monitors_under_own_stays_in_its_capture() {
+        use crate::effect::plan::{Owner, PaneSlot};
+        use crate::effect::rules::Slot;
+        fx2_fixture!(fixture, "warp-own");
+        two_monitors(&mut fixture);
+        let (pane, window) = translucent_window(&mut fixture);
+        straddle(&mut fixture, &window);
+        apply_rules(
+            &mut fixture,
+            r#"{ { match = "*", part = "client", slot = "behind", effect = "blur" } }"#,
+        );
+        let owner = Owner::Pane(pane, PaneSlot::Client);
+        let genie = genie_half(&fixture, pane);
+        present_deform(&mut fixture, pane, &genie);
+        assert!(
+            resolved(&mut fixture).is_beneath(&owner, Slot::Behind),
+            "under each the straddling genie is not beneath, so nothing was tested"
+        );
+        fixture.state.effect_settings.xray.straddle = crate::effect::xray::Straddle::Own;
+        assert!(
+            !resolved(&mut fixture).is_beneath(&owner, Slot::Behind),
+            "under own a slot with one place was drawn beneath two monitors"
         );
     }
 

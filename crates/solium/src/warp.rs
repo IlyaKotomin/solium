@@ -41,7 +41,7 @@ use smithay::{
 use crate::mat4::Mat4;
 
 mod gl;
-pub(crate) use gl::Program;
+pub(crate) use gl::{BeneathProgram, Draw, Program, scissor_box};
 
 /// One corner: where it lands, and its projective weight.
 #[derive(Clone, Copy, Debug)]
@@ -81,30 +81,7 @@ impl Warp {
         // The bounding box is what the damage tracker reasons about: a warped
         // texture can land anywhere, and claiming a smaller area than it
         // covers leaves the difference undrawn until something else damages it.
-        let mut left = f32::MAX;
-        let mut right = f32::MIN;
-        let mut top = f32::MAX;
-        let mut bottom = f32::MIN;
-        for corner in &mesh.vertices {
-            left = left.min(corner.x);
-            right = right.max(corner.x);
-            top = top.min(corner.y);
-            bottom = bottom.max(corner.y);
-        }
-
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "output coordinates are small integers"
-        )]
-        let bounds = Rectangle::new(
-            (left.floor() as i32, top.floor() as i32).into(),
-            (
-                ((right.ceil() - left.floor()) as i32).max(1),
-                ((bottom.ceil() - top.floor()) as i32).max(1),
-            )
-                .into(),
-        );
-
+        let bounds = mesh.bounds();
         Self {
             id,
             commit,
@@ -128,6 +105,86 @@ pub(crate) struct Mesh {
 }
 
 impl Mesh {
+    /// Its bounding box, whole pixels around every vertex: what a warp's
+    /// and a beneath draw's damage is reckoned over.
+    /// `tests::a_parts_bounds_on_a_mesh_are_its_cells`.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "output coordinates are small integers"
+    )]
+    pub(crate) fn bounds(&self) -> Rectangle<i32, Physical> {
+        let (mut left, mut right, mut top, mut bottom) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+        for corner in &self.vertices {
+            left = left.min(corner.x);
+            right = right.max(corner.x);
+            top = top.min(corner.y);
+            bottom = bottom.max(corner.y);
+        }
+        Rectangle::new(
+            (left.floor() as i32, top.floor() as i32).into(),
+            (
+                ((right.ceil() - left.floor()) as i32).max(1),
+                ((bottom.ceil() - top.floor()) as i32).max(1),
+            )
+                .into(),
+        )
+    }
+
+    /// The bounding box, in the mesh's own pixels, of every triangle whose
+    /// texture rectangle (the least and greatest `u` and `v` of its three
+    /// vertices) overlaps `part` with a positive area; `None` when none
+    /// does. Cell-grained: a part that ends inside a cell takes the whole
+    /// cell (Ruling F37, amended 2026-10-14, live under motion and warps).
+    /// `tests::a_parts_bounds_on_a_mesh_are_its_cells`.
+    pub(crate) fn part_bounds(&self, part: UnitRect) -> Option<Rectangle<f64, Physical>> {
+        let mut found: Option<(f64, f64, f64, f64)> = None;
+        for triangle in self.vertices.as_chunks::<3>().0 {
+            let each = |pick: fn(&Corner) -> f32| {
+                triangle.iter().map(move |corner| f64::from(pick(corner)))
+            };
+            let least = |pick: fn(&Corner) -> f32| each(pick).fold(f64::MAX, f64::min);
+            let most = |pick: fn(&Corner) -> f32| each(pick).fold(f64::MIN, f64::max);
+            let (u0, u1) = (least(|c| c.u), most(|c| c.u));
+            let (v0, v1) = (least(|c| c.v), most(|c| c.v));
+            if u1.min(part.u1) <= u0.max(part.u0) || v1.min(part.v1) <= v0.max(part.v0) {
+                continue;
+            }
+            let (x0, x1) = (least(|c| c.x), most(|c| c.x));
+            let (y0, y1) = (least(|c| c.y), most(|c| c.y));
+            found = Some(match found {
+                None => (x0, y0, x1, y1),
+                Some((l, t, r, b)) => (l.min(x0), t.min(y0), r.max(x1), b.max(y1)),
+            });
+        }
+        let (left, top, right, bottom) = found?;
+        Some(Rectangle::new(
+            (left, top).into(),
+            (right - left, bottom - top).into(),
+        ))
+    }
+
+    /// Two triangles over `rect`, the texture's 0 to 1 across it, `q` = 1:
+    /// what a capture's hole is drawn through (`effect::beneath::Hole`).
+    #[expect(clippy::cast_possible_truncation, reason = "capture-sized floats")]
+    pub(crate) fn quad(rect: Rectangle<f64, Physical>) -> Self {
+        let (x0, y0) = (rect.loc.x as f32, rect.loc.y as f32);
+        let (x1, y1) = (
+            (rect.loc.x + rect.size.w) as f32,
+            (rect.loc.y + rect.size.h) as f32,
+        );
+        let at = |x: f32, y: f32, u: f32, v: f32| Corner { x, y, u, v, q: 1.0 };
+        Self {
+            vertices: vec![
+                at(x0, y0, 0.0, 0.0),
+                at(x1, y0, 1.0, 0.0),
+                at(x1, y1, 1.0, 1.0),
+                at(x0, y0, 0.0, 0.0),
+                at(x1, y1, 1.0, 1.0),
+                at(x0, y1, 0.0, 1.0),
+            ],
+        }
+    }
+
     /// Five floats a vertex, as the program reads them: x, y, u·q, v·q, q.
     pub(crate) fn interleaved(&self) -> Vec<f32> {
         let mut vertices = Vec::with_capacity(self.vertices.len() * 5);
@@ -798,5 +855,65 @@ mod tests {
         )
         .expect("a mesh");
         assert!((past.vertices[2].x - (40.0 + 200.0 * 1.3)).abs() < 1e-3);
+    }
+
+    /// **A part's bounds on a mesh are its cells'**: the whole mesh's for
+    /// the whole pane, the bottom row's for the bottom of the pane, none
+    /// for a part off the mesh (amended 2026-10-14, live under motion and
+    /// warps).
+    #[test]
+    fn a_parts_bounds_on_a_mesh_are_its_cells() {
+        use super::{Grid, UnitRect, mesh_grid};
+        // A 2 by 2 funnel: the top row 400 wide, the bottom pulled in to 200.
+        let grid = Grid {
+            cols: 2,
+            rows: 2,
+            part: UnitRect::WHOLE,
+            points: vec![
+                0.0, 0.0, 200.0, 0.0, 400.0, 0.0, //
+                50.0, 100.0, 200.0, 100.0, 350.0, 100.0, //
+                100.0, 300.0, 200.0, 300.0, 300.0, 300.0,
+            ],
+        };
+        let rect = Rectangle::<f64, Logical>::new((0.0, 0.0).into(), (400.0, 300.0).into());
+        let mesh = mesh_grid(
+            &grid,
+            smithay::utils::Point::from((0.0, 0.0)),
+            rect,
+            Mat4::IDENTITY,
+            (0.5, 0.5),
+            1.0,
+        )
+        .expect("a mesh");
+        let whole = mesh.part_bounds(UnitRect::WHOLE).expect("bounds");
+        assert_eq!(
+            (whole.loc.x, whole.loc.y, whole.size.w, whole.size.h),
+            (0.0, 0.0, 400.0, 300.0)
+        );
+        let low = mesh
+            .part_bounds(UnitRect {
+                u0: 0.0,
+                v0: 0.6,
+                u1: 1.0,
+                v1: 1.0,
+            })
+            .expect("bounds");
+        assert_eq!(
+            (low.loc.x, low.loc.y, low.size.w, low.size.h),
+            (50.0, 100.0, 300.0, 200.0)
+        );
+        assert!(
+            mesh.part_bounds(UnitRect {
+                u0: 1.2,
+                v0: 0.0,
+                u1: 1.4,
+                v1: 1.0,
+            })
+            .is_none()
+        );
+        assert_eq!(
+            mesh.bounds(),
+            Rectangle::new((0, 0).into(), (400, 300).into())
+        );
     }
 }

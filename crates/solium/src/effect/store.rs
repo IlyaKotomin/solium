@@ -45,6 +45,11 @@ pub(crate) struct SlotState {
     /// the monitor's name (Ruling F30).
     /// `tests::a_t2_suffix_reruns_only_when_its_key_moves`.
     pub(crate) t2: BTreeMap<String, T2State>,
+    /// The id of the hole a warped pane's capture keeps where this slot is
+    /// drawn beneath the warp (`effect::beneath::Hole`, Ruling F37), the
+    /// same for as long as the slot keeps this state.
+    /// `render::tests::a_beneath_slot_is_a_hole_only_inside_a_capture`.
+    pub(crate) hole: Id,
 }
 
 impl SlotState {
@@ -62,6 +67,7 @@ impl SlotState {
             size: None,
             seen: 0,
             t2: BTreeMap::new(),
+            hole: Id::new(),
         }
     }
 
@@ -142,6 +148,9 @@ pub(crate) struct T2State {
     pub(crate) commit: CommitCounter,
     pub(crate) placed: Option<super::element::Placement>,
     pub(crate) read_at: Option<u64>,
+    /// The warp's commit its beneath draw last saw, and the beneath's own
+    /// (Ruling F37): `tests::an_unders_commit_moves_with_its_warp_or_its_rerun`.
+    pub(crate) under: Option<(CommitCounter, CommitCounter)>,
 }
 
 /// Never run, with an id of its own.
@@ -155,6 +164,7 @@ impl Default for T2State {
             commit: CommitCounter::default(),
             placed: None,
             read_at: None,
+            under: None,
         }
     }
 }
@@ -179,6 +189,20 @@ impl T2State {
         let commit = super::element::commit_for(&mut self.commit, self.placed, placement, rerun);
         self.placed = Some(placement);
         commit
+    }
+
+    /// The commit its beneath draw carries (Ruling F37, amended 2026-10-14,
+    /// live under motion and warps): moved when the warp's moved or its
+    /// texture re-ran, kept otherwise, so a held tilt is not damaged pass
+    /// after pass.
+    /// `tests::an_unders_commit_moves_with_its_warp_or_its_rerun`.
+    pub(crate) fn under_commit(&mut self, warp: CommitCounter, rerun: bool) -> CommitCounter {
+        let (seen, mut own) = self.under.unwrap_or((warp, CommitCounter::default()));
+        if rerun || seen != warp {
+            own.increment();
+        }
+        self.under = Some((warp, own));
+        own
     }
 
     /// Whether its place read its memos in the pass before `pass`.
@@ -606,5 +630,30 @@ mod tests {
         assert_eq!(drawn.get(&client(1), Slot::Front), None);
         assert_eq!(drawn.commit(&client(1), Slot::Behind), Some(1));
         assert_eq!(drawn.commit(&client(2), Slot::Behind), Some(0));
+    }
+
+    /// **A beneath draw's commit moves with its warp or its run**, and not
+    /// otherwise, so a held tilt is not damaged pass after pass (amended
+    /// 2026-10-14, live under motion and warps).
+    #[test]
+    fn an_unders_commit_moves_with_its_warp_or_its_rerun() {
+        use smithay::backend::renderer::utils::CommitCounter;
+        let mut t2 = super::T2State::default();
+        let still = CommitCounter::default();
+        let mut moved = CommitCounter::default();
+        moved.increment();
+        let first = t2.under_commit(still, false);
+        assert_eq!(
+            t2.under_commit(still, false),
+            first,
+            "a held warp damaged its beneath"
+        );
+        let rerun = t2.under_commit(still, true);
+        assert_ne!(rerun, first, "a re-run left its beneath undamaged");
+        assert_ne!(
+            t2.under_commit(moved, false),
+            rerun,
+            "the warp moved and its beneath did not"
+        );
     }
 }

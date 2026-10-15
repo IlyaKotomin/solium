@@ -48,13 +48,17 @@ pub(crate) enum Straddle {
     Own,
 }
 
-/// `effects.xray.warped`: a warped pane's T2 boxes at its resting
-/// rectangle, or where it is drawn (Task 54 reads it).
-/// `tests::xray_keep_straddle_and_warped_are_read_and_checked`.
+/// `effects.xray.warped`: a warped pane's behind T2 slot drawn beneath its
+/// warp, reading the backdrop where each fragment is (`Drawn`, the default
+/// since 2026-10-14), or kept in its capture at its resting rectangle
+/// (`Rest`, the cheaper choice); `render::measured` reads it (Ruling F37).
+/// The value is not called `live`, which `source = "live"` (X4.1) means.
+/// `tests::xray_keep_straddle_and_warped_are_read_and_checked`,
+/// `tests::the_default_of_effects_xray_warped_is_drawn`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Warped {
-    #[default]
     Rest,
+    #[default]
     Drawn,
 }
 
@@ -77,7 +81,7 @@ impl Default for XrayConfig {
             scale: 1.0,
             keep_ms: 2000,
             straddle: Straddle::Each,
-            warped: Warped::Rest,
+            warped: Warped::Drawn,
         }
     }
 }
@@ -379,7 +383,7 @@ mod tests {
     }
 
     /// **The default is the wallpaper alone** ([16] decision 2), a cut
-    /// kept 2 s, one result per monitor, read at rest.
+    /// kept 2 s, one result per monitor, read where a warped pane is drawn.
     #[test]
     fn the_default_xray_is_the_wallpaper_alone() {
         assert_eq!(
@@ -389,8 +393,24 @@ mod tests {
                 scale: 1.0,
                 keep_ms: 2000,
                 straddle: super::Straddle::Each,
-                warped: super::Warped::Rest
+                warped: super::Warped::Drawn
             }
+        );
+    }
+
+    /// **A warped pane reads the backdrop where it is drawn, by default**
+    /// (Ruling F37, amended 2026-10-14): `"rest"` is the cheaper choice,
+    /// read and kept.
+    #[test]
+    fn the_default_of_effects_xray_warped_is_drawn() {
+        assert_eq!(XrayConfig::default().warped, super::Warped::Drawn);
+        assert_eq!(
+            parse(&tree("{}")).expect("read").warped,
+            super::Warped::Drawn
+        );
+        assert_eq!(
+            parse(&tree(r#"{ warped = "rest" }"#)).expect("read").warped,
+            super::Warped::Rest
         );
     }
 

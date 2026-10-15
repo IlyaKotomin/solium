@@ -762,6 +762,12 @@ pub(crate) struct Solium {
     /// `startup.first_frame.max_ms`, until [`Solium::first_frame_ready`]
     /// (spec C14). `warm::tests::the_first_frame_is_held_until_ready_then_never_again`.
     pub(crate) warm: crate::warm::Warm,
+    /// The pass's warp plans and its one instant, made at the top of
+    /// `resolve` (`render::plan_warps`, Ruling F31): what a warped pane's
+    /// behind slots are placed on, and what the T2 places and the walk are
+    /// measured at.
+    /// `tests::real_client::a_gliding_windows_t2_place_is_measured_at_the_passs_instant`.
+    pub(crate) presented: crate::render::Presented,
 
     /// Hardware buffer sharing: `zwp_linux_dmabuf_v1`.
     ///
@@ -1319,6 +1325,7 @@ impl Solium {
                 warm.inject(crate::dev::warm_inject());
                 warm
             },
+            presented: crate::render::Presented::default(),
             textures: None,
             focusing: false,
             closing: None,

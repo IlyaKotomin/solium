@@ -6,6 +6,7 @@
 //! Singular, apart from the `solium_effects` crate, which holds what is data
 //! and text; this module holds Lua, GL and everything per frame (Ruling 2).
 
+pub(crate) mod beneath;
 pub(crate) mod element;
 pub(crate) mod geometry;
 pub(crate) mod gl;

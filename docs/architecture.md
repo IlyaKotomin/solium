@@ -203,7 +203,8 @@ resolved to, in `t.from` and `t.to`.
 the command is applied (`present::Geometry`: the effect's id, the progress, its
 params packed into numbers so a present can blend them, its axis, picked once
 for `"auto"`, and what it draws when it cannot be drawn); `render::prepare`
-builds each warped pane's grid once a pass, not once per output, and keeps it
+builds each warped pane's grid once a pass, not once per output, at the top
+of `resolve` (`render::plan_warps`), and keeps it
 on the pane while nothing it depends on moves, and `warp::mesh_grid` projects
 it. `script::shipped` checks every effect the shipped Lua names is a shipped
 folder, as it checks every curve against `Curve::from_name`.
@@ -424,6 +425,29 @@ plan by `BoundChain::split`, by `effects.memo.split` or a rule's
 `memo = false`. While the session is locked `build_slots` wants no slot of
 the session at all, so nothing of it is captured, run or read behind the
 lock.
+
+A T2 place is measured where the part is drawn this pass (Ruling F37,
+`render::measured`): at rest from the layout's rectangle, through a glide or
+a drag from the rectangle the walk draws it at, so a plain blur's crop moves
+with the window and a suffix runs again on each pass its box moves. The pass
+reads the clock once, at the top of `resolve`, where it also plans every
+pane's warp (`render::plan_warps`; the `warps` phase takes those plans), and
+the places, the warps and `elements`' walk are all measured at that instant
+(`Prepared::now`). A warped pane's capture holds its slots, with one
+exception: under `effects.xray.warped = "drawn"`, the default, a `behind` T2
+slot is drawn beneath the warp instead (`effect::beneath`), through the same
+mesh, each fragment sampling the memo or the suffix's result where it is on
+the monitor and cut by the part's shape at the mesh's texture coordinates,
+and the capture keeps a hole there (`beneath::Hole`, blended `ZERO,
+ONE_MINUS_SRC_ALPHA`) so the pane's lower layers do not cover it. Its place
+is the bounds of the part's cells of the mesh. The capture is one picture
+for every monitor, so it holes the part only while every place has its
+texture that pass, and the slot is skipped otherwise. `"rest"` keeps the
+slot in the capture at the pane's resting rectangle.
+`dev/effects-check.sh motion` holds, glides and genies a window over bars no
+two places of which look alike, and wirecheck case 13i pins the beneath
+draw and the hole on the GPU.
+
 `dev/effects-check.sh blur` blurs a video player's own pixels through a rule
 and shows a still window's chain run only on the passes that captured it.
 
