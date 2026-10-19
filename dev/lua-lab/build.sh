@@ -40,7 +40,7 @@ PY
 )"
 [[ -n "$binary" ]] || { echo "No Solium executable in Cargo output" >&2; exit 1; }
 if [[ "$kind" == test ]]; then
-    "$binary" lua_layout_lab "$@"
+    "$binary" "${SOLIUM_TEST_FILTER-lua_layout_lab}" "$@"
 else
     echo "$binary"
 fi

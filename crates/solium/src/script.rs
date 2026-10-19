@@ -16379,6 +16379,7 @@ impl Scripts {
 #[cfg(test)]
 mod directions {
     include!("script/lua_layout_lab.rs");
+    include!("script/mobile_tests.rs");
 
     use super::{
         AnimationSpec, Command, Drawn, FocusSource, Interrupt, MonitorInfo, Parentage, Rect,

@@ -12,7 +12,7 @@ chmod 700 "$XDG_RUNTIME_DIR"
 export LIBGL_ALWAYS_SOFTWARE=1
 export LC_ALL=C.UTF-8
 export WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman
-export SOLIUM_LUA_INIT="$here/init.lua"
+export SOLIUM_LUA_INIT="${SOLIUM_LUA_INIT:-$here/init.lua}"
 unset DISPLAY WAYLAND_DISPLAY WAYLAND_SOCKET
 
 pids=()
@@ -21,7 +21,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-sway -c "$here/sway.conf" >"$out/sway.log" 2>&1 &
+sway -c "${SOLIUM_HOST_CONFIG:-$here/sway.conf}" >"$out/sway.log" 2>&1 &
 host_pid=$!
 pids+=("$host_pid")
 host=""
@@ -35,6 +35,11 @@ for ((attempt = 0; attempt < 100; attempt++)); do
 done
 [[ -n "$host" ]] || { echo "No headless host socket" >&2; exit 1; }
 export WAYLAND_DISPLAY="$host"
+
+if [[ "${SOLIUM_VNC:-0}" == 1 ]]; then
+    wayvnc 0.0.0.0 5900 >"$out/wayvnc.log" 2>&1 &
+    pids+=("$!")
+fi
 
 "${SOLIUM_BIN:-/target/debug/solium}" >"$out/solium.log" 2>&1 &
 solium_pid=$!
@@ -52,6 +57,8 @@ echo "Solium: $socket, runtime: $XDG_RUNTIME_DIR, config: $SOLIUM_LUA_INIT"
 
 # nobody's login shell is nologin in Fedora. Supply an interactive shell
 # explicitly so the terminal does not map and immediately disappear.
-WAYLAND_DISPLAY="$socket" foot /bin/bash --noprofile --norc >"$out/foot.log" 2>&1 &
-pids+=("$!")
+if [[ "${SOLIUM_LAB_CLIENT:-foot}" != none ]]; then
+    WAYLAND_DISPLAY="$socket" foot /bin/bash --noprofile --norc >"$out/foot.log" 2>&1 &
+    pids+=("$!")
+fi
 wait "$solium_pid"

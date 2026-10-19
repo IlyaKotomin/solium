@@ -18,6 +18,10 @@ rendered in-process; the one on the right asked to draw its own and was let.
 The wallpaper is a QML file too.
 [docs/modes.md](docs/modes.md) has every mode, frame by frame.
 
+This fork also includes an independent [mobile shell prototype](docs/mobile-shell.md):
+phone and tablet layouts, a QML launcher, live Recents and three-button
+navigation, with split-screen on tablets and a Fedora nested test harness.
+
 ## Status
 
 **Alpha, and not yet anyone's daily desktop.** The first release, v0.1.0,

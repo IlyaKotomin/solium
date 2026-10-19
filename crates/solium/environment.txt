@@ -157,6 +157,22 @@ SOLIUM_LOGIND_BUS=<address>
     happens, so a nested run or a test never reaches the real logind. Blank
     counts as unset.
 
+## Mobile shell
+
+SOLIUM_MOBILE_PROFILE=<auto|phone|tablet>
+    The independent `lua/mobile.lua` entry point's layout profile. `auto`
+    selects tablet when the output's shorter logical side is at least 600;
+    otherwise phone. The desktop configuration does not read this setting.
+
+SOLIUM_MOBILE_SOFTWARE=1
+    Make the mobile entry point use software QML rendering for a headless
+    nested session. Unset, it asks for the normal automatic GPU probe.
+
+SOLIUM_QML_RUNNER=<program>
+    The QML executable used to launch the mobile Notes and Gallery demo
+    clients. Defaults to `qml`; Fedora's lab uses `/usr/lib64/qt6/bin/qml`.
+    The demo windows are separate Wayland clients, not hosted shell surfaces.
+
 ## Hosting a shell
 
 A shell is loaded as configuration, with `shell = { scene = ... }`; see
