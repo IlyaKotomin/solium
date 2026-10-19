@@ -3,7 +3,8 @@ import QtQuick
 Rectangle {
     property string program: ""
     property int waited: 0
-    color: "#f1f0e5"
+    color: "#f2f2f7"
+    radius: 30
     Column {
         anchors.centerIn: parent; spacing: 20
         Row {
@@ -12,7 +13,7 @@ Rectangle {
                 model: 3
                 Rectangle {
                     required property int index
-                    width: 9; height: 9; radius: 4.5; color: "#57744e"
+                    width: 9; height: 9; radius: 4.5; color: "#007aff"
                     SequentialAnimation on opacity {
                         loops: Animation.Infinite
                         PauseAnimation { duration: index * 100 }
@@ -22,6 +23,6 @@ Rectangle {
                 }
             }
         }
-        Text { text: "Opening…"; color: "#43533f"; font.pixelSize: 15 }
+        Text { text: "Opening…"; color: "#6e6e73"; font.pixelSize: 15 }
     }
 }

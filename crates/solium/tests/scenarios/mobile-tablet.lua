@@ -14,7 +14,7 @@ return {
         { expect = function(world)
             assert(shell(world).splitActive, "two real clients enter split screen")
             local a, b = world.windows[1], world.windows[2]
-            assert(a.w == 635 and b.w == 635 and a.h == 704 and b.h == 704,
+            assert(a.w == 635 and b.w == 635 and a.h == 732 and b.h == 732,
                 "split tiles share usable bounds with a ten-pixel divider")
             assert(math.abs(a.x - b.x) == 645 and a.y == 32 and b.y == 32,
                 "the two clients never overlap or cover the navigation bar")
@@ -38,7 +38,7 @@ return {
             local active = shell(world).activeId
             for _, window in ipairs(world.windows) do
                 if window.id == active then
-                    assert(window.w == 1280 and window.h == 704, "single-app mode fills the usable display")
+                    assert(window.w == 1280 and window.h == 732, "single-app mode fills the usable display")
                 end
             end
         end },

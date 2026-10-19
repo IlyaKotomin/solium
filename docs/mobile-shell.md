@@ -8,27 +8,42 @@ same Solium compositor and real Wayland clients as the desktop. The desktop
 
 ## Behaviour
 
-- **Phone:** one foreground task, full usable screen, with persistent status
-  and three-button navigation bars. Home parks clients without terminating
-  them; unbound keys cannot leak into those hidden clients.
-- **Tablet:** the same launcher and task switcher, plus two real clients in
-  split screen. Choose **Split** on a Recents card, then choose another card.
-  **Resize split** cycles 50/50, 60/40 and 40/60; **Single app** returns to the
-  selected task. Controls occupy the reserved navigation bar.
-- **Recents:** MRU task cards use the compositor's actual client textures,
-  transformed by Lua, with QML chrome and buttons. Previous/Next, Open and
-  Close work with mouse presses; no touch gesture is required.
-- **Apps:** the launcher includes Notes and Gallery demo clients and a real
-  foot terminal. All apps also shows the compositor's live desktop-file app
-  index. A matched relaunch restores its existing task.
-- **Back:** closes the app drawer, shade or Recents, cancels split selection,
-  or returns from the root app to Home while preserving its task. Linux
-  desktop applications have no common Android activity-back protocol;
-  in-app back navigation is not synthesized by this prototype.
-- **Animations:** app scale/fade, Home fade, app-drawer reveal, live task
-  scaling/sliding, split resize, and close fade use the compositor clock and
-  hosted QML animations. A small dedicated loading scene avoids displaying
-  the QML runner's technical name during launch.
+- **Phone:** one foreground task and a compact **36 px** three-button
+  navigation bar. Home parks clients without terminating them; unbound keys
+  cannot leak into hidden clients.
+- **Home Screen:** applications only. Drag horizontally between pages; the
+  first contains the demo apps and Settings, subsequent pages use the live
+  installed-app index. Mouse wheels and trackpad scrolling work too.
+- **App switcher:** overlapping, rounded **live panes**, with neighbours
+  visible at the sides. Drag horizontally or scroll to browse, click a card
+  to open it, and swipe a card upward to close it. No Previous/Next/Open/Close
+  buttons. Empty space returns Home. MRU order changes only on activation,
+  rather than on browsing.
+- **Tablet:** two real clients in split screen. Open Control Center, choose
+  **Split screen**, then select the other card. The small navbar controls
+  resize the divider or return to one app.
+- **Control Center:** pull down from the status bar, click its top-right
+  chevron, or open Settings. Appearance, reduced motion, visual brightness,
+  Home, task switcher and tablet multitasking controls act on the session.
+  Brightness is a compositor overlay, not a hardware backlight change.
+  Appearance changes the shell wallpaper; applications retain their themes.
+  No simulated Wi-Fi, Bluetooth, battery or media controls are shown.
+- **Back:** dismisses Control Center or the switcher, cancels split selection,
+  or returns from the root app to Home while preserving its task. In-app
+  navigation is the application's own.
+- **Launch:** the QML icon reports its actual rectangle on release. Lua uses
+  `sol.present_from` on the launch's loading pane, **before** the application
+  maps; adoption keeps the same pane and animation. An origin is consumed
+  once. Keyboard launches use a small central fade instead.
+- **Window chrome:** `panes/mobile/Pane.qml` declares the compositor's
+  `client.radius`; its identity and shadow layers travel through the same
+  pane matrix as the client. The shell draws no duplicate title, icon or
+  border positioned beside a separately animated window. Drag updates use
+  zero-duration presentation; release snaps with the compositor clock.
+
+![Live app switcher](mobile/phone-switcher.png)
+
+![Control Center](mobile/control-center.png)
 
 Notes is an editable **in-memory draft**, not a persistent notes database.
 Gallery is an interactive collection of generated geometric studies, not a
@@ -90,19 +105,27 @@ docker run -d --name solium-mobile-phone \
   solium-dev:fc44 bash /src/dev/mobile-session.sh phone
 ```
 
-Connect macOS Screen Sharing to `vnc://127.0.0.1:5902`. The port is bound only
+Connect a VNC client to `vnc://127.0.0.1:5902`. The port is bound only
 to localhost. For a second session use container `solium-mobile-tablet`, port
 5903, and the `tablet` argument. Stop them with `docker stop` followed by the
 container name. Logs are under `/tmp/solium-mobile-phone` or
 `/tmp/solium-mobile-tablet` inside the respective container.
 
+A browser viewer is also available in the current development session at
+`http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale&reconnect=true`.
+It uses Fedora's noVNC/websockify in the separate `solium-mobile-viewer`
+container, proxying to the phone VNC socket. Both published ports bind only
+localhost. After restarting Solium the page reconnects automatically.
+
 ## Controls
 
 | Control | Action |
 |---|---|
-| Navigation triangle / circle / square | Back / Home / Recents |
-| Click status bar | Open or close the session panel |
-| Super+H / Super+B / Super+Space / Super+A | Home / Back / Recents / All apps |
+| Compact chevron / circle / square | Back / Home / App switcher |
+| Pull down from status bar / click top-right chevron | Control Center |
+| Drag or scroll on Home / switcher | Browse app pages / live windows |
+| Swipe a card upward / click it | Close task / open task |
+| Super+H / Super+B / Super+Space / Super+A | Home / Back / Switcher / Launcher |
 | Super+N / Super+G / Super+Return | Launch Notes / Gallery / Terminal |
 | Super+[ / Super+] | Previous / Next task card |
 | Super+Shift+S | Split the two most recent tasks, tablet only |
@@ -115,7 +138,7 @@ Two Lua scenarios under `crates/solium/tests/scenarios/` run against real
 Wayland clients: phone foreground geometry, Home parking, app drawer/Back,
 Recents/selection and phone split rejection; tablet split bounds, ratio changes
 and return to single-app mode. The existing runner discovers them dynamically.
-Two additional script-host regressions reload the actual mobile entry with
+Two original script-host regressions reload the actual mobile entry with
 kept state and verify MRU/Recents and tablet split/active-task preservation.
 Both failed before guarding the entry's initial empty snapshot: a fresh Lua
 VM has not received live windows yet, so treating that as an empty desktop
@@ -153,19 +176,22 @@ Results on 2026-10-19:
 
 | Check | Result |
 |---|---|
-| Complete Solium test binary, Rust 1.98 | 2042 passed, 0 failed, 3 pre-existing ignored |
-| Workspace clippy, Rust 1.99, `--all-targets -- -D warnings` | Passed |
-| Rust formatting, shell syntax, mobile `solium --check` | Passed |
-| Phone buttons / typing / restore / close | Passed with real Qt Wayland clients |
-| Tablet card picker / split / ratio | Passed with real Qt Wayland clients |
-| Four size/orientation changes and automatic profile selection | Passed |
-| Live reload during tablet split and Recents | Passed; task order and split preserved |
-| Launch and Recents animation intermediate/settled frames | Captured and visually checked |
+| Initial mobile implementation's full test binary | 2042 passed, 3 pre-existing ignored (before the visual revision) |
+| Revised policy's six script-host regressions | Passed: drag/snap, swipe-close, loading-pane launch origin, shade/settings reload, task/split reload |
+| Real-client scenario suite | Passed, run in its own process |
+| QML scenario suite | Passed, run in its own process |
+| Lua/QML loading, Rust formatting, shell syntax | Passed |
+| Phone: paged Home, launch from icon, horizontal/vertical card drag, Control Center | Captured through the real pointer path |
+| Tablet: card drag, Control Center, split picker and ratio | Captured through the real pointer path |
+
+The Qt scenario suite and client suite are run in separate processes: running
+both after initializing Qt in one process aborts in this headless setup. This
+revision does not claim another complete all-tests-in-one-process pass.
 
 This verifies a mobile-sized **nested compositor**, with llvmpipe and software
 QML. It does not verify a phone's DRM/GPU driver, suspend/power behaviour,
 hardware sensors, physical screen rotation, or hardware performance. Touch,
-gesture navigation, an on-screen keyboard, a lock screen and Android APK
+touch gesture navigation, an on-screen keyboard, a lock screen and Android APK
 compatibility are outside this iteration. XWayland was unavailable in this
 unprivileged container; the tested clients are native Wayland.
 
@@ -176,6 +202,7 @@ unprivileged container; the tested clients are native Wayland.
 - `lua/mobile/policy.lua`: task ownership, MRU, navigation, real geometry,
   presentation and event handling; state survives Lua reload via `sol.keep`.
 - `qml/mobile/`: hosted shell, controls and native QML demo clients.
+- `qml/panes/mobile/`: client rounding, pane-bound identity and shadow.
 - `qml/loading/mobile.qml`: loading presentation.
 - `dev/mobile-session.sh`, `mobile-smoke.sh`, `mobile-rotation.sh`: isolated
   session and reproducible runtime exercises.

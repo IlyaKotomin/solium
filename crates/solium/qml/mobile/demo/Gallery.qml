@@ -5,11 +5,11 @@ Window {
     id: app
     visible: true; width: 390; height: 748
     title: "Gallery"
-    color: "#1b252b"
+    color: "#ffffff"
     property int selected: -1
-    readonly property var tones: ["#b6b98b", "#c28e78", "#849f9e", "#aaa0b6", "#c4ae82", "#7d9a7a"]
-    Text { x: 24; y: 24; text: "Little landscapes"; color: "#f0e8d8"; font { pixelSize: 26; weight: Font.Medium } }
-    Text { x: 24; y: 64; text: "A collection of shapes & quiet colour"; color: "#9eafa8"; font.pixelSize: 12 }
+    readonly property var tones: ["#efb855", "#e8889f", "#72b8d2", "#9994d0", "#eab998", "#91b8a5"]
+    Text { x: 24; y: 24; text: "Gallery"; color: "#1c1c1e"; font { pixelSize: 26; weight: Font.Bold } }
+    Text { x: 24; y: 64; text: "Your collection"; color: "#8e8e93"; font.pixelSize: 12 }
     Flickable {
         id: collection
         x: 20; y: 110; width: parent.width - 40; height: parent.height - 130

@@ -9,6 +9,24 @@ mkdir -p "$out"
 export XDG_RUNTIME_DIR="$out/runtime"
 mkdir -p "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
+# Reusing a private session directory must not select a dead socket left by
+# an interrupted run. Refuse a live session; remove only refused sockets.
+python3 - "$XDG_RUNTIME_DIR" <<'PYRUNTIME'
+import errno, pathlib, socket, sys
+for path in pathlib.Path(sys.argv[1]).glob("wayland-*"):
+    if not path.is_socket():
+        continue
+    with socket.socket(socket.AF_UNIX) as probe:
+        try:
+            probe.connect(str(path))
+        except OSError as error:
+            if error.errno not in (errno.ECONNREFUSED, errno.ENOENT):
+                raise
+            path.unlink(missing_ok=True)
+            pathlib.Path(str(path) + ".lock").unlink(missing_ok=True)
+        else:
+            sys.exit("A session is already using " + str(path.parent))
+PYRUNTIME
 export LIBGL_ALWAYS_SOFTWARE=1
 export LC_ALL=C.UTF-8
 export WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman
@@ -18,6 +36,7 @@ unset DISPLAY WAYLAND_DISPLAY WAYLAND_SOCKET
 pids=()
 cleanup() {
     for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+    for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
 }
 trap cleanup EXIT
 

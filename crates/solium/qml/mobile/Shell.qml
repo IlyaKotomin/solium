@@ -1,9 +1,11 @@
 import QtQuick
+import QtQml.Models
 import Solium
 
 Item {
     id: root
     property string page: "home"
+    property string shadeBackground: "home"
     property bool tablet: false
     property var cards: []
     property int taskCount: 0
@@ -11,193 +13,248 @@ Item {
     property bool splitActive: false
     property bool pickingSplit: false
     property int statusHeight: 32
-    property int navigationHeight: 64
+    property int navigationHeight: 36
+    property real brightness: 1
+    property bool darkAppearance: false
+    property bool reduceMotion: false
     property date now: new Date()
-    readonly property color ink: "#e6f0df"
-    readonly property bool launcher: page === "home" || page === "apps"
-    readonly property real inset: tablet ? 40 : 24
+    property var installed: []
+    readonly property string underneath: page === "shade" ? shadeBackground : page
+    readonly property int columns: tablet ? Math.max(6, Math.floor(width / 112)) : 4
+    readonly property int rows: Math.max(1, Math.min(tablet ? 5 : 6, Math.floor((height - 160) / 106)))
+    readonly property int capacity: columns * rows
+    readonly property int pageCount: 1 + Math.ceil(installed.length / capacity)
+    readonly property var builtins: [
+        { name: "Notes", app: "notes", glyph: "≡", tone: "#f6bd24" },
+        { name: "Gallery", app: "gallery", glyph: "✿", tone: "#f04e78" },
+        { name: "Terminal", app: "terminal", glyph: ">_", tone: "#262a34" },
+        { name: "Settings", app: "settings", glyph: "⚙", tone: "#8c929e" }
+    ]
     function send(action, data) { Solium.send("mobile." + action, data || {}) }
+    function launch(entry, origin) {
+        if (entry.app === "settings") send("shade")
+        else if (entry.app) send("launch", { app: entry.app, origin: origin })
+        else send("desktop", { id: entry.desktopId, origin: origin })
+    }
+    function refreshApps() {
+        let entries = []
+        for (let i = 0; i < appIndex.count; ++i) {
+            const app = appIndex.objectAt(i)
+            if (app && app.present) entries.push({ name: app.appName, desktopId: app.desktopId,
+                glyph: app.appName.slice(0, 1), icon: app.iconName, tone: "#576c9e" })
+        }
+        installed = entries
+    }
+    Instantiator {
+        id: appIndex
+        model: Apps
+        delegate: QtObject {
+            required property var model
+            readonly property string appName: model.name
+            readonly property string desktopId: model.id
+            readonly property string iconName: model.icon
+            readonly property bool present: model.present
+        }
+        onObjectAdded: Qt.callLater(root.refreshApps)
+        onObjectRemoved: Qt.callLater(root.refreshApps)
+    }
     Timer { interval: 1000; running: true; repeat: true; onTriggered: root.now = new Date() }
-
-    // A shell page owns the keyboard; client view relinquishes it. The Lua
-    // input grab additionally protects thumbnail clients from stray input.
     focus: page !== "app"
     Solium.keyboard.wants: page !== "app"
     Solium.keyboard.claims: ["Escape"]
     Keys.onEscapePressed: root.send("back")
 
-    Rectangle {
-        anchors.fill: parent
-        color: "#101c24"
-        opacity: root.page === "apps" ? 0.97 : (root.page === "recents" ? 0.22 : 0)
-        Behavior on opacity { NumberAnimation { duration: 260; easing.type: Easing.OutCubic } }
-    }
-
-    // Status is deliberately only a real clock and session identity. No fake
-    // battery, radio signal or connectivity data is shown.
-    Rectangle {
-        id: status
-        width: parent.width; height: root.statusHeight
-        color: root.page === "app" ? "#101a20" : "transparent"
-        Text {
-            anchors { left: parent.left; leftMargin: root.inset; verticalCenter: parent.verticalCenter }
-            text: Qt.formatTime(root.now, "h:mm"); color: root.ink; font { pixelSize: 12; weight: Font.DemiBold }
-        }
-        Text {
-            anchors { right: parent.right; rightMargin: root.inset; verticalCenter: parent.verticalCenter }
-            text: root.splitActive ? "SPLIT SCREEN" : "SOLIUM"; color: "#bfcebd"
-            font { pixelSize: 10; letterSpacing: 2 }
-        }
-        MouseArea { anchors.fill: parent; onClicked: root.send("shade") }
-    }
-
     Item {
-        id: home
-        anchors { left: parent.left; right: parent.right; top: status.bottom; bottom: navigation.top }
-        opacity: root.page === "home" ? 1 : 0
+        id: launcher
+        anchors { top: parent.top; topMargin: root.statusHeight; bottom: navigation.top; left: parent.left; right: parent.right }
+        opacity: root.underneath === "home" || root.underneath === "apps" ? 1 : 0
         visible: opacity > 0.001
-        enabled: root.page === "home"
-        Behavior on opacity { NumberAnimation { duration: 240; easing.type: Easing.OutCubic } }
-        MouseArea { anchors.fill: parent }
-        Column {
-            anchors { top: parent.top; topMargin: root.height < 560 ? 18 : (root.tablet ? 58 : 52); left: parent.left; leftMargin: root.inset }
-            spacing: 8
-            Text { text: Qt.formatDate(root.now, "dddd, MMMM d"); color: "#d4dfcf"; font.pixelSize: root.tablet ? 18 : 15 }
-            Text { text: Qt.formatTime(root.now, "hh:mm"); color: "#e0edcf"; font { pixelSize: root.height < 560 ? 50 : (root.tablet ? 112 : 86); weight: Font.Light; letterSpacing: -3 } }
-            Text { visible: root.height >= 560; text: "Make space for your day."; color: "#b9cdbb"; font.pixelSize: 14 }
-        }
-        Rectangle {
-            visible: root.height >= 600
-            width: Math.min(parent.width - root.inset * 2, 440); height: 80; radius: 24
-            anchors { left: parent.left; leftMargin: root.inset; bottom: dock.top; bottomMargin: root.tablet ? 48 : 32 }
-            color: "#a52b4140"; border { width: 1; color: "#456059" }
-            Column {
-                anchors { left: parent.left; leftMargin: 20; verticalCenter: parent.verticalCenter }
-                spacing: 6
-                Text { text: root.taskCount ? "Pick up where you left off" : "A fresh start"; color: root.ink; font { pixelSize: 15; weight: Font.Medium } }
-                Text { text: root.taskCount ? root.taskCount + (root.taskCount === 1 ? " app running" : " apps running") : "Your apps are one tap away"; color: "#b9ccbb"; font.pixelSize: 12 }
-            }
-            Text { anchors { right: parent.right; rightMargin: 20; verticalCenter: parent.verticalCenter } text: "→"; color: "#c5dfb3"; font.pixelSize: 26 }
-            MouseArea { anchors.fill: parent; onClicked: root.send(root.taskCount ? "recents" : "apps") }
-        }
-        Row {
-            id: dock
-            anchors { bottom: parent.bottom; bottomMargin: root.tablet ? 42 : 16; horizontalCenter: parent.horizontalCenter }
-            spacing: root.tablet ? 24 : Math.max(0, (root.width - 32 - 320) / 3)
-            AppTile { title: "Notes"; glyph: "Aa"; tone: "#c9dfb6"; onTriggered: root.send("launch", { app: "notes" }) }
-            AppTile { title: "Gallery"; glyph: "▧"; tone: "#e1ceaf"; onTriggered: root.send("launch", { app: "gallery" }) }
-            AppTile { title: "Terminal"; glyph: ">_"; tone: "#b7d5d7"; onTriggered: root.send("launch", { app: "terminal" }) }
-            AppTile { title: "All apps"; gridIcon: true; tone: "#d1c7e4"; onTriggered: root.send("apps") }
-        }
-    }
-
-    Item {
-        anchors { top: status.bottom; bottom: navigation.top; left: parent.left; right: parent.right }
-        opacity: root.page === "apps" ? 1 : 0
-        visible: opacity > 0.001
-        enabled: root.page === "apps"
-        scale: 0.97 + opacity * 0.03
-        Behavior on opacity { NumberAnimation { duration: 240; easing.type: Easing.OutCubic } }
-        MouseArea { anchors.fill: parent }
-        Text {
-            id: appsTitle
-            x: root.inset; y: 28; text: "Your apps"; color: root.ink; font { pixelSize: 30; weight: Font.Medium }
-        }
-        Text { x: root.inset; y: 72; text: "OPEN SOMETHING GOOD"; color: "#9cb5a4"; font { pixelSize: 10; letterSpacing: 2 } }
-        Flickable {
-            anchors { top: appsTitle.bottom; topMargin: 56; bottom: parent.bottom; left: parent.left; right: parent.right; margins: root.inset }
-            clip: true; contentHeight: appGrid.height + 24
-            Grid {
-                id: appGrid
-                columns: Math.max(3, Math.floor(parent.width / 94)); spacing: 14
-                AppTile { title: "Notes"; glyph: "Aa"; onTriggered: root.send("launch", { app: "notes" }) }
-                AppTile { title: "Gallery"; glyph: "▧"; tone: "#e1ceaf"; onTriggered: root.send("launch", { app: "gallery" }) }
-                AppTile { title: "Terminal"; glyph: ">_"; tone: "#b7d5d7"; onTriggered: root.send("launch", { app: "terminal" }) }
-                Repeater {
-                    model: Apps
-                    AppTile {
-                        title: model.name
-                        glyph: model.name.slice(0, 1).toUpperCase()
-                        tone: "#d1c7e4"
-                        onTriggered: root.send("desktop", { id: model.id })
+        enabled: root.page === "home" || root.page === "apps"
+        scale: 0.96 + opacity * 0.04
+        Behavior on opacity { NumberAnimation { duration: root.reduceMotion ? 0 : 280; easing.type: Easing.OutCubic } }
+        ListView {
+            id: desktops
+            anchors { fill: parent; topMargin: 28; bottomMargin: 44 }
+            orientation: ListView.Horizontal
+            snapMode: ListView.SnapOneItem
+            boundsBehavior: Flickable.StopAtBounds
+            maximumFlickVelocity: 1800
+            clip: true
+            model: root.pageCount
+            onMovementEnded: currentIndex = Math.round(contentX / Math.max(1, width))
+            delegate: Item {
+                required property int index
+                width: desktops.width; height: desktops.height
+                Grid {
+                    anchors { top: parent.top; left: parent.left; right: parent.right; margins: root.tablet ? 36 : 12 }
+                    columns: root.columns
+                    Repeater {
+                        model: index === 0 ? root.builtins : root.installed.slice((index - 1) * root.capacity, index * root.capacity)
+                        Item {
+                            required property var modelData
+                            width: (desktops.width - (root.tablet ? 72 : 24)) / root.columns
+                            height: Math.min(112, desktops.height / root.rows)
+                            AppTile {
+                                anchors.horizontalCenter: parent.horizontalCenter
+                                title: modelData.name; glyph: modelData.glyph; tone: modelData.tone
+                                imageSource: modelData.icon ? "image://solium/icon/" + modelData.icon + "?size=60" : ""
+                                onTriggered: origin => root.launch(modelData, origin)
+                            }
+                        }
                     }
                 }
             }
-        }
-    }
-
-    Item {
-        id: recents
-        anchors { fill: parent; topMargin: root.statusHeight; bottomMargin: root.navigationHeight }
-        opacity: root.page === "recents" ? 1 : 0
-        visible: opacity > 0.001
-        enabled: root.page === "recents"
-        Behavior on opacity { NumberAnimation { duration: 250; easing.type: Easing.OutCubic } }
-        clip: true
-        MouseArea { anchors.fill: parent }
-        Text {
-            x: root.inset; y: 22
-            text: root.pickingSplit ? "Choose a second app" : "Recent apps"
-            color: root.ink; font { pixelSize: root.tablet ? 30 : 26; weight: Font.Medium }
-        }
-        Text {
-            x: root.inset; y: 62
-            text: root.pickingSplit ? "Select another card to share the screen" : root.taskCount + (root.taskCount === 1 ? " app, ready when you are" : " apps, ready when you are")
-            color: "#b9ccbb"; font.pixelSize: 12
-        }
-        Repeater {
-            model: root.cards
-            Item {
-                id: card
-                required property var modelData
-                x: modelData.x - Solium.monitor.whole.x
-                y: modelData.y - Solium.monitor.whole.y - root.statusHeight
-                width: modelData.w; height: modelData.h
-                // The pixels in this rectangle are the compositor's live pane.
-                // Only chrome and hit regions belong to QML.
-                Rectangle { anchors.fill: parent; color: "transparent"; radius: 16; border { width: 1; color: "#6b8173" } }
-                Text {
-                    anchors { left: parent.left; right: parent.right; bottom: parent.top; bottomMargin: 12 }
-                    text: card.modelData.title; color: root.ink; elide: Text.ElideRight
-                    font { pixelSize: 14; weight: Font.Medium }
-                }
-                MouseArea { anchors.fill: parent; onClicked: root.send("select", { id: card.modelData.id }) }
-                Row {
-                    anchors { top: parent.bottom; topMargin: 14; horizontalCenter: parent.horizontalCenter } spacing: 10
-                    ActionButton { label: "Open"; highlighted: true; onTriggered: root.send("select", { id: card.modelData.id }) }
-                    ActionButton { visible: root.tablet && root.taskCount > 1; label: "Split"; onTriggered: root.send("split", { id: card.modelData.id }) }
-                    ActionButton { symbol: "×"; label: "Close"; onTriggered: root.send("close", { id: card.modelData.id }) }
+            MouseArea {
+                anchors.fill: parent; acceptedButtons: Qt.NoButton
+                onWheel: wheel => {
+                    const d = wheel.angleDelta.x || wheel.angleDelta.y
+                    if (d) desktops.currentIndex = Math.max(0, Math.min(root.pageCount - 1, desktops.currentIndex + (d < 0 ? 1 : -1)))
                 }
             }
         }
-        Column {
-            visible: root.taskCount === 0
-            anchors.centerIn: parent; spacing: 12
-            Text { anchors.horizontalCenter: parent.horizontalCenter; text: "A little breathing room"; color: root.ink; font.pixelSize: 21 }
-            Text { anchors.horizontalCenter: parent.horizontalCenter; text: "Open an app and it will appear here."; color: "#b9ccbb"; font.pixelSize: 13 }
-            ActionButton { anchors.horizontalCenter: parent.horizontalCenter; label: "All apps"; highlighted: true; onTriggered: root.send("apps") }
-        }
         Row {
-            visible: root.taskCount > 1
-            anchors { bottom: parent.bottom; bottomMargin: 12; horizontalCenter: parent.horizontalCenter } spacing: 16
-            ActionButton { symbol: "←"; label: "Previous"; onTriggered: root.send("previous") }
-            ActionButton { label: "Next"; symbol: "→"; onTriggered: root.send("next") }
+            anchors { bottom: parent.bottom; bottomMargin: 16; horizontalCenter: parent.horizontalCenter }
+            spacing: 8
+            Repeater {
+                model: root.pageCount
+                Rectangle {
+                    required property int index
+                    width: 6; height: 6; radius: 3
+                    color: index === Math.round(desktops.contentX / Math.max(1, desktops.width)) ? "white" : "#65ffffff"
+                    MouseArea { anchors { fill: parent; margins: -9 } onClicked: desktops.currentIndex = index }
+                }
+            }
+        }
+    }
+
+    // A single gesture region. No QML copy of the cards, labels or borders:
+    // Lua moves real panes, and their own decoration carries app identity.
+    MouseArea {
+        id: switcher
+        anchors { fill: parent; topMargin: root.statusHeight; bottomMargin: root.navigationHeight }
+        enabled: root.page === "recents"
+        visible: enabled
+        preventStealing: true
+        property real startX: 0
+        property real startY: 0
+        property real wheelX: 0
+        onPressed: mouse => {
+            startX = mouse.x; startY = mouse.y
+            root.send("swipe.begin", { x: mouse.x, y: mouse.y + root.statusHeight })
+        }
+        onPositionChanged: mouse => {
+            if (pressed) root.send("swipe.move", { dx: mouse.x - startX, dy: mouse.y - startY })
+        }
+        onReleased: mouse => root.send("swipe.end", { tap: Math.abs(mouse.x - startX) < 8 && Math.abs(mouse.y - startY) < 8 })
+        onCanceled: root.send("swipe.end")
+        onWheel: wheel => {
+            if (!wheelEnd.running) {
+                wheelX = 0
+                root.send("swipe.begin", { x: root.width / 2, y: root.height / 2 })
+            }
+            const pixel = wheel.pixelDelta.x || wheel.pixelDelta.y
+            const angle = wheel.angleDelta.x || wheel.angleDelta.y
+            wheelX += pixel || angle * 0.8
+            root.send("swipe.move", { dx: wheelX, dy: 0 })
+            wheelEnd.restart()
+        }
+        Timer { id: wheelEnd; interval: 160; onTriggered: root.send("swipe.end") }
+        Text {
+            visible: root.taskCount === 0
+            anchors.centerIn: parent; text: "No recent apps"; color: "white"; font.pixelSize: 18
+        }
+        Text {
+            anchors { horizontalCenter: parent.horizontalCenter; bottom: parent.bottom; bottomMargin: 12 }
+            text: root.pickingSplit ? "Choose another app" : ""; color: "white"; font.pixelSize: 13
         }
     }
 
     Rectangle {
-        anchors { top: status.bottom; left: parent.left; right: parent.right; bottom: navigation.top; margins: 12 }
-        radius: 28; color: "#edf2e6"; visible: root.page === "shade"
-        MouseArea { anchors.fill: parent }
-        Column {
-            x: 24; y: 30; width: parent.width - 48; spacing: 20
-            Text { text: Qt.formatDate(root.now, "dddd, MMMM d"); color: "#344b3b"; font.pixelSize: 15 }
-            Text { text: "Take a moment"; color: "#23392d"; font { pixelSize: 30; weight: Font.Medium } }
-            Text { text: root.taskCount + " apps running"; color: "#536a59"; font.pixelSize: 15 }
-            ActionButton { label: "Recent apps"; highlighted: true; onTriggered: root.send("recents") }
-            ActionButton { label: "All apps"; onTriggered: root.send("apps") }
-            Rectangle { width: parent.width; height: 1; color: "#c5d2be" }
-            Text { width: parent.width; text: "A little space to focus."; color: "#536a59"; wrapMode: Text.WordWrap; font.pixelSize: 16 }
+        id: status
+        width: parent.width; height: root.statusHeight
+        color: root.underneath === "app" ? "#13151c" : "transparent"
+        Text {
+            anchors { left: parent.left; leftMargin: 24; verticalCenter: parent.verticalCenter }
+            text: Qt.formatTime(root.now, "h:mm"); color: "white"; font { pixelSize: 13; weight: Font.DemiBold }
+        }
+        Text {
+            anchors { right: parent.right; rightMargin: 24; verticalCenter: parent.verticalCenter }
+            text: "⌄"; color: "white"; font.pixelSize: 20
+        }
+        MouseArea {
+            anchors.fill: parent
+            property real startY: 0
+            property bool pulled: false
+            onPressed: mouse => { startY = mouse.y; pulled = false }
+            onReleased: mouse => { if (mouse.y - startY > 14) { pulled = true; root.send("shade") } }
+            onClicked: { if (!pulled) root.send("shade") }
+        }
+    }
+
+    Rectangle {
+        anchors.fill: parent; color: "black"; opacity: (1 - root.brightness) * 0.7
+        // Visual dimming only; no input item, so it never intercepts a client.
+    }
+    Rectangle {
+        anchors.fill: parent; color: "#121629"
+        opacity: root.page === "shade" ? 0.96 : 0
+        visible: opacity > 0.001
+        Behavior on opacity { NumberAnimation { duration: root.reduceMotion ? 0 : 260 } }
+        MouseArea { anchors.fill: parent; enabled: root.page === "shade"; onClicked: root.send("back") }
+    }
+    Item {
+        id: center
+        width: Math.min(root.width - 36, 380)
+        height: Math.min(root.height - root.statusHeight - root.navigationHeight - 20, 570)
+        anchors.horizontalCenter: parent.horizontalCenter
+        y: root.page === "shade" ? root.statusHeight + 12 : -height - 20
+        opacity: root.page === "shade" ? 1 : 0
+        visible: opacity > 0.001
+        enabled: root.page === "shade"
+        Behavior on y { NumberAnimation { duration: root.reduceMotion ? 0 : 360; easing.type: Easing.OutCubic } }
+        Behavior on opacity { NumberAnimation { duration: root.reduceMotion ? 0 : 240 } }
+        Flickable {
+            anchors.fill: parent; contentHeight: centerContent.height + 10; clip: true
+            Column {
+                id: centerContent
+                width: parent.width; spacing: 12
+                Text { text: "Control Center"; color: "white"; font { pixelSize: 28; weight: Font.DemiBold } height: 52; verticalAlignment: Text.AlignVCenter }
+                Grid {
+                    width: parent.width; columns: 2; spacing: 12
+                    ControlTile { width: (parent.width - 12) / 2; height: 108; glyph: "◐"; label: "Appearance"; detail: root.darkAppearance ? "Dark" : "Light"; active: !root.darkAppearance; onTriggered: root.send("setting", { key: "dark" }) }
+                    ControlTile { width: (parent.width - 12) / 2; height: 108; glyph: "◈"; label: "Motion"; detail: root.reduceMotion ? "Reduced" : "Full"; active: !root.reduceMotion; onTriggered: root.send("setting", { key: "reduceMotion" }) }
+                    ControlTile { width: (parent.width - 12) / 2; height: 108; glyph: "▣"; label: "App switcher"; detail: root.taskCount + " running"; onTriggered: root.send("recents") }
+                    ControlTile { width: (parent.width - 12) / 2; height: 108; glyph: "⌂"; label: "Home Screen"; detail: "Applications"; onTriggered: root.send("home") }
+                }
+                Rectangle {
+                    width: parent.width; height: 92; radius: 23; color: "#b52e354a"
+                    Text { x: 18; y: 12; text: "☀  Brightness"; color: "white"; font { pixelSize: 14; weight: Font.DemiBold } }
+                    Rectangle {
+                        id: brightnessTrack
+                        x: 18; y: 48; width: parent.width - 36; height: 25; radius: 12; color: "#4c5265"
+                        Rectangle { width: parent.width * ((root.brightness - 0.25) / 0.75); height: parent.height; radius: 12; color: "#f2f2f7" }
+                        MouseArea {
+                            anchors { fill: parent; margins: -8 }
+                            function adjust(x) { root.send("setting", { key: "brightness", value: 0.25 + 0.75 * Math.max(0, Math.min(1, (x - 8) / brightnessTrack.width)) }) }
+                            onPressed: mouse => adjust(mouse.x)
+                            onPositionChanged: mouse => { if (pressed) adjust(mouse.x) }
+                        }
+                    }
+                }
+                Row {
+                    spacing: 12
+                    ControlTile { width: (centerContent.width - 12) / 2; height: 100; glyph: root.tablet ? "◫" : "↻"; label: root.tablet ? (root.splitActive ? "Single app" : "Split screen") : "Reload shell"; detail: root.tablet ? "Multitasking" : "Refresh"; onTriggered: { if (!root.tablet) root.send("reload"); else if (root.splitActive) { root.send("unsplit"); root.send("back") } else { root.send("recents"); root.send("split", { id: root.activeId }) } } }
+                    ControlTile { width: (centerContent.width - 12) / 2; height: 100; glyph: "×"; label: "Close"; detail: "Control Center"; onTriggered: root.send("back") }
+                }
+            }
+        }
+        MouseArea {
+            anchors { left: parent.left; right: parent.right; top: parent.bottom }
+            height: 24
+            property real startY: 0
+            onPressed: mouse => startY = mouse.y
+            onReleased: mouse => { if (mouse.y - startY < -12) root.send("back") }
+            Rectangle { anchors.centerIn: parent; width: 36; height: 4; radius: 2; color: "#aaffffff" }
         }
     }
 
@@ -205,20 +262,18 @@ Item {
         id: navigation
         anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
         height: root.navigationHeight
-        color: root.page === "app" ? "#101a20" : "#d9142329"
+        color: root.page === "app" ? "#13151c" : "#14000000"
         Row {
             visible: root.page === "app" && root.splitActive
-            anchors { left: parent.left; leftMargin: 24; verticalCenter: parent.verticalCenter }
-            spacing: 8
-            ActionButton { label: root.width >= 800 ? "Resize split" : ""; symbol: root.width >= 800 ? "" : "↔"; Accessible.name: "Resize split"; onTriggered: root.send("ratio") }
-            ActionButton { label: root.width >= 800 ? "Single app" : ""; symbol: root.width >= 800 ? "" : "▣"; Accessible.name: "Single app"; onTriggered: root.send("unsplit") }
+            anchors { left: parent.left; leftMargin: 20; verticalCenter: parent.verticalCenter } spacing: 8
+            ActionButton { width: 38; height: 30; symbol: "↔"; onTriggered: root.send("ratio") }
+            ActionButton { width: 38; height: 30; symbol: "▣"; onTriggered: root.send("unsplit") }
         }
         Row {
-            anchors.centerIn: parent
-            spacing: root.tablet ? 64 : 40
-            ActionButton { width: 56; height: 48; symbol: "◁"; fill: "transparent"; Accessible.name: "Back"; onTriggered: root.send("back") }
-            ActionButton { width: 56; height: 48; symbol: "○"; fill: "transparent"; Accessible.name: "Home"; onTriggered: root.send("home") }
-            ActionButton { width: 56; height: 48; symbol: "□"; fill: "transparent"; Accessible.name: "Recent apps"; onTriggered: root.send("recents") }
+            anchors.centerIn: parent; spacing: root.tablet ? 44 : 32
+            ActionButton { width: 52; height: 34; symbol: "‹"; fill: "transparent"; Accessible.name: "Back"; onTriggered: root.send("back") }
+            ActionButton { width: 52; height: 34; symbol: "○"; fill: "transparent"; Accessible.name: "Home"; onTriggered: root.send("home") }
+            ActionButton { width: 52; height: 34; symbol: "▢"; fill: "transparent"; Accessible.name: "App switcher"; onTriggered: root.send("recents") }
         }
     }
 }

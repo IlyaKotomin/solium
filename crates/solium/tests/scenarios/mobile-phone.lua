@@ -21,7 +21,7 @@ return {
         { expect = page("app", 1) },
         { expect = function(world)
             local w = world.windows[1]
-            assert(w.x == 0 and w.y == 32 and w.w == 390 and w.h == 748,
+            assert(w.x == 0 and w.y == 32 and w.w == 390 and w.h == 776,
                 "a phone app leaves space for both system bars")
         end },
         { open = true, app_id = "mobile-gallery" }, { answer = 2 }, { wait = 400 },
@@ -38,7 +38,7 @@ return {
             local ui = shell(world)
             assert(#ui.cards == 2, "one live thumbnail slot per task")
             local card = ui.cards[1]
-            assert(card.w < 390 and card.h < 748 and card.x >= 0,
+            assert(card.w < 390 and card.h < 776 and card.x >= 0,
                 "the active app shrinks to an on-screen card")
         end },
         { key = "super+bracketright" }, { wait = 400 },
