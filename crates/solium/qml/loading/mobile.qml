@@ -4,7 +4,7 @@ Rectangle {
     property string program: ""
     property int waited: 0
     color: "#f2f2f7"
-    radius: 30
+    radius: 0
     Column {
         anchors.centerIn: parent; spacing: 20
         Row {

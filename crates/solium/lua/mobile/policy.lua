@@ -4,6 +4,7 @@ local config = require("mobile.config")
 local mobile = {}
 local last_geometry
 local presentations = {}
+local pane_style = "mobile-flat"
 local swipe = { offset = 0, lift = 0, id = 0 }
 local pending_launch
 local card_slots = {}
@@ -111,9 +112,17 @@ function mobile.apply(motion)
     if ready then ordered, by_id, dialogs = windows() end
     local placed, cards = {}, {}
     sol.animate(state.settings.reduceMotion and { duration = 0 } or motion or config.motion)
+    local content_page = state.page == "shade" and state.previous or state.page
+    local wanted_style = content_page == "recents" and "mobile" or "mobile-flat"
+    -- A real pane style change updates the compositor's client mask. Merely
+    -- changing a QML Rectangle cannot change the application's own corners.
+    -- Only switch at mode boundaries, never for each pointer move.
+    if pane_style ~= wanted_style then
+        pane_style = wanted_style
+        sol.pane(wanted_style)
+    end
     local card_w = card_metrics(area, tablet)
     sol.pane_values({ mobilePage = state.page, mobileHeaderScale = math.min(2.4, math.max(1, area.w / card_w * 0.8)) })
-    local content_page = state.page == "shade" and state.previous or state.page
     card_slots = {}
     local focused_index = 1
     for index, window in ipairs(ordered) do
@@ -265,7 +274,7 @@ function mobile.launch(name, data)
     remember_origin(data)
     if name == "terminal" then
         if pending_launch then pending_launch.program = "foot" end
-        sol.spawn("foot", "--app-id=mobile-terminal", "--title=Terminal", "/bin/bash", "--noprofile", "--norc")
+        sol.spawn("foot", "--override=resize-by-cells=no", "--app-id=mobile-terminal", "--title=Terminal", "/bin/bash", "--noprofile", "--norc")
     elseif name == "notes" or name == "gallery" then
         -- The file paths are shipped assets, selected from a closed set.
         local source = package.searchpath("mobile.policy", package.path)

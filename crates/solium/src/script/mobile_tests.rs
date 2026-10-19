@@ -205,3 +205,48 @@ fn mobile_shade_preserves_foreground_geometry_and_keeps_settings_on_reload() {
         "true"
     );
 }
+
+#[test]
+fn mobile_rounds_only_overview_and_does_not_rebuild_frames_while_swiping() {
+    let (mut scripts, snapshot, _) = mobile_reload_fixture();
+    let overview = scripts.key("super+space", snapshot.clone());
+    assert!(overview.commands.iter().any(|c| matches!(c,
+        Command::Decoration { name: Some(name) } if name == "mobile"
+    )));
+    let drag = mobile_action(
+        &mut scripts,
+        &snapshot,
+        "swipe.move",
+        r#"{"dx":-100,"dy":0}"#,
+    );
+    assert!(
+        !drag
+            .commands
+            .iter()
+            .any(|c| matches!(c, Command::Decoration { .. }))
+    );
+    let shade = mobile_action(&mut scripts, &snapshot, "shade", "{}");
+    assert!(
+        !shade
+            .commands
+            .iter()
+            .any(|c| matches!(c, Command::Decoration { .. })),
+        "a shade over overview preserves its rounded panes"
+    );
+    mobile_action(&mut scripts, &snapshot, "back", "{}");
+    let opened = mobile_action(&mut scripts, &snapshot, "select", r#"{"id":2}"#);
+    assert!(
+        opened.commands.iter().any(|c| matches!(c,
+            Command::Decoration { name: Some(name) } if name == "mobile-flat"
+        )),
+        "an opened app must have square corners again"
+    );
+    let app_shade = mobile_action(&mut scripts, &snapshot, "shade", "{}");
+    assert!(
+        !app_shade
+            .commands
+            .iter()
+            .any(|c| matches!(c, Command::Decoration { .. })),
+        "a shade over an app keeps the app square"
+    );
+}

@@ -2,7 +2,7 @@
 -- All mobile policy is Lua; the scene contains controls, never window copies.
 sol.qml({ renderer = os.getenv("SOLIUM_MOBILE_SOFTWARE") == "1" and "software" or "auto" })
 sol.session({ systemd = false })
-sol.pane("mobile")
+sol.pane("mobile-flat")
 sol.loading({ scene = "mobile", decorated = true, reserves_a_slot = true, fade = 160, patience = 10000 })
 sol.auto_reload({ automatic = false })
 sol.focus_mode({ click = true, follow = false, clear_on_empty_click = false, after_close = {} })
