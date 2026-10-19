@@ -16378,6 +16378,8 @@ impl Scripts {
 /// one left it, which is what the compositor hands a script.
 #[cfg(test)]
 mod directions {
+    include!("script/lua_layout_lab.rs");
+
     use super::{
         AnimationSpec, Command, Drawn, FocusSource, Interrupt, MonitorInfo, Parentage, Rect,
         Scripts, Snapshot, Warp, WarpTo, WindowInfo,
