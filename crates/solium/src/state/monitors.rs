@@ -509,7 +509,16 @@ impl Solium {
     /// `tests::real_client::a_resize_that_brings_a_monitor_under_a_surface_gives_it_an_instance_there`.
     pub(crate) fn outputs_resized(&mut self) {
         self.place_outputs();
+        // A size change changes the layout contract as much as hotplug does:
+        // scripts may choose another mode and must replace old-size slots.
+        // Hold both handlers so declarations are synced only after both ran.
+        self.dispatching += 1;
+        self.trigger_monitors_changed();
+        self.trigger_relayout();
+        self.dispatching -= 1;
         self.sync_instances();
+        self.tell_settled_attempts();
+        self.redraw = true;
     }
 
     pub(crate) fn settle_monitors(&mut self) {
@@ -630,6 +639,66 @@ mod tests {
 
     use super::within;
     use crate::scripted::Edges;
+
+    #[test]
+    fn resizing_an_output_notifies_scripts_before_relayout() {
+        use crate::{script::Scripts, state::Solium};
+        use smithay::output::{Mode, Output, PhysicalProperties};
+        use smithay::reexports::wayland_server::Display;
+
+        let display = Display::<Solium>::new().expect("a display");
+        let mut state = Solium::new(display.handle());
+        let output = Output::new(
+            "mobile-resize".into(),
+            PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: smithay::output::Subpixel::Unknown,
+                make: "Solium".into(),
+                model: "Resize test".into(),
+            },
+        );
+        output.change_current_state(
+            Some(Mode {
+                size: (1280, 800).into(),
+                refresh: 60_000,
+            }),
+            None,
+            None,
+            Some((0, 0).into()),
+        );
+        state.space.map_output(&output, (0, 0));
+        let directory =
+            std::env::temp_dir().join(format!("solium-mobile-resize-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("a config directory");
+        let entry = directory.join("init.lua");
+        std::fs::write(
+            &entry,
+            r#"
+            local changed = 0
+            sol.on("monitors", function() changed = changed + 1 end)
+            sol.on("layout", function()
+                sol.status(string.format("%d:%d", changed, sol.monitors()[1].w))
+            end)
+        "#,
+        )
+        .expect("writing the config");
+        state.start_scripts(Some(Scripts::load(&entry).expect("loading the config")));
+        output.change_current_state(
+            Some(Mode {
+                size: (390, 844).into(),
+                refresh: 60_000,
+            }),
+            None,
+            None,
+            None,
+        );
+        state.outputs_resized();
+        assert_eq!(
+            state.status, "1:390",
+            "resize must tell monitors then layout with the new bounds"
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
 
     fn rect(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Logical> {
         Rectangle::new((x, y).into(), (w, h).into())
