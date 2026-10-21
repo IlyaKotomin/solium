@@ -7,6 +7,11 @@ Item {
     property string imageSource: ""
     property color tone: "#007aff"
     property bool showTitle: true
+    property string appKey: ""
+    function iconRect() {
+        const p = icon.mapToItem(null, 0, 0)
+        return { x: p.x, y: p.y, size: icon.width }
+    }
     signal triggered(var origin)
     width: 80; height: 92
     Accessible.role: Accessible.Button
@@ -39,8 +44,7 @@ Item {
         id: mouse
         anchors.fill: parent
         onClicked: {
-            const p = icon.mapToItem(null, 0, 0)
-            tile.triggered({ x: p.x, y: p.y, size: icon.width })
+            tile.triggered(tile.iconRect())
         }
     }
 }

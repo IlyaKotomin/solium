@@ -8,10 +8,16 @@ local pane_style = "mobile-flat"
 local swipe = { offset = 0, lift = 0, id = 0 }
 local pending_launch
 local card_slots = {}
+local dismissals = {}
+local home_ids, home_targets = {}, {}
+local home_serial = 0
 local state = sol.keep("mobile.v1", {
     page = "home", previous = "home", active = 0, order = {},
     split = {}, ratio = 0.5, picker = 0, closing = {},
 })
+state.overview_offset = state.overview_offset or 0
+state.launcher_icons = state.launcher_icons or {}
+local launcher_icons = state.launcher_icons
 state.settings = state.settings or { brightness = 1, dark = false, reduceMotion = false }
 local pages = { home = true, apps = true, recents = true, app = true, shade = true }
 if not pages[state.page] then state.page = "home" end
@@ -85,6 +91,15 @@ local function rect(x, y, w, h)
 end
 
 local function hide(window, whole)
+    if home_ids[window.id] then
+        local target = home_targets[window.id]
+        -- A window with no visible launcher icon falls down and shrinks out
+        -- of view. Never send it sideways across the desktop.
+        target = target or { x = whole.x + whole.w / 2 - 24,
+            y = whole.y + whole.h + 24, w = 48, h = 48 }
+        sol.present(window.id, { x = target.x, y = target.y, w = target.w, h = target.h, opacity = 0 })
+        return
+    end
     sol.present(window.id, {
         x = whole.x + whole.w + 32, y = whole.y + 64,
         w = math.max(1, whole.w * 0.88), h = math.max(1, whole.h * 0.88), opacity = 0,
@@ -92,8 +107,21 @@ local function hide(window, whole)
 end
 
 local function card_metrics(area, tablet)
-    local w = math.min(area.w * (tablet and 0.47 or 0.80), 540)
+    if tablet then
+        local columns = area.w >= area.h and 3 or 2
+        local rows = 2
+        local cell_w = (area.w - 64 - (columns - 1) * 28) / columns
+        local row_pitch = math.max(80, (area.h - 132) / rows)
+        local h = math.max(24, math.min(cell_w * area.h / area.w, row_pitch - 60))
+        return h * area.w / area.h, h, cell_w + 28, columns, row_pitch, cell_w
+    end
+    local w = math.min(area.w * 0.80, 540)
     return w, math.min(area.h * 0.79, w * area.h / math.max(1, area.w)), w * 0.64
+end
+
+local function strip_limit(area, count)
+    local _, _, stride, columns = card_metrics(area, true)
+    return math.max(0, (math.ceil(count / 2) - columns) * stride)
 end
 
 function mobile.apply(motion)
@@ -110,6 +138,7 @@ function mobile.apply(motion)
     if ready and not tablet then state.split = {}; state.picker = 0 end
     local ordered, by_id, dialogs = {}, {}, {}
     if ready then ordered, by_id, dialogs = windows() end
+    if tablet then state.overview_offset = math.max(-strip_limit(area, #ordered), math.min(0, state.overview_offset)) end
     local placed, cards = {}, {}
     sol.animate(state.settings.reduceMotion and { duration = 0 } or motion or config.motion)
     local content_page = state.page == "shade" and state.previous or state.page
@@ -143,21 +172,30 @@ function mobile.apply(motion)
         local visible = content_page == "app" and (window.id == state.active
             or (#state.split == 2 and (window.id == state.split[1] or window.id == state.split[2])))
         if content_page == "recents" then
-            local card_w, card_h, stride = card_metrics(area, tablet)
-            local distance = index - focused_index + swipe.offset / stride
-            local scale = math.max(0.86, 1 - math.abs(distance) * 0.045)
-            local w, h = card_w * scale, card_h * scale
-            local x = whole.x + (whole.w - w) / 2 + distance * stride
-            local y = area.y + (area.h - h) / 2 + math.abs(distance) * 8
-                + (window.id == swipe.id and swipe.lift or 0)
+            local card_w, card_h, stride, columns, row_pitch, cell_w = card_metrics(area, tablet)
+            local w, h, x, y
+            if tablet then
+                local column, row = math.floor((index - 1) / 2), (index - 1) % 2
+                w, h = card_w, card_h
+                x = area.x + 32 + column * stride + (cell_w - w) / 2
+                    + state.overview_offset + swipe.offset
+                y = area.y + 58 + row * row_pitch
+            else
+                local distance = index - focused_index + swipe.offset / stride
+                local scale = math.max(0.86, 1 - math.abs(distance) * 0.045)
+                w, h = card_w * scale, card_h * scale
+                x = whole.x + (whole.w - w) / 2 + distance * stride
+                y = area.y + (area.h - h) / 2 + math.abs(distance) * 8
+            end
+            y = y + (window.id == swipe.id and swipe.lift or 0)
             local card = rect(x, y, w, h)
             card.id = window.id
             card.selected = window.id == state.active
-            card.z = 100 - math.abs(distance)
+            card.z = index -- right cards always overlap left cards; browsing never changes depth
             cards[#cards + 1] = card
             card_slots[#card_slots + 1] = card
             sol.present(window.id, { x = x, y = y, w = w, h = h,
-                z = card.z, opacity = window.id == swipe.id and math.max(0.15, 1 + swipe.lift / area.h) or 1 })
+                z = card.z, opacity = 1 })
             presentations[window.id] = "recents"
         elseif visible then
             -- Repeated layout/configure events must not cancel the entry
@@ -193,7 +231,7 @@ function mobile.apply(motion)
         properties = {
             page = state.page, tablet = tablet, cards = cards, taskCount = #ordered,
             activeId = state.active, splitActive = #state.split == 2, pickingSplit = state.picker ~= 0,
-            statusHeight = config.status, navigationHeight = config.navigation,
+            statusHeight = config.status, navigationHeight = config.navigation, homeRequest = home_serial,
             shadeBackground = state.previous, brightness = state.settings.brightness,
             darkAppearance = state.settings.dark, reduceMotion = state.settings.reduceMotion,
         },
@@ -208,14 +246,42 @@ end
 
 local function reset_swipe() swipe = { offset = 0, lift = 0, id = 0 } end
 
+local function app_key(window)
+    if window.title == "Notes" or window.app_id == "mobile-notes" then return "notes" end
+    if window.title == "Gallery" or window.app_id == "mobile-gallery" then return "gallery" end
+    if window.app_id == "mobile-terminal" then return "terminal" end
+    return window.app_id:gsub("%.desktop$", "")
+end
+
+local function icon_target(window, whole)
+    local icon = launcher_icons[app_key(window)]
+    if not icon or icon.screen_w ~= whole.w or icon.screen_h ~= whole.h then return end
+    return rect(whole.x + icon.x, whole.y + icon.y, icon.size, icon.size)
+end
+
 function mobile.home()
     pending_launch = nil
     reset_swipe()
+    local ordered = windows()
+    local whole = dimensions()
+    local previous = state.page == "shade" and state.previous or state.page
+    home_ids, home_targets = {}, {}
+    for _, window in ipairs(ordered) do
+        if (previous == "app" and (window.id == state.active
+            or (#state.split == 2 and (window.id == state.split[1] or window.id == state.split[2]))))
+            or previous == "recents" then
+            home_ids[window.id] = true
+            home_targets[window.id] = icon_target(window, whole)
+        end
+    end
+    home_serial = home_serial + 1
     state.page = "home"; state.picker = 0
     mobile.apply()
 end
 
 function mobile.recents()
+    if state.page ~= "recents" and state.page ~= "shade" then state.overview_offset = 0 end
+    home_ids, home_targets = {}, {}
     reset_swipe()
     if state.page ~= "recents" and state.page ~= "shade" then state.previous = state.page end
     state.page = "recents"; state.picker = 0
@@ -226,13 +292,17 @@ function mobile.back()
     reset_swipe()
     if state.picker ~= 0 then state.picker = 0
     elseif state.page == "shade" then state.page = state.previous
-    elseif state.page == "recents" then state.page = state.previous == "app" and "app" or "home"
-    else state.page = "home" end
+    elseif state.page == "recents" then
+        if state.previous == "app" then state.page = "app"
+        else mobile.home(); return end
+    else mobile.home(); return end
+    if state.page == "home" then mobile.home(); return end
     mobile.apply()
     if state.page == "app" and state.active ~= 0 then sol.focus(state.active) end
 end
 
 function mobile.select(id)
+    home_ids, home_targets = {}, {}
     reset_swipe()
     local _, by_id = windows()
     if not by_id[id] or state.picker == id then return end
@@ -289,7 +359,31 @@ end
 local function act(action, data)
     data = type(data) == "table" and data or {}
     local id = math.tointeger(tonumber(data.id))
-    if action == "mobile.home" then mobile.home()
+    if action == "mobile.icons" then
+        if tonumber(data.epoch) ~= home_serial or (state.page ~= "home" and state.page ~= "apps") then return end
+        local whole = dimensions()
+        if tonumber(data.w) ~= whole.w or tonumber(data.h) ~= whole.h then return end
+        local icons = {}
+        if type(data.items) == "table" then
+            for key, icon in pairs(data.items) do
+                if type(key) == "string" and type(icon) == "table" then
+                    local x, y, size = tonumber(icon.x), tonumber(icon.y), tonumber(icon.size)
+                    if x and y and size and size >= 16 and size <= 160 and x >= 0 and y >= 0
+                        and x + size <= whole.w + 1 and y + size <= whole.h + 1 then
+                        icons[key:gsub("%.desktop$", "")] = { x = x, y = y, size = size,
+                            screen_w = whole.w, screen_h = whole.h }
+                    end
+                end
+            end
+        end
+        launcher_icons = icons
+        state.launcher_icons = icons
+        local ordered = windows()
+        for _, window in ipairs(ordered) do
+            if home_ids[window.id] then home_targets[window.id] = icon_target(window, whole) end
+        end
+        mobile.apply()
+    elseif action == "mobile.home" then mobile.home()
     elseif action == "mobile.back" then mobile.back()
     elseif action == "mobile.recents" then mobile.recents()
     elseif action == "mobile.apps" then state.page = "apps"; mobile.apply()
@@ -332,8 +426,13 @@ local function act(action, data)
             local _, _, stride = card_metrics(area, tablet)
             local current = 1
             for index, window in ipairs(ordered) do if window.id == state.active then current = index end end
-            swipe.offset = math.max(-(#ordered - current) * stride - 40,
-                math.min((current - 1) * stride + 40, dx))
+            if tablet then
+                swipe.offset = math.max(-strip_limit(area, #ordered) - state.overview_offset - 32,
+                    math.min(-state.overview_offset + 32, dx))
+            else
+                swipe.offset = math.max(-(#ordered - current) * stride - 40,
+                    math.min((current - 1) * stride + 40, dx))
+            end
             swipe.lift = 0
         end
         mobile.apply({ duration = 0 })
@@ -342,9 +441,19 @@ local function act(action, data)
         local _, _, stride = card_metrics(area, tablet)
         local offset, lift, selected = swipe.offset, swipe.lift, swipe.id
         reset_swipe()
-        if lift < -85 and selected ~= 0 then sol.close(selected); mobile.apply()
+        if lift < -85 and selected ~= 0 then
+            for _, card in ipairs(card_slots) do
+                if card.id == selected then dismissals[selected] = card; break end
+            end
+            sol.close(selected)
         elseif math.abs(offset) < 8 and math.abs(lift) < 8 and data.tap then
             if selected ~= 0 then mobile.select(selected) else mobile.home() end
+        elseif tablet then
+            local ordered = windows()
+            local velocity = state.settings.reduceMotion and 0 or math.max(-2, math.min(2, tonumber(data.velocity) or 0))
+            state.overview_offset = math.max(-strip_limit(area, #ordered),
+                math.min(0, state.overview_offset + offset + velocity * 150))
+            mobile.apply({ duration = 320, easing = "outCubic" })
         else mobile.cycle(math.floor(-offset / stride + 0.5)) end
     elseif action == "mobile.setting" then
         if data.key == "brightness" then
@@ -403,13 +512,28 @@ sol.on("activate", function(id, why)
         if origin then sol.present_from(id, origin.rect) end
     end
 end)
-sol.on("closing", function(id) state.closing[id] = true; mobile.apply() end)
+sol.on("closing", function(id)
+    local card = dismissals[id]
+    state.closing[id] = true
+    mobile.apply()
+    if card then
+        local whole = dimensions()
+        -- Native close requests are delivered after the compositor's 190 ms
+        -- closing phase. Land off-screen before that, with no on-screen fade.
+        sol.animate({ duration = state.settings.reduceMotion and 0 or 180, easing = "outCubic" })
+        sol.present(id, { x = card.x, y = whole.y - card.h - 48,
+            w = card.w, h = card.h, z = card.z, opacity = 1 })
+    end
+end)
 sol.on("close", function(id)
+    dismissals[id] = nil; home_ids[id] = nil; home_targets[id] = nil
     state.closing[id] = nil -- close's snapshot marks the departing pane leaving
     mobile.apply()
     if state.page == "app" and state.active ~= 0 then sol.focus(state.active) end
 end)
-sol.on("refused", function(id) state.closing[id] = nil; mobile.apply() end)
+sol.on("refused", function(id)
+    dismissals[id] = nil; state.closing[id] = nil; mobile.apply()
+end)
 sol.on("layout", function() mobile.apply(config.quick) end)
 sol.on("monitors", function() mobile.apply({ duration = 0 }) end)
 sol.on("restore", function() mobile.apply({ duration = 0 }) end)

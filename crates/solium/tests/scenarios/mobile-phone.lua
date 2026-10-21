@@ -28,7 +28,7 @@ return {
         { key = "super+h" }, { wait = 400 }, { expect = page("home", 2) },
         { expect = function(world)
             for _, window in ipairs(world.windows) do
-                assert(window.drawn.x >= 390, "Home parks real clients offstage")
+                assert(window.drawn.x >= 390 or window.drawn.y >= 844, "Home parks unknown clients outside the display")
             end
         end },
         { key = "super+a" }, { expect = page("apps", 2) },

@@ -19,6 +19,23 @@ Item {
     property bool reduceMotion: false
     property date now: new Date()
     property var installed: []
+    property int homeRequest: 0
+    property var iconItems: []
+    function registerIcon(tile) { iconItems.push(tile); Qt.callLater(reportIcons) }
+    function unregisterIcon(tile) { iconItems = iconItems.filter(item => item !== tile) }
+    function reportIcons() {
+        if (page !== "home" && page !== "apps") return
+        let icons = {}
+        for (const tile of iconItems) {
+            const r = tile.iconRect()
+            if (tile.appKey && r.x >= 0 && r.y >= 0 && r.x + r.size <= width + 1 && r.y + r.size <= height + 1)
+                icons[tile.appKey] = r
+        }
+        send("icons", { epoch: homeRequest, w: width, h: height, items: icons })
+    }
+    onHomeRequestChanged: Qt.callLater(reportIcons)
+    onWidthChanged: Qt.callLater(reportIcons)
+    onHeightChanged: Qt.callLater(reportIcons)
     readonly property string underneath: page === "shade" ? shadeBackground : page
     readonly property int columns: tablet ? Math.max(6, Math.floor(width / 112)) : 4
     readonly property int rows: Math.max(1, Math.min(tablet ? 5 : 6, Math.floor((height - 160) / 106)))
@@ -70,7 +87,7 @@ Item {
         opacity: root.underneath === "home" || root.underneath === "apps" ? 1 : 0
         visible: opacity > 0.001
         enabled: root.page === "home" || root.page === "apps"
-        scale: 0.96 + opacity * 0.04
+        scale: 1 // Icon targets stay in layout space throughout Home fade.
         Behavior on opacity { NumberAnimation { duration: root.reduceMotion ? 0 : 280; easing.type: Easing.OutCubic } }
         ListView {
             id: desktops
@@ -81,7 +98,7 @@ Item {
             maximumFlickVelocity: 1800
             clip: true
             model: root.pageCount
-            onMovementEnded: currentIndex = Math.round(contentX / Math.max(1, width))
+            onMovementEnded: { currentIndex = Math.round(contentX / Math.max(1, width)); Qt.callLater(root.reportIcons) }
             delegate: Item {
                 required property int index
                 width: desktops.width; height: desktops.height
@@ -95,6 +112,10 @@ Item {
                             width: (desktops.width - (root.tablet ? 72 : 24)) / root.columns
                             height: Math.min(112, desktops.height / root.rows)
                             AppTile {
+                                id: appTile
+                                appKey: modelData.app || modelData.desktopId || ""
+                                Component.onCompleted: root.registerIcon(appTile)
+                                Component.onDestruction: root.unregisterIcon(appTile)
                                 anchors.horizontalCenter: parent.horizontalCenter
                                 title: modelData.name; glyph: modelData.glyph; tone: modelData.tone
                                 imageSource: modelData.icon ? "image://solium/icon/" + modelData.icon + "?size=60" : ""
@@ -138,14 +159,27 @@ Item {
         property real startX: 0
         property real startY: 0
         property real wheelX: 0
+        property real previousX: 0
+        property real previousAt: 0
+        property real velocityX: 0
         onPressed: mouse => {
             startX = mouse.x; startY = mouse.y
+            previousX = mouse.x; previousAt = Date.now(); velocityX = 0
             root.send("swipe.begin", { x: mouse.x, y: mouse.y + root.statusHeight })
         }
         onPositionChanged: mouse => {
-            if (pressed) root.send("swipe.move", { dx: mouse.x - startX, dy: mouse.y - startY })
+            if (pressed) {
+                const now = Date.now()
+                const dt = now - previousAt
+                if (dt > 0) velocityX = (mouse.x - previousX) / dt
+                previousX = mouse.x; previousAt = now
+                root.send("swipe.move", { dx: mouse.x - startX, dy: mouse.y - startY })
+            }
         }
-        onReleased: mouse => root.send("swipe.end", { tap: Math.abs(mouse.x - startX) < 8 && Math.abs(mouse.y - startY) < 8 })
+        onReleased: mouse => root.send("swipe.end", {
+            tap: Math.abs(mouse.x - startX) < 8 && Math.abs(mouse.y - startY) < 8,
+            velocity: Date.now() - previousAt < 80 ? velocityX : 0
+        })
         onCanceled: root.send("swipe.end")
         onWheel: wheel => {
             if (!wheelEnd.running) {
@@ -169,6 +203,26 @@ Item {
         }
     }
 
+    Rectangle {
+        id: overviewDock
+        visible: root.tablet && root.underneath === "recents"
+        enabled: root.page === "recents"
+        width: Math.min(root.width - 64, 420); height: 92; radius: 27
+        anchors { horizontalCenter: parent.horizontalCenter; bottom: navigation.top; bottomMargin: 14 }
+        color: "#4affffff"; border { width: 1; color: "#30ffffff" }
+        Row {
+            anchors.centerIn: parent; spacing: 14
+            Repeater {
+                model: root.builtins
+                AppTile {
+                    required property var modelData
+                    width: 70; height: 60; showTitle: false
+                    title: modelData.name; glyph: modelData.glyph; tone: modelData.tone
+                    onTriggered: origin => root.launch(modelData, origin)
+                }
+            }
+        }
+    }
     Rectangle {
         id: status
         width: parent.width; height: root.statusHeight

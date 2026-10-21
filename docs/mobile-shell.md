@@ -14,12 +14,20 @@ same Solium compositor and real Wayland clients as the desktop. The desktop
 - **Home Screen:** applications only. Drag horizontally between pages; the
   first contains the demo apps and Settings, subsequent pages use the live
   installed-app index. Mouse wheels and trackpad scrolling work too.
-- **App switcher:** overlapping, rounded **live panes**, with neighbours
+- **Phone app switcher:** overlapping, rounded **live panes**, with neighbours
   visible at the sides. Drag horizontally or scroll to browse, click a card
-  to open it, and swipe a card upward to close it. No Previous/Next/Open/Close
+  to open it, and swipe a card upward to close it. The right-hand card stays
+  above its left neighbour throughout dragging and snapping; focus never
+  changes this ordering. No Previous/Next/Open/Close
   buttons. Empty space returns Home. MRU order changes only on activation,
   rather than on browsing.
-- **Tablet:** two real clients in split screen. Open Control Center, choose
+- **Tablet app switcher:** a continuous horizontal strip in **two rows**,
+  typically showing three columns at once in landscape. Scroll or drag by
+  any distance, with a short inertial glide on release; there are no pages,
+  page indicators or snapping to column boundaries. A dock below opens apps.
+  The seventh task simply continues into the next column. Card labels and
+  corners remain pane-bound here too.
+- **Tablet split screen:** two real clients in split screen. Open Control Center, choose
   **Split screen**, then select the other card. The small navbar controls
   resize the divider or return to one app.
 - **Control Center:** pull down from the status bar, click its top-right
@@ -31,6 +39,15 @@ same Solium compositor and real Wayland clients as the desktop. The desktop
 - **Back:** dismisses Control Center or the switcher, cancels split selection,
   or returns from the root app to Home while preserving its task. In-app
   navigation is the application's own.
+- **Home transition:** the shell reports the actual visible icon rectangles,
+  tagged with an epoch and output dimensions. A window shrinks and fades to
+  its icon; if that icon is on a different page, absent, or stale after a
+  resize, the window shrinks below the display instead. The icon cache
+  survives a Lua reload, and a fresh Home layout updates it.
+- **Swipe close:** the live card remains opaque and flies entirely above the
+  output. The native close request is sent only after the compositor's
+  closing phase; the scripted 180 ms movement lands before its 190 ms
+  deadline. Client refusal/dialog handling remains the native compositor's.
 - **Launch:** the QML icon reports its actual rectangle on release. Lua uses
   `sol.present_from` on the launch's loading pane, **before** the application
   maps; adoption keeps the same pane and animation. An origin is consumed
@@ -177,7 +194,7 @@ Results on 2026-10-19:
 | Check | Result |
 |---|---|
 | Initial mobile implementation's full test binary | 2042 passed, 3 pre-existing ignored (before the visual revision) |
-| Revised policy's six script-host regressions | Passed: drag/snap, swipe-close, loading-pane launch origin, shade/settings reload, task/split reload |
+| Revised policy's twelve script-host regressions | Passed: drag/snap, swipe-close, loading-pane launch origin, shade/settings reload, task/split reload, fixed depth, off-screen close, icon/fallback Home targets, continuous tablet strip and phone overlap |
 | Real-client scenario suite | Passed, run in its own process |
 | QML scenario suite | Passed, run in its own process |
 | Lua/QML loading, Rust formatting, shell syntax | Passed |
@@ -194,6 +211,17 @@ hardware sensors, physical screen rotation, or hardware performance. Touch,
 touch gesture navigation, an on-screen keyboard, a lock screen and Android APK
 compatibility are outside this iteration. XWayland was unavailable in this
 unprivileged container; the tested clients are native Wayland.
+
+## 2026-10-21 interaction revision
+
+The tablet overview is a two-row **strip**, not a paged grid. Verified with
+seven real Qt/foot tasks: six are visible initially and the extra column is
+reached by continuous scrolling. A policy regression checks that a 100 px
+scroll remains exactly 100 px after release. The phone retains the overlapping
+carousel with invariant right-over-left depth. Home and swipe-close animations
+were captured at 25–35 ms intervals and checked before, during and after exit.
+
+![Tablet overview strip](mobile/tablet-strip.png)
 
 ## Source map
 
