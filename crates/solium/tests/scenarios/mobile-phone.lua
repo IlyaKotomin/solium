@@ -10,6 +10,7 @@ local function page(wanted, count)
         assert(ui.taskCount == count, "the running task count is real")
     end
 end
+local departing = {}
 return {
     monitors = { { 390, 844 } },
     init = [[ require("mobile") ]],
@@ -47,6 +48,20 @@ return {
         end },
         { key = "super+shift+s" },
         { expect = function(world) assert(not shell(world).splitActive, "phone does not enter tablet split") end },
-        { key = "super+b" }, { wait = 400 }, { expect = page("home", 2) },
+        { expect = function(world)
+            for _, card in ipairs(shell(world).cards) do
+                departing[card.id] = { x = card.x, y = card.y, w = card.w, h = card.h }
+            end
+        end },
+        { key = "super+b" }, { wait = 500 }, { expect = page("home", 2) },
+        { expect = function(world)
+            for _, window in ipairs(world.windows) do
+                local card, drawn = assert(departing[window.id]), window.drawn
+                for _, key in ipairs({ "x", "y", "w", "h" }) do
+                    assert(math.abs(card[key] - drawn[key]) < 1,
+                        "exiting Recents fades each card in place, never towards an icon")
+                end
+            end
+        end },
     },
 }

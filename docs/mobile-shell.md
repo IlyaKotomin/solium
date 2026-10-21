@@ -40,10 +40,12 @@ same Solium compositor and real Wayland clients as the desktop. The desktop
   or returns from the root app to Home while preserving its task. In-app
   navigation is the application's own.
 - **Home transition:** the shell reports the actual visible icon rectangles,
-  tagged with an epoch and output dimensions. A window shrinks and fades to
-  its icon; if that icon is on a different page, absent, or stale after a
+  tagged with an epoch and output dimensions. Only the foreground app, when
+  leaving the app itself, shrinks and fades to its icon; if that icon is on a different page, absent, or stale after a
   resize, the window shrinks below the display instead. The icon cache
-  survives a Lua reload, and a fresh Home layout updates it.
+  survives a Lua reload, and a fresh Home layout updates it. Leaving Recents
+  fades the cards in place, preserving their rectangles and depth. Selecting
+  a card expands that app while the other cards fade in place.
 - **Swipe close:** the live card remains opaque and flies entirely above the
   output. The native close request is sent only after the compositor's
   closing phase; the scripted 180 ms movement lands before its 190 ms
@@ -52,9 +54,13 @@ same Solium compositor and real Wayland clients as the desktop. The desktop
   `sol.present_from` on the launch's loading pane, **before** the application
   maps; adoption keeps the same pane and animation. An origin is consumed
   once. Keyboard launches use a small central fade instead.
-- **Window chrome:** `panes/mobile/Pane.qml` declares the compositor's
-  `client.radius`; its identity and shadow layers travel through the same
-  pane matrix as the client. The shell draws no duplicate title, icon or
+- **Window chrome:** both mobile pane styles keep `client.radius: 0`.
+  `effects/mobile-corners` reads `self` in the client's `replace` slot and
+  cuts an antialiased rounded outline in GLSL, without deforming its pixels.
+  QML animates the radius input over 420 ms (instant with reduced motion),
+  Lua forwards it as the effect parameter. Geometry, opacity and stacking
+  remain native presentations. Identity and shadow layers travel through the
+  same pane matrix as the client. No Rust compositor changes are required. The shell draws no duplicate title, icon or
   border positioned beside a separately animated window. Drag updates use
   zero-duration presentation; release snaps with the compositor clock.
 

@@ -5,7 +5,7 @@ import Solium
 // the pane, and go through exactly the same presentation matrix as its pixels.
 PaneStyle {
     requires: []
-    client.radius: 30
+    client.radius: 0 // mobile-corners masks the client through its self-input shader
     Layer { name: "shadow"; depth: "behind"; bleed: 24; source: "Shadow.qml" }
     Layer { name: "identity"; depth: "above"; bleed: { "top": 160 }; source: "Identity.qml" }
 }

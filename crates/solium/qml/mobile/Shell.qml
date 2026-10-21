@@ -17,6 +17,13 @@ Item {
     property real brightness: 1
     property bool darkAppearance: false
     property bool reduceMotion: false
+    property real cornerRadius: 0
+    property int cornerDuration: 420
+    property real animatedCornerRadius: cornerRadius
+    Behavior on animatedCornerRadius {
+        NumberAnimation { duration: root.reduceMotion ? 0 : root.cornerDuration; easing.type: Easing.OutCubic }
+    }
+    onAnimatedCornerRadiusChanged: send("corners", { radius: animatedCornerRadius })
     property date now: new Date()
     property var installed: []
     property int homeRequest: 0

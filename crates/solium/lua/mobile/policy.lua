@@ -10,6 +10,8 @@ local pending_launch
 local card_slots = {}
 local dismissals = {}
 local home_ids, home_targets = {}, {}
+local fading = {}
+local corner_target, corner_radius = 0, -1
 local home_serial = 0
 local state = sol.keep("mobile.v1", {
     page = "home", previous = "home", active = 0, order = {},
@@ -90,7 +92,34 @@ local function rect(x, y, w, h)
     return { x = x, y = y, w = math.max(1, w), h = math.max(1, h) }
 end
 
+-- Keep the departing cards' exact rectangles and depth. These stay parked at
+-- alpha zero until the next overview, including through client configures.
+local function fade_recents()
+    local page = state.page == "shade" and state.previous or state.page
+    if page ~= "recents" then return end
+    fading = {}
+    for _, card in ipairs(card_slots) do fading[card.id] = card end
+end
+
+local function set_corners(radius)
+    radius = math.max(0, math.min(30, tonumber(radius) or 0))
+    if math.abs(radius - corner_radius) < 0.05 then return end
+    corner_radius = radius
+    local monitor = screen()
+    local scale = monitor and monitor.scale or 1
+    sol.effects({ rules = {
+        { match = { fullscreen = false }, part = "client", slot = "replace",
+          effect = { "mobile-corners", radius = radius * scale } },
+    } })
+end
+
 local function hide(window, whole)
+    local card = fading[window.id]
+    if card then
+        sol.present(window.id, { x = card.x, y = card.y, w = card.w, h = card.h,
+            z = card.z, opacity = 0 })
+        return
+    end
     if home_ids[window.id] then
         local target = home_targets[window.id]
         -- A window with no visible launcher icon falls down and shrinks out
@@ -134,6 +163,7 @@ function mobile.apply(motion)
         sol.log("mobile layout: " .. geometry)
         last_geometry = geometry
         presentations = {}
+        corner_radius = -1
     end
     if ready and not tablet then state.split = {}; state.picker = 0 end
     local ordered, by_id, dialogs = {}, {}, {}
@@ -142,10 +172,12 @@ function mobile.apply(motion)
     local placed, cards = {}, {}
     sol.animate(state.settings.reduceMotion and { duration = 0 } or motion or config.motion)
     local content_page = state.page == "shade" and state.previous or state.page
+    -- Styles select pane-bound chrome; both have a square client mask.
+    -- The self-input shader cuts client pixels; QML supplies only its radius.
+    if content_page == "recents" then corner_target = 30
+    elseif content_page == "app" then corner_target = 0 end
+    if corner_radius < 0 then set_corners(corner_target) end
     local wanted_style = content_page == "recents" and "mobile" or "mobile-flat"
-    -- A real pane style change updates the compositor's client mask. Merely
-    -- changing a QML Rectangle cannot change the application's own corners.
-    -- Only switch at mode boundaries, never for each pointer move.
     if pane_style ~= wanted_style then
         pane_style = wanted_style
         sol.pane(wanted_style)
@@ -198,6 +230,7 @@ function mobile.apply(motion)
                 z = card.z, opacity = 1 })
             presentations[window.id] = "recents"
         elseif visible then
+            fading[window.id] = nil
             -- Repeated layout/configure events must not cancel the entry
             -- transition started by open after its initial placement.
             if presentations[window.id] ~= "app" then sol.present_clear(window.id) end
@@ -230,6 +263,7 @@ function mobile.apply(motion)
         reserve = { top = config.status, bottom = config.navigation },
         properties = {
             page = state.page, tablet = tablet, cards = cards, taskCount = #ordered,
+            cornerRadius = corner_target, cornerDuration = config.motion.duration,
             activeId = state.active, splitActive = #state.split == 2, pickingSplit = state.picker ~= 0,
             statusHeight = config.status, navigationHeight = config.navigation, homeRequest = home_serial,
             shadeBackground = state.previous, brightness = state.settings.brightness,
@@ -265,11 +299,10 @@ function mobile.home()
     local ordered = windows()
     local whole = dimensions()
     local previous = state.page == "shade" and state.previous or state.page
+    fade_recents()
     home_ids, home_targets = {}, {}
     for _, window in ipairs(ordered) do
-        if (previous == "app" and (window.id == state.active
-            or (#state.split == 2 and (window.id == state.split[1] or window.id == state.split[2]))))
-            or previous == "recents" then
+        if previous == "app" and window.id == state.active then
             home_ids[window.id] = true
             home_targets[window.id] = icon_target(window, whole)
         end
@@ -280,6 +313,7 @@ function mobile.home()
 end
 
 function mobile.recents()
+    fading = {}
     if state.page ~= "recents" and state.page ~= "shade" then state.overview_offset = 0 end
     home_ids, home_targets = {}, {}
     reset_swipe()
@@ -293,7 +327,7 @@ function mobile.back()
     if state.picker ~= 0 then state.picker = 0
     elseif state.page == "shade" then state.page = state.previous
     elseif state.page == "recents" then
-        if state.previous == "app" then state.page = "app"
+        if state.previous == "app" then fade_recents(); state.page = "app"
         else mobile.home(); return end
     else mobile.home(); return end
     if state.page == "home" then mobile.home(); return end
@@ -302,6 +336,7 @@ function mobile.back()
 end
 
 function mobile.select(id)
+    fade_recents()
     home_ids, home_targets = {}, {}
     reset_swipe()
     local _, by_id = windows()
@@ -455,6 +490,8 @@ local function act(action, data)
                 math.min(0, state.overview_offset + offset + velocity * 150))
             mobile.apply({ duration = 320, easing = "outCubic" })
         else mobile.cycle(math.floor(-offset / stride + 0.5)) end
+    elseif action == "mobile.corners" then
+        set_corners(data.radius)
     elseif action == "mobile.setting" then
         if data.key == "brightness" then
             state.settings.brightness = math.max(0.25, math.min(1, tonumber(data.value) or 1))
@@ -526,7 +563,7 @@ sol.on("closing", function(id)
     end
 end)
 sol.on("close", function(id)
-    dismissals[id] = nil; home_ids[id] = nil; home_targets[id] = nil
+    dismissals[id] = nil; home_ids[id] = nil; home_targets[id] = nil; fading[id] = nil
     state.closing[id] = nil -- close's snapshot marks the departing pane leaving
     mobile.apply()
     if state.page == "app" and state.active ~= 0 then sol.focus(state.active) end
